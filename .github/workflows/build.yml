@@ -1,0 +1,15 @@
+name: build
+on: [push, pull_request]
+jobs:
+  winwm:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          install: mingw-w64-ucrt-x86_64-gcc
+          path-type: inherit
+      - run: python tools/check_layers.py
+      - shell: msys2 {0}
+        run: cmd.exe //c build.bat

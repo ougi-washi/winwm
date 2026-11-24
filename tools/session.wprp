@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WindowsPerformanceRecorder Version="1.0">
+  <Profiles>
+    <SystemCollector Id="kernel_collector" Name="NT Kernel Logger">
+      <BufferSize Value="1024"/><Buffers Value="64"/>
+    </SystemCollector>
+    <EventCollector Id="winwm_collector" Name="winwm events">
+      <BufferSize Value="64"/><Buffers Value="32"/>
+    </EventCollector>
+    <SystemProvider Id="kernel_provider"><Keywords><Keyword Value="ProcessThread"/><Keyword Value="Loader"/></Keywords></SystemProvider>
+    <EventProvider Id="winwm_provider" Name="{76227E72-6688-4CAD-A786-AF119D55C26B}" Level="5"/>
+    <Profile Id="winwm.Verbose.File" Name="winwm" Description="Session process lifetime and desktop milestones" LoggingMode="File" DetailLevel="Verbose">
+      <Collectors>
+        <SystemCollectorId Value="kernel_collector"><SystemProviderId Value="kernel_provider"/></SystemCollectorId>
+        <EventCollectorId Value="winwm_collector"><EventProviders><EventProviderId Value="winwm_provider"/></EventProviders></EventCollectorId>
+      </Collectors>
+    </Profile>
+  </Profiles>
+</WindowsPerformanceRecorder>

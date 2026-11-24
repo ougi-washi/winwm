@@ -1,0 +1,16 @@
+-std=c11
+-O2
+-DNDEBUG
+-DUNICODE
+-D_UNICODE
+-DWINVER=0x0a00
+-D_WIN32_WINNT=0x0a00
+-D_CRT_SECURE_NO_WARNINGS
+-Isrc
+-ffunction-sections
+-municode
+-mwindows
+-Wl,--subsystem,windows
+-Wl,--gc-sections
+-static-libgcc
+-s

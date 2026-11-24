@@ -1,0 +1,8 @@
+@compile.rsp
+src/install/main.c
+build/install_res.o
+-luser32
+-ladvapi32
+-lshell32
+-lole32
+-luuid
