@@ -4,7 +4,7 @@ jobs:
   portable:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check module includes for cycles
         run: |
           grep -HE '^[[:space:]]*#[[:space:]]*include[[:space:]]*"' src/*/*.[ch] |
@@ -19,7 +19,7 @@ jobs:
   winwm:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
