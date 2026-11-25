@@ -13,7 +13,8 @@
                                         x(program) x(workspace_follow) x(volume_set) x(volume_mixer)        \
                                             x(languages) x(keyboard_settings) x(power_settings) x(date_time) \
                                                 x(network_settings) x(animations_toggle) x(borders_toggle) x(animations_system) \
-                                                    x(media_previous) x(media_next) x(media_stop)
+                                                    x(media_previous) x(media_next) x(media_stop) x(activity) \
+                                                        x(open_place) x(project) x(pick_color)
 #define command_enum(name) cmd_##name,
 enum command_kind { cmd_invalid, command_list(command_enum) cmd_count };
 

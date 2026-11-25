@@ -8,9 +8,6 @@
 *.etl
 *.dmp
 
-__pycache__/
-*.py[cod]
-.venv/
 .cache/
 .vs/
 *.user

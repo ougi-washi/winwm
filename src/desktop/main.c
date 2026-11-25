@@ -351,8 +351,11 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         w_desktop_status_done((void *)lp);
         return 0;
     case msg_catalog:
-        if (w_palette_visible(L"Run"))
-            w_desktop_palette(cmd_launcher, desk.model.output);
+        if (wp) w_desktop_notice("The selected application could not start.");
+        else w_desktop_catalog_update();
+        return 0;
+    case msg_run_result:
+        w_palette_line_result((UINT)wp, lp != 0);
         return 0;
     case msg_devices:
         w_providers_tick();

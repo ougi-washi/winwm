@@ -96,7 +96,23 @@ static bool w_choose_region(void) {
 ////////////////
 //~ Frame capture
 
-static bool w_capture_rect(RECT r) {
+static bool w_window_bounds(HWND window, DWORD pid, RECT *frame, RECT *area) {
+    DWORD current = 0, cloaked = 0, affinity = 0;
+    GetWindowThreadProcessId(window,&current);
+    if (!pid || current != pid || !IsWindowVisible(window) || IsIconic(window) ||
+        window == GetDesktopWindow() || window == GetShellWindow() ||
+        (GetWindowDisplayAffinity(window,&affinity) && affinity != WDA_NONE) ||
+        (SUCCEEDED(DwmGetWindowAttribute(window,DWMWA_CLOAKED,&cloaked,sizeof(cloaked))) && cloaked) ||
+        !GetWindowRect(window,frame) || IsRectEmpty(frame)) return false;
+    RECT visible;
+    if (FAILED(DwmGetWindowAttribute(window,DWMWA_EXTENDED_FRAME_BOUNDS,&visible,sizeof(visible))) ||
+        !IntersectRect(area,frame,&visible)) *area = *frame;
+    return true;
+}
+
+static bool w_capture_rect(RECT r, HWND window, DWORD pid) {
+    RECT frame;
+    if (window && !w_window_bounds(window,pid,&frame,&r)) return false;
     HWND owner =
         CreateWindowW(L"STATIC", L"", WS_POPUP, 0, 0, 0, 0, NULL, NULL, GetModuleHandleW(NULL), NULL);
     HDC src = GetDC(NULL), dst = CreateCompatibleDC(src);
@@ -104,12 +120,21 @@ static bool w_capture_rect(RECT r) {
     bool ok = false;
     if (bmp && dst) {
         HGDIOBJ old = SelectObject(dst, bmp);
-        ok = BitBlt(dst, 0, 0, r.right - r.left, r.bottom - r.top, src, r.left, r.top,
-                    SRCCOPY | CAPTUREBLT) != 0;
+        if (window) {
+            SetViewportOrgEx(dst,frame.left-r.left,frame.top-r.top,NULL);
+            ok = PrintWindow(window,dst,PW_RENDERFULLCONTENT) != 0;
+            RECT after, area;
+            if (ok && w_window_bounds(window,pid,&after,&area)) {
+                OffsetRect(&area,frame.left-after.left,frame.top-after.top);
+                ok = EqualRect(&r,&area);
+            } else ok = false;
+        } else {
+            ok = BitBlt(dst, 0, 0, r.right - r.left, r.bottom - r.top, src, r.left, r.top,
+                        SRCCOPY | CAPTUREBLT) != 0;
+        }
         SelectObject(dst, old);
-        if (ok && OpenClipboard(owner)) {
-            EmptyClipboard();
-            if (SetClipboardData(CF_BITMAP, bmp))
+        if (ok && owner && OpenClipboard(owner)) {
+            if (EmptyClipboard() && SetClipboardData(CF_BITMAP, bmp))
                 bmp = NULL;
             CloseClipboard();
         }
@@ -320,7 +345,19 @@ int w_capture_run(const wchar_t *mode) {
     if (!wcscmp(mode, L"capture_region")) {
         if (!w_choose_region())
             return 0;
-    } else if (!GetWindowRect(GetForegroundWindow(), &selection))
-        return 1;
-    return !w_capture_rect(selection);
+        return !w_capture_rect(selection,NULL,0);
+    }
+    HWND target;
+    DWORD pid = 0;
+    if (!wcscmp(mode,L"capture_window")) {
+        target = GetForegroundWindow();
+        GetWindowThreadProcessId(target,&pid);
+    } else {
+        unsigned long long handle;
+        wchar_t extra;
+        if (swscanf(mode,L"capture_window-%llx-%lu%lc",&handle,&pid,&extra) != 2 ||
+            !handle || handle > UINTPTR_MAX || !pid) return 1;
+        target = (HWND)(uintptr_t)handle;
+    }
+    return !target || !w_capture_rect((RECT){0},target,pid);
 }

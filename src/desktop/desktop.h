@@ -25,7 +25,7 @@ enum {
     msg_desktop_menu,
     msg_catalog,
     msg_shell_exit,
-    msg_pointer_select, msg_drag_preview, msg_drag_limits
+    msg_pointer_select, msg_drag_preview, msg_drag_limits, msg_run_result
 };
 
 typedef struct w_output_state {
@@ -88,7 +88,7 @@ typedef struct w_desktop_state {
     uint64_t revision;
     HWINEVENTHOOK hooks[7];
     char status[512];
-    wchar_t notices[32][256], clips[24][512];
+    wchar_t notices[32][256], clips[24][4096];
     int notice_count, clip_count;
     DWORD clipboard_seq;
     bool clipboard_enabled;
@@ -132,11 +132,14 @@ bool w_desktop_run_on(const w_command *cmd, int output);
 bool w_desktop_run(const w_command *cmd);
 void w_desktop_action(int output, const char *text);
 void w_desktop_palette(enum command_kind kind, int output);
+void w_desktop_catalog_update(void);
+void w_desktop_clear_clips(void);
 void w_desktop_notice(const char *s);
 void w_desktop_load(void);
 void w_desktop_start_programs(bool first_load);
 void w_desktop_copy_clip(void);
-void w_desktop_capture(void);
+void w_desktop_capture(int output);
+bool w_desktop_capture_window(HWND target, DWORD pid);
 int w_desktop_find(HWND w);
 void w_desktop_activate(int slot);
 void w_desktop_hover(POINT p);

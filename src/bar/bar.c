@@ -58,7 +58,7 @@ static int w_format_module(w_bar_window *b, const char *key, wchar_t *s, int cap
         MEMORYSTATUSEX ms = {.dwLength = sizeof(ms)};
         if (GlobalMemoryStatusEx(&ms))
             swprintf(s, cap, L"%lu%% RAM", ms.dwMemoryLoad);
-        strcpy(action, "open_tasks");
+        strcpy(action, "activity");
     } else if (b->custom)
         b->custom(key, s, cap, action, 128);
     return (int)wcslen(s);

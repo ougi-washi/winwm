@@ -1,6 +1,7 @@
 #define COBJMACROS
 #include "theme/theme.h"
 #include "desktop_tools/tools.h"
+#include "desktop_tools/adapter.h"
 #include "desktop_tools/display.h"
 #include <initguid.h>
 #include "desktop_tools/sound.h"
@@ -12,7 +13,7 @@
 #include "desktop_tools/bluetooth.h"
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
-#include <powrprof.h>
+#include "desktop_tools/power.h"
 #include <commctrl.h>
 #include <commdlg.h>
 #include <stdio.h>
@@ -24,13 +25,10 @@ enum page { page_audio, page_wifi, page_bluetooth, page_display, page_power, pag
 
 static enum page page;
 static HWND window, list, apply, lower, raise_button, status;
-static HWND password, network_switch;
+static HWND password, network_switch, saved_action;
 static w_adapter_problem network_problems[32];
 static size_t problem_count;
-static GUID plans[128];
-static int plan_count;
-static wchar_t adapter_details[128][256];
-static int adapter_count;
+static IP_ADAPTER_ADDRESSES *adapters;
 static bool mixer;
 static HWND sound_slider, default_device, refresh_sound;
 static ULONGLONG sound_refresh_due;
@@ -41,6 +39,14 @@ static struct w_wifi_profile {
     WLAN_AVAILABLE_NETWORK network;
 } profiles[256];
 static int profile_count;
+static void w_selected(void);
+
+static bool w_same_network(const struct w_wifi_profile *a, const struct w_wifi_profile *b) {
+    return IsEqualGUID(&a->adapter, &b->adapter) && !wcscmp(a->profile, b->profile) &&
+           a->network.dot11DefaultAuthAlgorithm == b->network.dot11DefaultAuthAlgorithm &&
+           a->network.dot11Ssid.uSSIDLength == b->network.dot11Ssid.uSSIDLength &&
+           !memcmp(a->network.dot11Ssid.ucSSID, b->network.dot11Ssid.ucSSID, a->network.dot11Ssid.uSSIDLength);
+}
 
 ////////////////
 //~ Settings Functions
@@ -90,6 +96,9 @@ static struct w_wifi_api {
     DWORD(WINAPI *disconnect)(HANDLE, const GUID *, PVOID);
     DWORD(WINAPI *notify)(HANDLE, DWORD, BOOL, WLAN_NOTIFICATION_CALLBACK, PVOID, PVOID, PDWORD);
     DWORD(WINAPI *connect)(HANDLE, const GUID *, const WLAN_CONNECTION_PARAMETERS *, PVOID);
+    __typeof__(&WlanSaveTemporaryProfile) save;
+    __typeof__(&WlanDeleteProfile) forget;
+    __typeof__(&WlanQueryInterface) query;
     void(WINAPI *free_memory)(PVOID);
 } wifi;
 
@@ -112,6 +121,9 @@ static bool w_load_wifi(void) {
     wifi.notify = (__typeof__(wifi.notify))GetProcAddress(lib, "WlanRegisterNotification");
     wifi.connect = (DWORD(WINAPI *)(HANDLE, const GUID *, const WLAN_CONNECTION_PARAMETERS *,
                                     PVOID))GetProcAddress(lib, "WlanConnect");
+    wifi.save = (__typeof__(wifi.save))GetProcAddress(lib, "WlanSaveTemporaryProfile");
+    wifi.forget = (__typeof__(wifi.forget))GetProcAddress(lib, "WlanDeleteProfile");
+    wifi.query = (__typeof__(wifi.query))GetProcAddress(lib, "WlanQueryInterface");
     wifi.free_memory = (void(WINAPI *)(PVOID))GetProcAddress(lib, "WlanFreeMemory");
     return wifi.open && wifi.close && wifi.interfaces && wifi.profiles && wifi.connect && wifi.free_memory;
 }
@@ -143,7 +155,6 @@ static void w_wifi_items(bool scan) {
         previous = profiles[selected];
     profile_count = 0;
     SendMessageW(list, LB_RESETCONTENT, 0, 0);
-    SetWindowTextW(password, L"");
     ShowWindow(password, SW_HIDE);
     problem_count = 0;
     if (!wlan) {
@@ -187,7 +198,7 @@ static void w_wifi_items(bool scan) {
                     continue;
                 struct w_wifi_profile *p = profiles + profile_count;
                 *p = (struct w_wifi_profile){.adapter = adapter->InterfaceGuid, .network = *n};
-                wcscpy(p->profile, n->strProfileName);
+                if (n->dwFlags & WLAN_AVAILABLE_NETWORK_HAS_PROFILE) wcscpy(p->profile, n->strProfileName);
                 wchar_t ssid[33] = {0}, label[440];
                 MultiByteToWideChar(CP_UTF8, 0, (LPCSTR)n->dot11Ssid.ucSSID, n->dot11Ssid.uSSIDLength, ssid, 32);
                 swprintf(label, count_of(label), L"%ls   %lu%%   %ls%ls", *ssid ? ssid : L"Network", n->wlanSignalQuality,
@@ -200,7 +211,6 @@ static void w_wifi_items(bool scan) {
                 w_item(label, profile_count++);
             }
             wifi.free_memory(nearby);
-            continue;
         }
         restricted |= result == ERROR_ACCESS_DENIED;
         radio_off |= result == ERROR_NDIS_DOT11_POWER_STATE_INVALID;
@@ -208,9 +218,20 @@ static void w_wifi_items(bool scan) {
         if (wifi.profiles(wlan, &adapter->InterfaceGuid, NULL, &saved) != ERROR_SUCCESS)
             continue;
         for (DWORD j = 0; j < saved->dwNumberOfItems && profile_count < 256; j++) {
+            const wchar_t *name = saved->ProfileInfo[j].strProfileName;
+            bool listed = false;
+            for (int k = 0; k < profile_count; ++k)
+                if (IsEqualGUID(&profiles[k].adapter, &adapter->InterfaceGuid) && !wcscmp(profiles[k].profile, name)) {
+                    listed = true;
+                    break;
+                }
+            if (listed) continue;
             profiles[profile_count] = (struct w_wifi_profile){.adapter = adapter->InterfaceGuid};
-            wcscpy(profiles[profile_count].profile, saved->ProfileInfo[j].strProfileName);
-            w_item(profiles[profile_count].profile, profile_count);
+            wcscpy(profiles[profile_count].profile, name);
+            wchar_t label[512];
+            swprintf(label, count_of(label), L"%.250ls   ·   Saved%ls%.160ls", name, interface_count > 1 ? L"   ·   " : L"",
+                     interface_count > 1 ? adapter->strInterfaceDescription : L"");
+            w_item(label, profile_count);
             ++profile_count;
         }
         wifi.free_memory(saved);
@@ -224,10 +245,7 @@ static void w_wifi_items(bool scan) {
     if (had_selection) {
         for (int i = 0; i < profile_count; i++) {
             const struct w_wifi_profile *p = &profiles[i];
-            if (IsEqualGUID(&previous.adapter, &p->adapter) && !wcscmp(previous.profile, p->profile) &&
-                previous.network.dot11Ssid.uSSIDLength == p->network.dot11Ssid.uSSIDLength &&
-                !memcmp(previous.network.dot11Ssid.ucSSID, p->network.dot11Ssid.ucSSID, p->network.dot11Ssid.uSSIDLength) &&
-                previous.network.dot11DefaultAuthAlgorithm == p->network.dot11DefaultAuthAlgorithm) {
+            if (w_same_network(&previous, p)) {
                 SendMessageW(list, LB_SETCURSEL, i, 0);
                 break;
             }
@@ -247,6 +265,42 @@ static const wchar_t *w_personal_auth(const WLAN_AVAILABLE_NETWORK *n) {
     case DOT11_AUTH_ALGO_WPA3_SAE: return L"WPA3SAE";
     default: return NULL;
     }
+}
+
+static void w_saved_profile(void) {
+    int id = w_current_item();
+    if (id < 0 || id >= profile_count) return;
+    struct w_wifi_profile p = profiles[id];
+    DWORD error = ERROR_INVALID_STATE;
+    if (*p.profile && wifi.forget) {
+        wchar_t question[480];
+        swprintf(question,count_of(question),L"Forget %.250ls? Its saved credentials will be removed from this adapter.",p.profile);
+        if (MessageBoxW(window,question,L"Forget network",MB_YESNO|MB_DEFBUTTON2|MB_ICONQUESTION) != IDYES) return;
+        error = wifi.forget(wlan,&p.adapter,p.profile,NULL);
+    } else if (wifi.save && wifi.query && (p.network.dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED)) {
+        DWORD size = 0;
+        WLAN_CONNECTION_ATTRIBUTES *current = NULL;
+        error = wifi.query(wlan,&p.adapter,wlan_intf_opcode_current_connection,NULL,&size,(void **)&current,NULL);
+        if (error == ERROR_SUCCESS) {
+            const DOT11_SSID *ssid = &p.network.dot11Ssid;
+            if (size >= sizeof(*current) && ssid->uSSIDLength && ssid->uSSIDLength <= DOT11_SSID_MAX_LENGTH &&
+                current->wlanAssociationAttributes.dot11Ssid.uSSIDLength == ssid->uSSIDLength &&
+                !memcmp(current->wlanAssociationAttributes.dot11Ssid.ucSSID, ssid->ucSSID, ssid->uSSIDLength)) {
+                wchar_t name[65] = {0};
+                int n = MultiByteToWideChar(CP_UTF8,MB_ERR_INVALID_CHARS,(const char *)ssid->ucSSID,ssid->uSSIDLength,name,32);
+                if (!n || (int)wcslen(name) != n)
+                    for (DWORD i=0;i<ssid->uSSIDLength;i++) swprintf(name+2*i,3,L"%02X",ssid->ucSSID[i]);
+                error = wifi.save(wlan,&p.adapter,name,NULL,WLAN_PROFILE_USER,FALSE,NULL);
+            } else error = ERROR_INVALID_STATE;
+            wifi.free_memory(current);
+        }
+    }
+    w_wifi_items(false);
+    w_selected();
+    w_message(error == ERROR_SUCCESS ? (*p.profile ? L"Saved network forgotten." : L"Network saved for your account.") :
+              error == ERROR_ALREADY_EXISTS ? L"A profile with that name already exists." :
+              error == ERROR_ACCESS_DENIED ? L"Windows denied permission to change this profile." :
+                                             L"The profile or connection changed. Refresh and try again.");
 }
 
 static void w_join(struct w_wifi_profile *p) {
@@ -301,65 +355,52 @@ static void w_join(struct w_wifi_profile *p) {
     w_message(error == ERROR_SUCCESS ? L"Connection requested." : L"Windows rejected the connection request.");
 }
 
-static void w_power_items(void) {
-    GUID *active = NULL;
-    PowerGetActiveScheme(NULL, &active);
-    int selected = -1;
-    for (DWORD i = 0; i < count_of(plans); i++) {
-        DWORD size = sizeof(GUID);
-        if (PowerEnumerate(NULL, NULL, NULL, ACCESS_SCHEME, i, (BYTE *)&plans[plan_count], &size) != ERROR_SUCCESS)
-            break;
-        wchar_t label[192];
-        size = sizeof(label);
-        if (PowerReadFriendlyName(NULL, &plans[plan_count], NULL, NULL, (BYTE *)label, &size) == ERROR_SUCCESS) {
-            if (active && IsEqualGUID(active, &plans[plan_count]))
-                selected = plan_count;
-            w_item(label, plan_count++);
-        }
-    }
-    LocalFree(active);
-    SendMessageW(list, LB_SETCURSEL, selected, 0);
-    w_message(plan_count ? L"Select a power plan to activate it." : L"No power plans available.");
+
+static IP_ADAPTER_ADDRESSES *w_adapter_at(int index) {
+    if (index < 0) return NULL;
+    IP_ADAPTER_ADDRESSES *a = adapters;
+    while (index-- > 0 && a) a = a->Next;
+    return a;
 }
 
 static void w_network_items(void) {
-    SendMessageW(list, LB_RESETCONTENT, 0, 0);
-    adapter_count = 0;
-    ULONG bytes = 0;
-    ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_DNS_SERVER | GAA_FLAG_INCLUDE_ALL_INTERFACES;
+    IP_ADAPTER_ADDRESSES *previous = w_adapter_at(w_current_item());
+    ULONG64 previous_luid = previous ? previous->Luid.Value : 0;
+    ULONG bytes = 16 * 1024;
+    ULONG flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_INCLUDE_GATEWAYS | GAA_FLAG_INCLUDE_ALL_INTERFACES;
     IP_ADAPTER_ADDRESSES *all = NULL;
-    ULONG result;
-    while ((result = GetAdaptersAddresses(AF_UNSPEC, flags, NULL, all, &bytes)) == ERROR_BUFFER_OVERFLOW) {
+    ULONG result = ERROR_NOT_ENOUGH_MEMORY;
+    for (int attempt=0; attempt<4; ++attempt) {
         IP_ADAPTER_ADDRESSES *next = realloc(all, bytes);
-        if (!next) break;
+        if (!next) { result = ERROR_NOT_ENOUGH_MEMORY; break; }
         all = next;
+        result = GetAdaptersAddresses(AF_UNSPEC, flags, NULL, all, &bytes);
+        if (result != ERROR_BUFFER_OVERFLOW) break;
     }
-    if (result == NO_ERROR) {
-        for (IP_ADAPTER_ADDRESSES *a = all; a && adapter_count < (int)count_of(adapter_details); a = a->Next) {
-            if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK || a->IfType == IF_TYPE_TUNNEL)
-                continue;
-            wchar_t label[320], address[64] = L"No assigned address";
-            for (IP_ADAPTER_UNICAST_ADDRESS *u = a->FirstUnicastAddress; u; u = u->Next) {
-                SOCKADDR *sock = u->Address.lpSockaddr;
-                if (!sock) continue;
-                if (sock->sa_family == AF_INET) {
-                    InetNtopW(AF_INET, &((SOCKADDR_IN *)sock)->sin_addr, address, count_of(address));
-                    break;
-                }
-                if (sock->sa_family == AF_INET6)
-                    InetNtopW(AF_INET6, &((SOCKADDR_IN6 *)sock)->sin6_addr, address, count_of(address));
-            }
-            swprintf(label, count_of(label), L"%.185ls   ·   %ls%ls", a->FriendlyName ? a->FriendlyName : L"Network adapter",
-                     a->IfType == IF_TYPE_IEEE80211 ? L"Wi-Fi   ·   " : L"",
-                     a->OperStatus == IfOperStatusUp ? L"Connected" : L"Disconnected");
-            swprintf(adapter_details[adapter_count], count_of(adapter_details[0]), L"%ls   \u00b7   %llu Mbps",
-                     address, a->OperStatus == IfOperStatusUp ? a->TransmitLinkSpeed / 1000000 : 0);
-            w_item(label, adapter_count++);
-        }
+    if (result != NO_ERROR && result != ERROR_NO_DATA) {
+        free(all);
+        w_message(L"Windows could not refresh the network adapters.");
+        return;
     }
-    free(all);
+    SendMessageW(list, LB_RESETCONTENT, 0, 0);
+    free(adapters);
+    adapters = result == ERROR_NO_DATA ? NULL : all;
+    if (!adapters) free(all);
+    LRESULT select = -1;
+    int i = 0;
+    for (IP_ADAPTER_ADDRESSES *a = adapters; a; a = a->Next, ++i) {
+        if (a->IfType == IF_TYPE_SOFTWARE_LOOPBACK) continue;
+        wchar_t label[320];
+        swprintf(label, count_of(label), L"%.185ls   ·   %ls%ls", a->FriendlyName ? a->FriendlyName : L"Network adapter",
+                 a->IfType == IF_TYPE_IEEE80211 ? L"Wi-Fi   ·   " : L"",
+                 a->OperStatus == IfOperStatusUp ? L"Connected" : L"Disconnected");
+        w_item(label, i);
+        if (previous_luid == a->Luid.Value || (select < 0 && a->OperStatus == IfOperStatusUp))
+            select = SendMessageW(list, LB_GETCOUNT, 0, 0) - 1;
+    }
     w_show_network_problems(false);
-    w_message(adapter_count || problem_count ? L"Select an adapter for connection or driver details." : L"No network adapters found.");
+    SendMessageW(list, LB_SETCURSEL, select >= 0 ? select : 0, 0);
+    w_message(adapters || problem_count ? L"Select an adapter for addresses, DNS and link details." : L"No network adapters found.");
 }
 
 static void w_selected(void) {
@@ -367,15 +408,24 @@ static void w_selected(void) {
     int id = row == LB_ERR ? -1 : (int)SendMessageW(list, LB_GETITEMDATA, row, 0);
     EnableWindow(apply, id >= 0);
     if (page == page_audio) w_audio_selection();
+    if (page == page_power) w_power_selected();
     if (page == page_bluetooth) w_bluetooth_selected();
-    if (page == page_network && id >= 0 && id < adapter_count)
-        w_message(adapter_details[id]);
+    if (page == page_network && id >= 0) {
+        IP_ADAPTER_ADDRESSES *a = w_adapter_at(id);
+        EnableWindow(apply, a != NULL);
+        if (a && a->Description) w_message(a->Description);
+    }
     if (page == page_wifi) {
+        static struct w_wifi_profile key_target;
         struct w_wifi_profile *p = id >= 0 && id < profile_count ? &profiles[id] : NULL;
         bool connected = p && (p->network.dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED);
         SetWindowTextW(apply, connected ? L"Disconnect" : L"Connect");
-        SetWindowTextW(password, L"");
+        SetWindowTextW(saved_action, p && *p->profile ? L"Forget network…" : L"Save network");
+        EnableWindow(saved_action, p && (*p->profile ? wifi.forget != NULL : connected && wifi.save && wifi.query));
         bool needs_key = p && !*p->profile && p->network.bSecurityEnabled && w_personal_auth(&p->network);
+        if (!needs_key || !w_same_network(&key_target, p))
+            SetWindowTextW(password, L"");
+        key_target = needs_key ? *p : (struct w_wifi_profile){0};
         ShowWindow(password, needs_key ? SW_SHOW : SW_HIDE);
         EnableWindow(apply, p && (connected || *p->profile || p->network.bNetworkConnectable));
     }
@@ -383,14 +433,18 @@ static void w_selected(void) {
         w_message(network_problems[-2-id].detail);
 }
 
+static void w_size_controls(bool update_font);
+
 static void w_open_network_page(enum page next) {
     page = next;
     bool wireless = page == page_wifi;
     SetWindowTextW(window, wireless ? L"Wi-Fi networks" : L"Network adapters");
     SetWindowTextW(network_switch, wireless ? L"Network adapters" : L"Wi-Fi networks");
+    ShowWindow(saved_action, wireless ? SW_SHOWNA : SW_HIDE);
     SetWindowTextW(password, L"");
     ShowWindow(password, SW_HIDE);
-    ShowWindow(apply, wireless ? SW_SHOWNA : SW_HIDE);
+    SetWindowTextW(apply, wireless ? L"Connect" : L"Adapter details…");
+    ShowWindow(apply, SW_SHOWNA);
     KillTimer(window, 3);
     SendMessageW(list, LB_RESETCONTENT, 0, 0);
     if (wireless) w_wifi_items(true);
@@ -398,6 +452,7 @@ static void w_open_network_page(enum page next) {
     if (SendMessageW(list, LB_GETCURSEL, 0, 0) == LB_ERR)
         SendMessageW(list, LB_SETCURSEL, 0, 0);
     w_selected();
+    w_size_controls(false);
 }
 
 
@@ -417,8 +472,14 @@ static void w_use_selection(void) {
                 w_message(L"Disconnect requested.");
             } else w_message(L"Windows could not disconnect this adapter.");
         } else w_join(&profiles[id]);
-    } else if (page == page_power && id >= 0 && id < plan_count) {
-        w_message(PowerSetActiveScheme(NULL, &plans[id]) == ERROR_SUCCESS ? L"Power plan active." : L"Unable to change power plan.");
+    } else if (page == page_network) {
+        IP_ADAPTER_ADDRESSES *a = w_adapter_at(id);
+        if (a && w_adapter_show(window, a)) {
+            w_network_items();
+            w_selected();
+        }
+    } else if (page == page_power) {
+        w_power_save();
     } else if (page == page_bluetooth) {
         w_bluetooth_apply();
     } else if (page == page_display)
@@ -426,7 +487,7 @@ static void w_use_selection(void) {
 }
 
 static HFONT panel_font;
-static struct { HWND control; RECT logical; } positions[32];
+static struct { HWND control; RECT logical; int dropdown_height; } positions[32];
 static size_t position_count;
 
 static void w_measure_controls(void) {
@@ -436,6 +497,11 @@ static void w_measure_controls(void) {
         GetWindowRect(control, &r);
         MapWindowPoints(NULL, window, (POINT *)&r, 2);
         positions[position_count].control = control;
+        wchar_t kind[32];
+        RECT dropped;
+        if (GetClassNameW(control, kind, count_of(kind)) && !wcscmp(kind, L"ComboBox") &&
+            SendMessageW(control, CB_GETDROPPEDCONTROLRECT, 0, (LPARAM)&dropped))
+            positions[position_count].dropdown_height = dropped.bottom - dropped.top;
         positions[position_count++].logical = r;
     }
 }
@@ -452,17 +518,34 @@ static void w_size_controls(bool update_font) {
     }
     RECT area;
     GetClientRect(window, &area);
-    int dx = MulDiv(area.right, 96, dpi) - 544, dy = MulDiv(area.bottom, 96, dpi) - 344;
+    int width = MulDiv(area.right, 96, dpi);
+    int dx = width - 544, dy = MulDiv(area.bottom, 96, dpi) - 344;
+    bool wrap = width < 456 && (page == page_display || page == page_bluetooth || page == page_wifi ||
+                               (page == page_audio && !mixer));
+    int extra_row = wrap ? 38 : 0;
     for (size_t i = 0; i < position_count; ++i) {
         HWND c = positions[i].control;
         RECT r = positions[i].logical;
-        if (c == list) r.bottom += dy;
-        else if (r.top >= 248) OffsetRect(&r, 0, dy);
+        if (c == list) r.bottom += dy - extra_row;
+        else if (r.top >= 248) OffsetRect(&r, 0, dy - extra_row);
+        if (wrap && positions[i].logical.top >= 300 && positions[i].logical.left >= (page == page_display ? 160 : 270)) {
+            int first_x = page == page_display ? 162 : positions[i].logical.left;
+            OffsetRect(&r, 12 - first_x, extra_row);
+        }
         if (c == list || (c == status && page != page_audio) || c == password || c == sound_slider ||
             (page == page_display && w_display_stretches(c))) r.right += dx;
+        if (wrap && (c == password || (page == page_display && positions[i].logical.left >= 320)))
+            r.right = width - 12;
+        if (page == page_power && positions[i].logical.top < 48) {
+            if (r.left > 12) OffsetRect(&r, dx, 0);
+            else r.right += dx;
+        }
+        if (r.right > width - 12) r.right = width - 12;
+        int height = max(1, r.bottom - r.top);
+        if (positions[i].dropdown_height) height = max(height, positions[i].dropdown_height);
         if (update_font) SendMessageW(c, WM_SETFONT, (WPARAM)panel_font, FALSE);
         MoveWindow(c, MulDiv(r.left,dpi,96), MulDiv(r.top,dpi,96),
-                   MulDiv(r.right-r.left,dpi,96), MulDiv(r.bottom-r.top,dpi,96), TRUE);
+                   MulDiv(max(1,r.right-r.left),dpi,96), MulDiv(height,dpi,96), TRUE);
     }
     if (old) DeleteObject(old);
 }
@@ -472,16 +555,16 @@ static LRESULT CALLBACK w_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     if (w_theme_message(w, msg, wp, lp, &color_result))
         return color_result;
     if (page == page_display && w_display_message(msg, wp, lp)) return 0;
+    if (page == page_power && w_power_message(msg, wp, lp)) return 0;
     if (msg == WM_GETMINMAXINFO) {
         UINT dpi = GetDpiForWindow(w);
-        RECT r = {0, 0, MulDiv(544,dpi,96), MulDiv(246,dpi,96)};
+        RECT r = {0, 0, MulDiv(356,dpi,96), MulDiv(266,dpi,96)};
         AdjustWindowRectExForDpi(&r, GetWindowLongW(w, GWL_STYLE), FALSE, GetWindowLongW(w, GWL_EXSTYLE), dpi);
-        ((MINMAXINFO *)lp)->ptMinTrackSize = (POINT){r.right-r.left, r.bottom-r.top};
+        w_tool_minimum(w,(MINMAXINFO *)lp,r.right-r.left,r.bottom-r.top);
         return 0;
     }
     if (msg == WM_DPICHANGED) {
-        RECT *r = (RECT *)lp;
-        SetWindowPos(w, NULL, r->left, r->top, r->right-r->left, r->bottom-r->top, SWP_NOZORDER);
+        w_tool_resize_for_dpi(w,(RECT *)lp);
         w_size_controls(true);
         return 0;
     }
@@ -490,6 +573,10 @@ static LRESULT CALLBACK w_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == WM_COMMAND) {
+        if (page == page_wifi && saved_action && (HWND)lp == saved_action) {
+            w_saved_profile();
+            return 0;
+        }
         if (network_switch && (HWND)lp == network_switch) {
             w_open_network_page(page == page_wifi ? page_network : page_wifi);
             SetFocus(list);
@@ -585,7 +672,8 @@ int w_settings_run(const wchar_t *name) {
     DWORD style = WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX;
     RECT bounds = {0, 0, MulDiv(544, dpi, 96), MulDiv(344, dpi, 96)};
     AdjustWindowRectExForDpi(&bounds, style, FALSE, WS_EX_TOOLWINDOW, dpi);
-    int width = bounds.right - bounds.left, height = bounds.bottom - bounds.top;
+    int width = min(bounds.right - bounds.left, monitor.rcWork.right - monitor.rcWork.left);
+    int height = min(bounds.bottom - bounds.top, monitor.rcWork.bottom - monitor.rcWork.top);
     window = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, titles[page], style,
                             (monitor.rcWork.left + monitor.rcWork.right - width) / 2,
                             (monitor.rcWork.top + monitor.rcWork.bottom - height) / 2,
@@ -624,12 +712,15 @@ int w_settings_run(const wchar_t *name) {
         MoveWindow(list, 12, 49, 520, 199, FALSE);
         network_switch = CreateWindowW(L"BUTTON", L"", BS_OWNERDRAW | WS_CHILD | WS_VISIBLE | WS_TABSTOP,
                                        12, 10, 165, 30, window, (HMENU)108, inst, NULL);
+        saved_action = CreateWindowW(L"BUTTON", L"Save network", BS_OWNERDRAW | WS_CHILD | WS_TABSTOP,
+                                     188, 10, 155, 30, window, (HMENU)109, inst, NULL);
         password = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_TABSTOP | WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL,
                                  284, 300, 246, 30, window, NULL, inst, NULL);
         SendMessageW(password, EM_SETCUEBANNER, TRUE, (LPARAM)L"Wi-Fi password");
         SendMessageW(password, EM_SETLIMITTEXT, 64, 0);
     }
     if (page == page_display) w_display_create(window, list, status, apply);
+    if (page == page_power) w_power_create(window, list, status, apply);
     w_measure_controls();
     w_size_controls(true);
     ShowWindow(window, SW_SHOW);
@@ -643,8 +734,6 @@ int w_settings_run(const wchar_t *name) {
         w_open_network_page(page);
     else if (page == page_bluetooth)
         w_bluetooth_open(window, list, status, apply, lower);
-    else if (page == page_power)
-        w_power_items();
     if (page == page_bluetooth)
         SendMessageW(list, LB_SETCURSEL, 0, 0);
     w_selected();
@@ -663,7 +752,11 @@ int w_settings_run(const wchar_t *name) {
             if (m.message == WM_QUIT) break;
         } else if (GetMessageW(&m, NULL, 0, 0) <= 0) break;
         if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE) {
-            DestroyWindow(window);
+            bool dropped = false;
+            for (size_t i = 0; i < position_count && !dropped; ++i)
+                dropped = positions[i].dropdown_height && SendMessageW(positions[i].control, CB_GETDROPPEDSTATE, 0, 0);
+            if (dropped) DispatchMessageW(&m);
+            else DestroyWindow(window);
             continue;
         }
         if (m.message == WM_KEYDOWN && m.wParam == VK_RETURN && m.hwnd == list) {
@@ -676,6 +769,7 @@ int w_settings_run(const wchar_t *name) {
         }
     }
     w_sound_clear();
+    free(adapters);
     w_bluetooth_close();
     if (wlan)
         wifi.close(wlan, NULL);

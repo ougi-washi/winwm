@@ -195,7 +195,7 @@ bool w_desktop_status_text(const char *key, wchar_t *s, int cap, char *action, s
     }
     if (!strcmp(key, "cpu")) {
         value = cpu;
-        cmd = "open_tasks";
+        cmd = "activity";
     }
     if (!strcmp(key, "throughput")) {
         value = rate;

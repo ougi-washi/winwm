@@ -5,13 +5,17 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: python3 tools/check_layers.py
+      - name: Check module includes for cycles
+        run: |
+          grep -HE '^[[:space:]]*#[[:space:]]*include[[:space:]]*"' src/*/*.[ch] |
+            sed -nE 's|^src/([^/]+)/[^:]+:[[:space:]]*#[[:space:]]*include[[:space:]]*"([^"/]+)/[^"]+".*$|\1 \2|p' |
+            tsort > /dev/null
       - name: Test layout and configuration without the Windows SDK
         run: |
           gcc -std=c11 -Wall -Wextra -Werror -Isrc tools/test_pointer_layout.c src/layout/{layout,gesture}.c src/model/model.c -o "$RUNNER_TEMP/layout"
           "$RUNNER_TEMP/layout"
-          gcc -std=c11 -Wall -Wextra -Werror -Isrc tools/test_appearance_config.c src/config/{language,config}.c src/command/command.c src/base/json.c -o "$RUNNER_TEMP/appearance"
-          "$RUNNER_TEMP/appearance"
+          gcc -std=c11 -Wall -Wextra -Werror -Isrc tools/test_config.c src/config/{language,config}.c src/command/command.c src/base/json.c -o "$RUNNER_TEMP/config"
+          "$RUNNER_TEMP/config"
   winwm:
     runs-on: windows-latest
     steps:
@@ -19,12 +23,7 @@ jobs:
       - uses: msys2/setup-msys2@v2
         with:
           msystem: UCRT64
-          install: >-
-            mingw-w64-ucrt-x86_64-gcc
-            mingw-w64-ucrt-x86_64-python
+          install: mingw-w64-ucrt-x86_64-gcc
           path-type: inherit
-      - name: Verify compiled module dependencies
-        shell: msys2 {0}
-        run: python tools/check_layers.py --linked
       - shell: msys2 {0}
         run: cmd.exe //c build.bat

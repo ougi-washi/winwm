@@ -96,6 +96,10 @@ bool w_command_parse(const char *s, w_command *out) {
             break;
         case cmd_open_folder:
             break;
+        case cmd_open_place:
+            if (strcmp(s, "desktop") && strcmp(s, "documents") && strcmp(s, "downloads") &&
+                strcmp(s, "pictures") && strcmp(s, "videos") && strcmp(s, "config")) return false;
+            break;
         default:
             if (*s)
                 return false;

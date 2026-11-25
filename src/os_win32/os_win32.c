@@ -241,11 +241,11 @@ HANDLE w_os_launch_positioned(const wchar_t *exe, const wchar_t *arg, POINT orig
     return w_launch_at(exe, arg, NULL, &origin);
 }
 
-bool w_os_launch_line(const char *command) {
-    wchar_t line[os_path_cap], path[os_path_cap], home[os_path_cap];
+bool w_os_launch_wide_line(wchar_t *line) {
+    wchar_t path[os_path_cap], home[os_path_cap];
     int argc = 0;
-    if (!w_os_wide(command, line, count_of(line)))
-        return false;
+    while (*line == L' ' || *line == L'\t') ++line;
+    if (!*line) return false;
     wchar_t **argv = CommandLineToArgvW(line, &argc);
     char name[4096];
     bool found =
@@ -265,11 +265,13 @@ bool w_os_launch_line(const char *command) {
     return true;
 }
 
-bool w_os_launch_terminal(const char *name) {
-    wchar_t home[os_path_cap], path[os_path_cap];
-    DWORD n = GetEnvironmentVariableW(L"USERPROFILE", home, count_of(home));
-    if (!n || n >= count_of(home))
-        return false;
+bool w_os_launch_line(const char *command) {
+    wchar_t line[os_path_cap];
+    return w_os_wide(command, line, count_of(line)) && w_os_launch_wide_line(line);
+}
+
+bool w_os_launch_terminal_at(const char *name, const wchar_t *directory) {
+    wchar_t path[os_path_cap];
     if (!strcmp(name, "auto")) {
         if (!w_os_provider("alacritty.exe", path, count_of(path)) &&
             !w_os_provider("%ProgramFiles%\\Alacritty\\alacritty.exe", path, count_of(path)) &&
@@ -277,11 +279,17 @@ bool w_os_launch_terminal(const char *name) {
             return false;
     } else if (!w_os_provider(name, path, count_of(path)))
         return false;
-    HANDLE p = w_launch_at(path, NULL, home, NULL);
+    HANDLE p = w_launch_at(path, NULL, directory, NULL);
     if (!p)
         return false;
     CloseHandle(p);
     return true;
+}
+
+bool w_os_launch_terminal(const char *name) {
+    wchar_t home[os_path_cap];
+    DWORD n = GetEnvironmentVariableW(L"USERPROFILE", home, count_of(home));
+    return n && n < count_of(home) && w_os_launch_terminal_at(name, home);
 }
 
 bool w_os_launch_provider(const char *name, const char *arg) {

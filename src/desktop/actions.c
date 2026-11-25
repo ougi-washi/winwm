@@ -3,11 +3,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
+#include <shlobj.h>
 
 ////////////////
 //~ Actions
 
-enum launch_kind { launch_executable, launch_terminal, launch_command, launch_task_manager, launch_panel };
+enum launch_kind { launch_executable, launch_terminal, launch_command, launch_task_manager, launch_panel, launch_place, launch_window_capture };
 typedef struct w_launch_job {
     char exe[1024], arg[4096];
     enum launch_kind kind;
@@ -17,15 +18,52 @@ typedef struct w_launch_job {
 ////////////////
 //~ Actions Functions
 
+static bool w_open_place(const char *browser, const char *place) {
+    wchar_t config[os_path_cap];
+    PWSTR known = NULL;
+    const wchar_t *path;
+    if (!strcmp(place, "config")) {
+        if (!w_os_config_path(config, count_of(config))) return false;
+        wchar_t *end = wcsrchr(config, L'\\');
+        if (!end) return false;
+        *end = 0;
+        path = config;
+    } else {
+        const KNOWNFOLDERID *id = !strcmp(place, "desktop") ? &FOLDERID_Desktop :
+            !strcmp(place, "downloads") ? &FOLDERID_Downloads : !strcmp(place, "documents") ? &FOLDERID_Documents :
+            !strcmp(place, "pictures") ? &FOLDERID_Pictures : &FOLDERID_Videos;
+        if (FAILED(SHGetKnownFolderPath(id, 0, NULL, &known))) return false;
+        path = known;
+    }
+    wchar_t exe[os_path_cap];
+    HANDLE child = w_os_provider(browser, exe, count_of(exe)) ? w_os_launch(exe, path) : NULL;
+    CoTaskMemFree(known);
+    if (!child) return false;
+    CloseHandle(child);
+    return true;
+}
+
 static DWORD WINAPI w_launch_thread(void *ptr) {
     w_launch_job *j = ptr;
     bool launched;
     switch (j->kind) {
+    case launch_place:
+        launched = w_open_place(j->exe, j->arg);
+        break;
+    case launch_window_capture:
     case launch_panel: {
         wchar_t self[os_path_cap], mode[96];
         HANDLE child = w_os_self(self, count_of(self)) && w_os_wide(j->exe, mode, count_of(mode)) ?
                        w_os_launch_positioned(self, mode, j->origin) : NULL;
         launched = child != NULL;
+        if (child && j->kind == launch_window_capture) {
+            DWORD code;
+            if (WaitForSingleObject(child,10000) != WAIT_OBJECT_0) {
+                // A hung application can block PrintWindow inside the isolated helper.
+                TerminateProcess(child,1);
+                launched = false;
+            } else launched = GetExitCodeProcess(child,&code) && !code;
+        }
         if (child) CloseHandle(child);
         break;
     }
@@ -47,10 +85,12 @@ static DWORD WINAPI w_launch_thread(void *ptr) {
         launched = w_os_launch_provider(j->exe,j->arg);
         break;
     }
-    if (!launched) {
+    if (!launched || j->kind == launch_window_capture) {
         char *why = malloc(512);
         if (why) {
-            snprintf(why, 512, "Could not start %.380s. Check its configured executable path.", j->exe);
+            if (j->kind == launch_window_capture)
+                w_str_copy(why,512,launched ? "Window capture copied to clipboard." : "Could not capture the selected window.");
+            else snprintf(why, 512, "Could not start %.380s. Check its configured executable path.", j->exe);
             if (!PostMessageW(desk.root, msg_status, 0, (LPARAM)why))
                 free(why);
         }
@@ -71,6 +111,19 @@ static bool w_queue_launch(const char *exe, const char *arg, enum launch_kind ki
         return false;
     }
     return true;
+}
+
+bool w_desktop_capture_window(HWND target, DWORD pid) {
+    DWORD current = 0;
+    GetWindowThreadProcessId(target,&current);
+    if (!pid || current != pid || target == GetDesktopWindow() || target == GetShellWindow() ||
+        !IsWindowVisible(target) || IsIconic(target)) {
+        w_desktop_notice("No visible application window to capture.");
+        return false;
+    }
+    char mode[96];
+    snprintf(mode,sizeof(mode),"--tool-capture_window-%llx-%lu",(unsigned long long)(uintptr_t)target,pid);
+    return w_queue_launch(mode,NULL,launch_window_capture,NULL);
 }
 
 static DWORD WINAPI w_start_configured_programs(void *ptr) {
@@ -161,7 +214,6 @@ static bool w_open_files(const w_command *c) {
            w_launch(desk.config.file_browser, utf8);
 }
 
-static wchar_t clip_rows[24][512];
 bool w_desktop_run(const w_command *c) {
     return w_desktop_run_on(c, -1);
 }
@@ -192,6 +244,9 @@ bool w_desktop_run_on(const w_command *c, int output) {
             return false;
     }
     switch (c->kind) {
+    case cmd_open_place:
+        ok = w_queue_launch(desk.config.file_browser, c->arg, launch_place, NULL);
+        break;
     case cmd_terminal:
         ok = w_queue_launch(desk.config.terminal, NULL, launch_terminal, NULL);
         break;
@@ -212,7 +267,10 @@ bool w_desktop_run_on(const w_command *c, int output) {
         ok = configured ? w_launch(configured,"") : w_catalog_launch(c->arg) || w_launch(c->arg,"");
         break;
     }
+    case cmd_activity:
     case cmd_audio:
+    case cmd_project:
+    case cmd_pick_color:
     case cmd_languages:
     case cmd_keyboard_settings:
     case cmd_volume_mixer:
@@ -226,13 +284,19 @@ bool w_desktop_run_on(const w_command *c, int output) {
     case cmd_sleep:
     case cmd_restart:
     case cmd_capture_region:
-    case cmd_capture_window:
     case cmd_record: {
         char mode[64];
         snprintf(mode, sizeof(mode), "--tool-%s", w_command_name(c->kind));
         w_rect work = desk.outputs[output].work;
         POINT origin = {work.x + work.w/2, work.y + work.h/2};
         ok = w_queue_launch(mode, NULL, launch_panel, &origin);
+        break;
+    }
+    case cmd_capture_window: {
+        HWND target = GetForegroundWindow();
+        DWORD pid = 0;
+        GetWindowThreadProcessId(target,&pid);
+        ok = w_desktop_capture_window(target,pid);
         break;
     }
     case cmd_edit_config: {
@@ -417,12 +481,10 @@ bool w_desktop_run_on(const w_command *c, int output) {
             desk.inhibit = !desk.inhibit;
         break;
     case cmd_clipboard_clear:
-        SecureZeroMemory(desk.clips, sizeof(desk.clips));
-        SecureZeroMemory(clip_rows, sizeof(clip_rows));
-        desk.clip_count = 0;
+        w_desktop_clear_clips();
         break;
     case cmd_capture:
-        w_desktop_capture();
+        w_desktop_capture(output);
         break;
     case cmd_notify:
         w_desktop_notice(c->arg);
@@ -482,166 +544,6 @@ bool w_desktop_run_on(const w_command *c, int output) {
     return ok;
 }
 
-static w_palette_entry entries[palette_limit];
-static w_command actions[palette_limit];
-static w_window_id targets[palette_limit];
-static int row_count;
-static int row_output[palette_limit], palette_output;
-static enum command_kind current_palette;
-
-////////////////
-//~ Command palette
-
-static void w_add_row(const wchar_t *label, const char *action, w_window_id target) {
-    if (row_count >= palette_limit)
-        return;
-    int n = row_count++;
-    row_output[n] = palette_output;
-    entries[n].id = n;
-    wcsncpy(entries[n].label, label, 255);
-    entries[n].label[255] = 0;
-    actions[n] = (w_command){0};
-    if (action)
-        w_command_parse(action, &actions[n]);
-    targets[n] = target;
-}
-
-static void w_pick(int n) {
-    if ((unsigned)n >= (unsigned)row_count)
-        return;
-    if (current_palette == cmd_switcher) {
-        if (w_model_valid(&desk.model, targets[n]))
-            w_desktop_activate(targets[n].slot);
-    } else if (current_palette == cmd_clipboard) {
-        if (n >= desk.clip_count)
-            return;
-        size_t bytes = (wcslen(clip_rows[n]) + 1) * sizeof(wchar_t);
-        HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-        if (!mem)
-            return;
-        void *p = GlobalLock(mem);
-        if (!p) {
-            GlobalFree(mem);
-            return;
-        }
-        memcpy(p, clip_rows[n], bytes);
-        GlobalUnlock(mem);
-        if (OpenClipboard(desk.root)) {
-            EmptyClipboard();
-            if (SetClipboardData(CF_UNICODETEXT, mem))
-                mem = NULL;
-            CloseClipboard();
-        }
-        if (mem)
-            GlobalFree(mem);
-    } else if (actions[n].kind)
-        w_desktop_run_on(&actions[n], row_output[n]);
-}
-
-static void w_action_row(const char *label, const char *action) {
-    wchar_t s[256];
-    if (w_os_wide(label, s, count_of(s)))
-        w_add_row(s, action, (w_window_id){-1, 0});
-}
-
-void w_desktop_palette(enum command_kind kind, int output) {
-    current_palette = kind;
-    palette_output = output;
-    row_count = 0;
-    const wchar_t *title = L"Run";
-    if (kind == cmd_switcher) {
-        title = L"Switch window";
-        for (int j = 0; j < window_limit; j++)
-            if (desk.model.windows[j].live) {
-                wchar_t s[256] = {0};
-                GetWindowTextW(desk.windows[j].hwnd, s, count_of(s));
-                w_add_row(*s ? s : L"Untitled window", NULL, (w_window_id){j, desk.model.windows[j].generation});
-            }
-    } else if (kind == cmd_shortcuts) {
-        title = L"Active bindings";
-        for (int j = 0; j < desk.config.binding_count; j++) {
-            w_key_binding *b = &desk.config.bindings[j];
-            char action[1200], label[1400];
-            snprintf(action, sizeof(action), "%s%s%s", w_command_name(b->action.kind),
-                     *b->action.arg ? " " : "", b->action.arg);
-            snprintf(label, sizeof(label), "%s   %s%s", b->chord, action,
-                     desk.registered[j] ? "" : "   [unavailable]");
-            w_action_row(label, action);
-        }
-    } else if (kind == cmd_notifications) {
-        title = L"Notifications";
-        for (int j = desk.notice_count - 1; j >= 0; j--)
-            w_add_row(desk.notices[j], NULL, (w_window_id){-1, 0});
-    } else if (kind == cmd_clipboard) {
-        if (!desk.clipboard_enabled) {
-            desk.clipboard_enabled = AddClipboardFormatListener(desk.root) != 0;
-            w_desktop_copy_clip();
-        }
-        title = L"Clipboard history";
-        memcpy(clip_rows, desk.clips, sizeof(clip_rows));
-        for (int j = 0; j < desk.clip_count; j++)
-            w_add_row(desk.clips[j], NULL, (w_window_id){-1, 0});
-    } else if (kind == cmd_settings) {
-        title = L"Settings";
-        for (int o = 0; o < output_limit; o++)
-            if (desk.outputs[o].live) {
-                w_output_state *d = &desk.outputs[o];
-                wchar_t s[160];
-                const wchar_t *number = !wcsncmp(d->device, L"\\\\.\\DISPLAY", 11) ? d->device + 11 : d->device;
-                swprintf(s, count_of(s), L"Display %ls   ·   %d × %d   ·   %d%%", number, d->screen.w, d->screen.h,
-                         MulDiv(d->dpi, 100, 96));
-                w_add_row(s, "display", (w_window_id){-1, 0});
-                row_output[row_count-1] = o;
-            }
-        static const struct { const char *label, *action; } items[] = {
-            {"Sound devices", "audio"}, {"Volume mixer", "volume_mixer"}, {"Wi-Fi and networks", "wifi"},
-            {"Bluetooth devices", "bluetooth"}, {"Add languages and keyboards", "languages"},
-            {"Set up keyboard layouts", "keyboard_settings"}, {"Power and sleep", "power_settings"},
-            {"Date and time", "date_time"}, {"Change wallpaper", "wallpaper"}, {"Edit configuration", "edit_config"},
-            {"Reload configuration", "reload"}, {"Keyboard shortcuts", "shortcuts"}, {"Volume up", "volume_up"},
-            {"Volume down", "volume_down"}, {"Mute or unmute", "mute"}, {"Toggle toolbar", "bar_toggle"},
-            {"Clear clipboard history", "clipboard_clear"}
-        };
-        for (size_t i = 0; i < count_of(items); i++)
-            w_action_row(items[i].label, items[i].action);
-        w_action_row(desk.inhibit ? "Resume automatic sleep" : "Keep awake", "idle_inhibit");
-        w_action_row(desk.motion_allowed ? "Disable animations" : "Enable animations", "animations_toggle");
-        if (desk.config.animations != motion_system)
-            w_action_row("Follow Windows animation preference", "animations_system");
-        w_action_row(desk.borders_hidden ? "Show window borders" : "Hide window borders", "borders_toggle");
-    } else {
-        for (int j = 0; j < desk.config.app_count; j++) {
-            char a[160];
-            snprintf(a, sizeof(a), "launch %s", desk.config.apps[j].name);
-            w_action_row(desk.config.apps[j].name, a);
-        }
-        w_catalog_begin(desk.root, msg_catalog);
-        for (int j = 0; j < w_catalog_count(); j++) {
-            char name[768], action[800];
-            if (!w_catalog_label(j, name, sizeof(name)))
-                continue;
-            snprintf(action, sizeof(action), "launch %s", name);
-            w_action_row(name, action);
-        }
-        for (int j = 1; j < cmd_count; j++) {
-            w_command c;
-            if (w_command_parse(w_command_name((enum command_kind)j), &c) && c.kind != cmd_launcher)
-                w_action_row(w_command_name(c.kind), w_command_name(c.kind));
-        }
-        const char *ops[] = {"focus left",  "focus right",      "focus up",         "focus down",
-                             "resize grow", "resize shrink",    "split horizontal", "split vertical",
-                             "layout tree", "layout alternate", "layout master",    "layout tabs",
-                             "layout stack"};
-        for (size_t j = 0; j < count_of(ops); j++)
-            w_action_row(ops[j], ops[j]);
-        for (int j = 1; j <= 10; j++) {
-            char s[48];
-            snprintf(s, sizeof(s), "workspace_select %d", j);
-            w_action_row(s, s);
-        }
-    }
-    w_palette_open(desk.outputs[output].monitor, title, entries, row_count, w_pick);
-}
 
 ////////////////
 //~ Clipboard and capture
@@ -653,12 +555,19 @@ void w_desktop_copy_clip(void) {
     UINT exclude = RegisterClipboardFormatW(L"ExcludeClipboardContentFromMonitorProcessing");
     UINT history = RegisterClipboardFormatW(L"CanIncludeInClipboardHistory");
     HANDLE h = NULL;
-    if (!IsClipboardFormatAvailable(exclude) && !IsClipboardFormatAvailable(history))
+    bool permitted = !IsClipboardFormatAvailable(exclude);
+    if (permitted && IsClipboardFormatAvailable(history)) {
+        HANDLE permission = GetClipboardData(history);
+        const DWORD *value = permission && GlobalSize(permission) >= sizeof(DWORD) ? GlobalLock(permission) : NULL;
+        permitted = value && *value == 1;
+        if (value) GlobalUnlock(permission);
+    }
+    if (permitted)
         h = GetClipboardData(CF_UNICODETEXT);
-    if (h && GlobalSize(h) <= 1024) {
+    if (h) {
         const wchar_t *s = GlobalLock(h);
-        size_t bound = GlobalSize(h) / sizeof(wchar_t);
-        if (s && bound && *s && wmemchr(s, 0, bound) && wcslen(s) < count_of(desk.clips[0]) &&
+        size_t bound = min(GlobalSize(h) / sizeof(wchar_t), count_of(desk.clips[0]));
+        if (s && bound && *s && wmemchr(s, 0, bound) &&
             (!desk.clip_count || wcscmp(s, desk.clips[0]))) {
             int keep = w_clamp_int(desk.clip_count, 0, 23);
             memmove(desk.clips + 1, desk.clips, keep * sizeof(desk.clips[0]));
@@ -671,8 +580,8 @@ void w_desktop_copy_clip(void) {
     CloseClipboard();
 }
 
-void w_desktop_capture(void) {
-    w_rect r = desk.outputs[desk.model.output].screen;
+void w_desktop_capture(int output) {
+    w_rect r = desk.outputs[output].screen;
     HDC screen = GetDC(NULL), dc = CreateCompatibleDC(screen);
     HBITMAP bmp = CreateCompatibleBitmap(screen, r.w, r.h);
     bool ok = false;
