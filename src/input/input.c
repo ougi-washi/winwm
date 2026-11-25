@@ -41,6 +41,8 @@ static int on_release[256], on_repeat[256];
 static unsigned prefix_key, prefix_mods;
 static DWORD prefix_time, generation;
 static bool super_down[2], mapped_super[2];
+// The sender and the low-level hook share this process-private marker.
+static char media_input_tag;
 // Use the WM_HOTKEY foreground grant when opening Menu from another process.
 // Binding dispatch always follows the matched physical press, including very
 // short taps where a queued notification may outlive its registration.
@@ -148,8 +150,7 @@ static int w_match(unsigned vk, unsigned scan, unsigned mods, DWORD time, int *r
 
 static bool w_consume_key(WPARAM event, const KBDLLHOOKSTRUCT *key) {
     unsigned vk = key->vkCode;
-    if (vk >= 256 || ((key->flags & LLKHF_INJECTED) &&
-        !(vk == VK_ESCAPE && (held[vk] || InterlockedCompareExchange(&active_drag,0,0)))))
+    if (vk >= 256 || key->dwExtraInfo == (ULONG_PTR)&media_input_tag)
         return false;
     bool up = event == WM_KEYUP || event == WM_SYSKEYUP;
     if (!up && vk == VK_ESCAPE) {
@@ -214,6 +215,14 @@ static bool w_consume_key(WPARAM event, const KBDLLHOOKSTRUCT *key) {
         }
     }
     return false;
+}
+
+bool w_input_send_media_key(WORD key) {
+    INPUT keys[2] = {
+        {.type = INPUT_KEYBOARD, .ki = {.wVk = key, .dwExtraInfo = (ULONG_PTR)&media_input_tag}},
+        {.type = INPUT_KEYBOARD, .ki = {.wVk = key, .dwFlags = KEYEVENTF_KEYUP, .dwExtraInfo = (ULONG_PTR)&media_input_tag}},
+    };
+    return SendInput(2, keys, sizeof(keys[0])) == 2;
 }
 
 ////////////////

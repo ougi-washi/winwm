@@ -17,6 +17,7 @@ uint64_t w_input_pointer_press_count(void);
 void w_input_hover_point(POINT *out);
 void w_input_mouse_motion(void);
 void w_input_cancel_pointer(void);
+bool w_input_send_media_key(WORD key);
 void w_input_mode(bool resize);
 void w_input_stop(void);
 void w_input_reset(void);

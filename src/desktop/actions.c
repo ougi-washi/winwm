@@ -574,13 +574,9 @@ bool w_desktop_run_anchored(const w_command *c, int output, bool admin, const w_
     case cmd_media_previous:
     case cmd_media_next:
     case cmd_media_stop: {
-        UINT key = c->kind == cmd_media_next ? VK_MEDIA_NEXT_TRACK : c->kind == cmd_media_previous ?
+        WORD key = c->kind == cmd_media_next ? VK_MEDIA_NEXT_TRACK : c->kind == cmd_media_previous ?
                    VK_MEDIA_PREV_TRACK : c->kind == cmd_media_stop ? VK_MEDIA_STOP : VK_MEDIA_PLAY_PAUSE;
-        INPUT keys[2] = {0};
-        keys[0].type = keys[1].type = INPUT_KEYBOARD;
-        keys[0].ki.wVk = keys[1].ki.wVk = (WORD)key;
-        keys[1].ki.dwFlags = KEYEVENTF_KEYUP;
-        ok = SendInput(2, keys, sizeof(INPUT)) == 2;
+        ok = w_input_send_media_key(key);
         break;
     }
     case cmd_provider_refresh:
