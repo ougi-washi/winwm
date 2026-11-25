@@ -1,5 +1,4 @@
 #include "desktop/desktop.h"
-#include <dwmapi.h>
 
 ////////////////
 //~ Focus
@@ -298,34 +297,6 @@ void w_desktop_focus_apply(void) {
 ////////////////
 //~ Pointer focus
 
-static HWND w_root_at(POINT point) {
-    return GetAncestor(WindowFromPoint(point), GA_ROOT);
-}
-
-static POINT w_midpoint(RECT r) {
-    return (POINT){r.left + ((int64_t)r.right - r.left) / 2,
-                   r.top + ((int64_t)r.bottom - r.top) / 2};
-}
-
-static void w_center_pointer(POINT entry, HWND target) {
-    RECT frame, clip, area;
-    if ((FAILED(DwmGetWindowAttribute(target, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))) &&
-         !GetWindowRect(target, &frame)) ||
-        !GetClipCursor(&clip) || !IntersectRect(&area, &frame, &clip))
-        return;
-    POINT center = w_midpoint(area);
-    if (!MonitorFromPoint(center, MONITOR_DEFAULTTONULL)) {
-        MONITORINFO monitor = {.cbSize = sizeof(monitor)};
-        if (!GetMonitorInfoW(MonitorFromPoint(entry, MONITOR_DEFAULTTONULL), &monitor) ||
-            !IntersectRect(&area, &area, &monitor.rcMonitor))
-            return;
-        center = w_midpoint(area);
-    }
-    // A floating peer can cover the center of the tile underneath it.
-    if ((center.x != entry.x || center.y != entry.y) && w_root_at(center) == target)
-        SetCursorPos(center.x, center.y);
-}
-
 void w_desktop_hover(POINT point) {
     static HWND last_hit, denied_by;
     static uint32_t last_generation;
@@ -334,18 +305,15 @@ void w_desktop_hover(POINT point) {
         GetAsyncKeyState(VK_LBUTTON) < 0 || GetAsyncKeyState(VK_RBUTTON) < 0 ||
         GetAsyncKeyState(VK_MBUTTON) < 0 || GetAsyncKeyState(VK_XBUTTON1) < 0 || GetAsyncKeyState(VK_XBUTTON2) < 0)
         return;
-    HWND hit = w_root_at(point);
+    HWND hit = GetAncestor(WindowFromPoint(point), GA_ROOT);
     HWND foreground = GetForegroundWindow();
     HWND owner = w_os_app_window(hit);
     int slot = w_desktop_find(owner);
     uint32_t generation = slot >= 0 ? desk.model.windows[slot].generation : 0;
-    bool entered = hit != last_hit || generation != last_generation;
-    if (!entered && denied) {
-        if (denied_by == foreground)
-            return;
-        entered = true;
-    }
-    if (!entered && slot >= 0 && foreground == hit) {
+    bool same_hit = hit == last_hit && generation == last_generation;
+    if (same_hit && denied && denied_by == foreground)
+        return;
+    if (same_hit && !denied && slot >= 0 && foreground == hit) {
         if (!w_model_valid(&desk.model, pending.window))
             w_select_owner(owner);
         return;
@@ -380,6 +348,4 @@ void w_desktop_hover(POINT point) {
     }
     w_desktop_focus_cancel();
     w_select_owner(owner);
-    if (entered)
-        w_center_pointer(point, target);
 }

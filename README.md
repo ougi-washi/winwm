@@ -14,7 +14,7 @@ Tiling window manager for Windows x64. Runs alongside Explorer.
 ## Features
 
 - Per-monitor workspaces, tiling, floating, mouse move and resize.
-- Hover to focus and center the pointer. Desktop gaps clear focus.
+- Hover to focus. Desktop gaps clear focus.
 - Configurable borders, animations, keybindings, and toolbar.
 - Win+D Menu for apps, commands, WinGet installs and updates, and elevated Chocolatey installs.
 - Menu → Settings opens Windows Security, Windows Settings, and Control Panel. `> ms-settings:display` opens Display. Win+I stays blocked while winwm runs.
