@@ -386,6 +386,10 @@ static bool w_app_icon(HDC dc, int index, RECT box) {
                                                  icon_cache[slot].handle, size,size,0,NULL,DI_NORMAL);
 }
 
+static bool w_can_run_admin(int source) {
+    return run_line && (source == command_submit || (source >= 0 && rows[source].entry.can_run_admin));
+}
+
 static void w_draw_result(NMLVCUSTOMDRAW *draw) {
     const NMCUSTOMDRAW *cd = &draw->nmcd;
     int index = (int)cd->dwItemSpec, source = w_source(index);
@@ -431,6 +435,18 @@ static void w_draw_result(NMLVCUSTOMDRAW *draw) {
             DrawTextW(dc,groups[kind].hint,-1,&hint,DT_RIGHT|DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
             label.right=hint.left-px(6);
         }
+    } else if (selected && w_can_run_admin(source)) {
+        const wchar_t *hint = viewport.right >= px(365) ? L"Ctrl+Enter  Admin" : L"Ctrl+↵";
+        SelectObject(dc, small_font);
+        SIZE size;
+        GetTextExtentPoint32W(dc, hint, (int)wcslen(hint), &size);
+        RECT key = label;
+        key.left = key.right - size.cx;
+        RECT shield = {key.left-px(22), key.top, key.left-px(3), key.bottom};
+        SetTextColor(dc, ink);
+        DrawTextW(dc, hint, -1, &key, DT_RIGHT|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
+        w_glyph(dc, 0xea18, shield, ink);
+        label.right = shield.left-px(6);
     } else if (kind && !group && viewport.right >= px(350)) {
         SelectObject(dc, small_font);
         SIZE size;
@@ -496,16 +512,16 @@ static void w_restore_window(HWND previous) {
 }
 
 
-static void w_accept(void) {
+static void w_accept(bool admin) {
     int source = w_source(w_selected_index());
-    if (source == no_result) return;
+    if (source == no_result || (admin && !w_can_run_admin(source))) return;
     if (source == command_submit) {
         if (run_line && command_line && !pending_ticket) {
             if (!++ticket) ++ticket;
             pending_ticket = ticket;
-            launch_status = L"Starting command…";
+            launch_status = admin ? L"Requesting administrator access…" : L"Starting command…";
             w_navigation_hint();
-            run_line(command_line,ticket);
+            run_line(command_line,ticket,admin);
         }
         return;
     }
@@ -523,16 +539,17 @@ static void w_accept(void) {
     int id = rows[source].entry.id;
     palette_callback cb = select_entry;
     w_dismiss(false);
-    if (cb) cb(id);
+    if (cb) cb(id,admin);
 }
 
-void w_palette_line_result(UINT request, bool started) {
+void w_palette_line_result(UINT request, DWORD error) {
     if (!request || request != pending_ticket) return;
     pending_ticket = 0;
     if (!w_palette_shown()) return;
-    if (started) w_dismiss(false);
+    if (!error) w_dismiss(false);
     else {
-        launch_status = L"Could not start the command. Check the executable or path.";
+        launch_status = error == ERROR_CANCELLED ? L"Administrator launch canceled." :
+                                                   L"Could not start the command. Check the executable or path.";
         w_navigation_hint();
         SetFocus(edit);
     }
@@ -554,7 +571,7 @@ static LRESULT CALLBACK w_results_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp, U
             bool pick = source != no_result && pressed_result == source;
             pressed_result = no_result;
             if (GetCapture() == w) ReleaseCapture();
-            if (pick && w_palette_shown()) { w_select(index); w_accept(); }
+            if (pick && w_palette_shown()) { w_select(index); w_accept(false); }
             return 0;
         }
     } else if (msg == WM_CANCELMODE || msg == WM_CAPTURECHANGED || msg == WM_LBUTTONDBLCLK)
@@ -891,6 +908,10 @@ bool w_palette_message(MSG *msg) {
     }
     if (msg->message == WM_SYSKEYDOWN) return false;
     if (ctrl && !shift) {
+        if (msg->wParam == VK_RETURN && run_line && (msg->hwnd == edit || msg->hwnd == list)) {
+            if (!(msg->lParam & (1L << 30))) w_accept(true);
+            return true;
+        }
         if (msg->wParam=='A' && msg->hwnd==edit) { SendMessageW(edit,EM_SETSEL,0,-1); return true; }
         if (msg->hwnd==edit && (msg->wParam==VK_BACK || msg->wParam==VK_DELETE)) {
             w_delete_word(msg->wParam==VK_BACK); return true;
@@ -916,14 +937,14 @@ bool w_palette_message(MSG *msg) {
         return true;
     case VK_RETURN:
         if (msg->hwnd == back || msg->hwnd == close_button) SendMessageW(msg->hwnd,BM_CLICK,0,0);
-        else w_accept();
+        else w_accept(false);
         return true;
     case VK_LEFT: case VK_BACK:
         if (group && !GetWindowTextLengthW(edit)) { w_route(palette_flat); SetFocus(edit); return true; }
         return false;
     case VK_RIGHT:
         if (!GetWindowTextLengthW(edit) && w_source(w_selected_index()) < 0 && result_count) {
-            w_accept(); return true;
+            w_accept(false); return true;
         }
         return false;
     case VK_UP: case VK_DOWN: case VK_PRIOR: case VK_NEXT: {

@@ -19,28 +19,34 @@ static bool dispatching_row;
 typedef struct {
     HWND owner;
     UINT request;
+    bool admin;
     wchar_t line[];
 } w_run_request;
 
 static DWORD WINAPI w_run_line_worker(void *arg) {
     w_run_request *job = arg;
-    bool started = w_os_launch_wide_line(job->line);
-    PostMessageW(job->owner, msg_run_result, job->request, started);
+    SetLastError(ERROR_SUCCESS);
+    bool started = w_os_launch_wide_line(job->line, job->admin);
+    DWORD error = ERROR_SUCCESS;
+    if (!started)
+        error = GetLastError() == ERROR_CANCELLED ? ERROR_CANCELLED : ERROR_GEN_FAILURE;
+    PostMessageW(job->owner, msg_run_result, job->request, error);
     free(job);
     return 0;
 }
 
-static void w_desktop_run_line(const wchar_t *line, UINT request) {
+static void w_desktop_run_line(const wchar_t *line, UINT request, bool admin) {
     size_t bytes = (wcslen(line) + 1) * sizeof(*line);
     w_run_request *job = malloc(sizeof(*job) + bytes);
     if (job) {
         job->owner = desk.root;
         job->request = request;
+        job->admin = admin;
         memcpy(job->line, line, bytes);
         if (QueueUserWorkItem(w_run_line_worker, job, WT_EXECUTEDEFAULT)) return;
         free(job);
     }
-    w_palette_line_result(request, false);
+    w_palette_line_result(request, ERROR_NOT_ENOUGH_MEMORY);
 }
 
 ////////////////
@@ -70,6 +76,7 @@ static void w_add_row(const wchar_t *label, const char *action, w_window_id targ
     int n = row_count++;
     row_output[n] = -1;
     entries[n] = (w_palette_entry){.id = n, .group = group, .glyph = command_glyphs[command.kind]};
+    entries[n].can_run_admin = w_desktop_can_run_admin(command.kind);
     wcsncpy(entries[n].label, label, 255);
     entries[n].label[255] = 0;
     if (IS_HIGH_SURROGATE(entries[n].label[254])) entries[n].label[254] = 0;
@@ -80,9 +87,9 @@ static void w_add_row(const wchar_t *label, const char *action, w_window_id targ
     targets[n] = target;
 }
 
-static void w_pick(int n) {
+static void w_pick(int n, bool admin) {
     if (current_palette == cmd_menu && n >= window_limit) {
-        if (!w_catalog_launch_item(snapshot, n - window_limit))
+        if (!w_catalog_launch_item(snapshot, n - window_limit, admin))
             w_desktop_notice("Could not start the selected application.");
         return;
     }
@@ -120,7 +127,7 @@ static void w_pick(int n) {
             w_desktop_notice("The selected window is no longer available to close.");
     } else if (actions[n].kind) {
         dispatching_row = true;
-        w_desktop_run_on(&actions[n], row_output[n] >= 0 ? row_output[n] : palette_output);
+        w_desktop_run_on(&actions[n], row_output[n] >= 0 ? row_output[n] : palette_output, admin);
         dispatching_row = false;
     }
 }
@@ -427,6 +434,7 @@ void w_desktop_palette(enum command_kind kind, int output) {
                     }
                     row->id = window_limit+i;
                     row->group = palette_apps;
+                    row->can_run_admin = true;
                 }
             }
             w_catalog_release(snapshot);

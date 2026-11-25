@@ -20,17 +20,18 @@ typedef struct w_palette_entry {
     const wchar_t *keywords; // Normalized search terms for built-in actions; static lifetime.
     int system_icon; // One-based index in the shell's small icon image list, or zero.
     uint64_t identity;
+    bool can_run_admin;
 } w_palette_entry;
 
-typedef void (*palette_callback)(int id);
-typedef void (*palette_line_callback)(const wchar_t *line, UINT request);
+typedef void (*palette_callback)(int id, bool admin);
+typedef void (*palette_line_callback)(const wchar_t *line, UINT request, bool admin);
 
 ////////////////
 //~ Palette Interface
 
 void w_palette_open(HMONITOR monitor, const wchar_t *title, const w_palette_entry *entries, int count,
                   palette_callback callback, HANDLE app_images, palette_line_callback run_line);
-void w_palette_line_result(UINT request, bool started);
+void w_palette_line_result(UINT request, DWORD error);
 void w_palette_focus(void);
 void w_palette_position(HMONITOR monitor);
 bool w_palette_shown(void);

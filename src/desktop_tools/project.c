@@ -152,7 +152,7 @@ static DWORD WINAPI w_project_launch(void *arg) {
         job.error = L"Folder unavailable. Choose or enter an existing project folder.";
     else if (!InterlockedCompareExchange(&closing,0,0)) {
         if (job.action == open_terminal)
-            job.launched = w_os_launch_terminal_at(job.provider,job.folder);
+            job.launched = w_os_launch_terminal_at(job.provider,job.folder,false);
         else if (job.action != choose_document) {
             wchar_t exe[os_path_cap];
             HANDLE child = w_os_provider(job.provider,exe,count_of(exe)) ?

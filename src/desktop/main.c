@@ -139,7 +139,7 @@ static void w_discover_initial(void) {
     w_desktop_scan(false);
     desk.ready = true;
     for (int i = 0; i < command_count; i++)
-        w_desktop_run_on(&pending_commands[i].action, pending_commands[i].output);
+        w_desktop_run_on(&pending_commands[i].action, pending_commands[i].output, false);
     command_count = 0;
 }
 
@@ -411,11 +411,12 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         w_desktop_status_done((void *)lp);
         return 0;
     case msg_catalog:
-        if (wp) w_desktop_notice("The selected application could not start.");
+        if (wp) w_desktop_notice(wp == 2 ? "This application could not start as administrator." :
+                                           "The selected application could not start.");
         else w_desktop_catalog_update();
         return 0;
     case msg_run_result:
-        w_palette_line_result((UINT)wp, lp != 0);
+        w_palette_line_result((UINT)wp, (DWORD)lp);
         return 0;
     case msg_devices:
         w_providers_tick();

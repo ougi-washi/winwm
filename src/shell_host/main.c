@@ -108,12 +108,12 @@ static void w_handle_action(int id) {
         if (!w_start_child())
             MessageBoxW(panel, L"The selected winwm executable could not start.", L"Recovery", MB_OK);
     } else if (id == 102)
-        w_os_launch_terminal("%SystemRoot%\\System32\\cmd.exe");
+        w_os_launch_terminal("%SystemRoot%\\System32\\cmd.exe", false);
     else if (id == 103) {
         wchar_t path[os_path_cap];
         char arg[8192];
         if (w_os_config_path(path, count_of(path)) && w_os_utf8(path, arg, sizeof(arg)))
-            w_os_launch_provider("%SystemRoot%\\System32\\notepad.exe", arg);
+            w_os_launch_provider("%SystemRoot%\\System32\\notepad.exe", arg, false);
     } else if (id == 104) {
         wchar_t path[os_path_cap], backup[os_path_cap + 64];
         if (!w_os_config_path(path, count_of(path)))

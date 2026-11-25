@@ -684,7 +684,7 @@ static LRESULT CALLBACK w_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             w_selected();
         }
         if (page == page_bluetooth && LOWORD(wp) == 105 &&
-            !w_os_launch_provider("%SystemRoot%\\System32\\DevicePairingWizard.exe", NULL))
+            !w_os_launch_provider("%SystemRoot%\\System32\\DevicePairingWizard.exe", NULL, false))
             w_message(L"Windows discovery for additional devices is unavailable.");
         if (page == page_audio && ((HWND)lp == default_device || (HWND)lp == calls_device || (HWND)lp == refresh_sound)) {
             bool ok = (HWND)lp == refresh_sound || w_sound_make_default(w_current_item(), (HWND)lp == calls_device);

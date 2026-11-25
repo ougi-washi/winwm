@@ -241,7 +241,32 @@ HANDLE w_os_launch_positioned(const wchar_t *exe, const wchar_t *arg, POINT orig
     return w_launch_at(exe, arg, NULL, &origin);
 }
 
-bool w_os_launch_wide_line(wchar_t *line) {
+bool w_os_run_as_admin(const wchar_t *file, const wchar_t *parameters, const wchar_t *directory) {
+    HRESULT apartment = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    SHELLEXECUTEINFOW info = {.cbSize = sizeof(info), .fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
+        .lpVerb = L"runas", .lpFile = file, .lpParameters = parameters, .lpDirectory = directory,
+        .nShow = SW_SHOWNORMAL};
+    bool started = ShellExecuteExW(&info) != FALSE;
+    DWORD error = started ? ERROR_SUCCESS : GetLastError();
+    if (SUCCEEDED(apartment)) CoUninitialize();
+    SetLastError(error);
+    return started;
+}
+
+bool w_os_run_executable(const wchar_t *exe, const wchar_t *argument, const wchar_t *directory, bool admin) {
+    if (admin) {
+        wchar_t quoted[2 * os_path_cap + 3];
+        if (argument && wcslen(argument) >= os_path_cap) return false;
+        if (argument && *argument) w_quote(quoted, argument);
+        return w_os_run_as_admin(exe, argument && *argument ? quoted : NULL, directory);
+    }
+    HANDLE child = w_launch_at(exe, argument, directory, NULL);
+    if (!child) return false;
+    CloseHandle(child);
+    return true;
+}
+
+bool w_os_launch_wide_line(wchar_t *line, bool admin) {
     wchar_t path[os_path_cap], home[os_path_cap];
     int argc = 0;
     while (*line == L' ' || *line == L'\t') ++line;
@@ -255,6 +280,13 @@ bool w_os_launch_wide_line(wchar_t *line) {
     DWORD n = GetEnvironmentVariableW(L"USERPROFILE", home, count_of(home));
     if (!found || !n || n >= count_of(home))
         return false;
+    if (admin) {
+        // argv[0] is the executable. Give its original argument tail to ShellExecuteEx.
+        const wchar_t *args = *line == L'"' ? wcschr(line + 1, L'"') : line + wcscspn(line, L" \t");
+        if (args && *args == L'"') ++args;
+        if (args) args += wcsspn(args, L" \t");
+        return w_os_run_as_admin(path, args && *args ? args : NULL, home);
+    }
     STARTUPINFOW si = {.cb = sizeof(si)};
     PROCESS_INFORMATION pi = {0};
     if (!CreateProcessW(path, line, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, home, &si, &pi))
@@ -265,12 +297,12 @@ bool w_os_launch_wide_line(wchar_t *line) {
     return true;
 }
 
-bool w_os_launch_line(const char *command) {
+bool w_os_launch_line(const char *command, bool admin) {
     wchar_t line[os_path_cap];
-    return w_os_wide(command, line, count_of(line)) && w_os_launch_wide_line(line);
+    return w_os_wide(command, line, count_of(line)) && w_os_launch_wide_line(line, admin);
 }
 
-bool w_os_launch_terminal_at(const char *name, const wchar_t *directory) {
+bool w_os_launch_terminal_at(const char *name, const wchar_t *directory, bool admin) {
     wchar_t path[os_path_cap];
     if (!strcmp(name, "auto")) {
         if (!w_os_provider("alacritty.exe", path, count_of(path)) &&
@@ -279,28 +311,20 @@ bool w_os_launch_terminal_at(const char *name, const wchar_t *directory) {
             return false;
     } else if (!w_os_provider(name, path, count_of(path)))
         return false;
-    HANDLE p = w_launch_at(path, NULL, directory, NULL);
-    if (!p)
-        return false;
-    CloseHandle(p);
-    return true;
+    return w_os_run_executable(path, NULL, directory, admin);
 }
 
-bool w_os_launch_terminal(const char *name) {
+bool w_os_launch_terminal(const char *name, bool admin) {
     wchar_t home[os_path_cap];
     DWORD n = GetEnvironmentVariableW(L"USERPROFILE", home, count_of(home));
-    return n && n < count_of(home) && w_os_launch_terminal_at(name, home);
+    return n && n < count_of(home) && w_os_launch_terminal_at(name, home, admin);
 }
 
-bool w_os_launch_provider(const char *name, const char *arg) {
+bool w_os_launch_provider(const char *name, const char *arg, bool admin) {
     wchar_t path[os_path_cap], param[os_path_cap];
     if (!w_os_provider(name, path, count_of(path)) || !w_os_wide(arg ? arg : "", param, count_of(param)))
         return false;
-    HANDLE p = w_os_launch(path, param);
-    if (!p)
-        return false;
-    CloseHandle(p);
-    return true;
+    return w_os_run_executable(path, param, NULL, admin);
 }
 
 void w_os_mark(const wchar_t *stage) {

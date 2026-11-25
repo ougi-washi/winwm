@@ -13,13 +13,14 @@ enum launch_kind { launch_executable, launch_terminal, launch_command, launch_ta
 typedef struct w_launch_job {
     char exe[1024], arg[4096];
     enum launch_kind kind;
+    bool admin;
     POINT origin;
 } w_launch_job;
 
 ////////////////
 //~ Actions Functions
 
-static bool w_open_place(const char *browser, const char *place) {
+static bool w_open_place(const char *browser, const char *place, bool admin) {
     wchar_t config[os_path_cap];
     PWSTR known = NULL;
     const wchar_t *path;
@@ -37,16 +38,15 @@ static bool w_open_place(const char *browser, const char *place) {
         path = known;
     }
     wchar_t exe[os_path_cap];
-    HANDLE child = w_os_provider(browser, exe, count_of(exe)) ? w_os_launch(exe, path) : NULL;
+    bool launched = w_os_provider(browser, exe, count_of(exe)) && w_os_run_executable(exe, path, NULL, admin);
     CoTaskMemFree(known);
-    if (!child) return false;
-    CloseHandle(child);
-    return true;
+    return launched;
 }
 
 static DWORD WINAPI w_launch_thread(void *ptr) {
     w_launch_job *j = ptr;
     bool launched;
+    SetLastError(ERROR_SUCCESS);
     switch (j->kind) {
     case launch_windows_update: {
         HRESULT apartment = CoInitializeEx(NULL,COINIT_APARTMENTTHREADED|COINIT_DISABLE_OLE1DDE);
@@ -57,13 +57,20 @@ static DWORD WINAPI w_launch_thread(void *ptr) {
         break;
     }
     case launch_place:
-        launched = w_open_place(j->exe, j->arg);
+        launched = w_open_place(j->exe, j->arg, j->admin);
         break;
     case launch_window_capture:
     case launch_panel: {
         wchar_t self[os_path_cap], mode[96];
-        HANDLE child = w_os_self(self, count_of(self)) && w_os_wide(j->exe, mode, count_of(mode)) ?
-                       w_os_launch_positioned(self, mode, j->origin) : NULL;
+        if (!w_os_self(self, count_of(self)) || !w_os_wide(j->exe, mode, count_of(mode))) {
+            launched = false;
+            break;
+        }
+        if (j->admin) {
+            launched = w_os_run_as_admin(self, mode, NULL);
+            break;
+        }
+        HANDLE child = w_os_launch_positioned(self, mode, j->origin);
         launched = child != NULL;
         if (child && j->kind == launch_window_capture) {
             DWORD code;
@@ -77,24 +84,21 @@ static DWORD WINAPI w_launch_thread(void *ptr) {
         break;
     }
     case launch_command:
-        launched = w_os_launch_line(j->exe);
+        launched = w_os_launch_line(j->exe, j->admin);
         break;
     case launch_terminal:
-        launched = w_os_launch_terminal(j->exe);
+        launched = w_os_launch_terminal(j->exe, j->admin);
         break;
     case launch_task_manager: {
         wchar_t path[os_path_cap];
-        HANDLE child = w_os_task_manager(j->exe,path,count_of(path)) ? w_os_launch(path,NULL) : NULL;
-        launched = child != NULL;
-        if (child)
-            CloseHandle(child);
+        launched = w_os_task_manager(j->exe,path,count_of(path)) && w_os_run_executable(path,NULL,NULL,j->admin);
         break;
     }
     default:
-        launched = w_os_launch_provider(j->exe,j->arg);
+        launched = w_os_launch_provider(j->exe,j->arg,j->admin);
         break;
     }
-    if (!launched || j->kind == launch_window_capture) {
+    if ((!launched && !(j->admin && GetLastError() == ERROR_CANCELLED)) || j->kind == launch_window_capture) {
         char *why = malloc(512);
         if (why) {
             if (j->kind == launch_window_capture)
@@ -108,11 +112,12 @@ static DWORD WINAPI w_launch_thread(void *ptr) {
     return 0;
 }
 
-static bool w_queue_launch(const char *exe, const char *arg, enum launch_kind kind, const POINT *origin) {
+static bool w_queue_launch(const char *exe, const char *arg, enum launch_kind kind, const POINT *origin, bool admin) {
     w_launch_job *j = calloc(1, sizeof(*j));
     if (!j)
         return false;
     j->kind = kind;
+    j->admin = admin;
     if (origin) j->origin = *origin;
     if (!w_str_copy(j->exe, sizeof(j->exe), exe) || !w_str_copy(j->arg, sizeof(j->arg), arg ? arg : "") ||
         !QueueUserWorkItem(w_launch_thread, j, WT_EXECUTEDEFAULT)) {
@@ -132,13 +137,13 @@ bool w_desktop_capture_window(HWND target, DWORD pid) {
     }
     char mode[96];
     snprintf(mode,sizeof(mode),"--tool-capture_window-%llx-%lu",(unsigned long long)(uintptr_t)target,pid);
-    return w_queue_launch(mode,NULL,launch_window_capture,NULL);
+    return w_queue_launch(mode,NULL,launch_window_capture,NULL,false);
 }
 
 static DWORD WINAPI w_start_configured_programs(void *ptr) {
     w_startup_entry *entries = ptr;
     for (int i = 0; entries[i].command_line[0]; i++) {
-        if (w_os_launch_line(entries[i].command_line))
+        if (w_os_launch_line(entries[i].command_line, false))
             continue;
         char *message = malloc(512);
         if (message) {
@@ -167,8 +172,8 @@ void w_desktop_start_programs(bool first_load) {
         free(entries);
 }
 
-static bool w_launch(const char *exe, const char *arg) {
-    return w_queue_launch(exe, arg, launch_executable, NULL);
+static bool w_launch(const char *exe, const char *arg, bool admin) {
+    return w_queue_launch(exe, arg, launch_executable, NULL, admin);
 }
 
 ////////////////
@@ -188,10 +193,10 @@ void w_desktop_notice(const char *s) {
 void w_desktop_action(int output, const char *s) {
     w_command c;
     if (w_command_parse(s, &c))
-        w_desktop_run_on(&c, output);
+        w_desktop_run_on(&c, output, false);
 }
 
-static bool w_open_files(const w_command *c) {
+static bool w_open_files(const w_command *c, bool admin) {
     char utf8[4096];
     wchar_t path[os_path_cap];
     if (*c->arg) {
@@ -220,14 +225,57 @@ static bool w_open_files(const w_command *c) {
     wchar_t canonical[os_path_cap];
     DWORD n = GetFullPathNameW(path, count_of(canonical), canonical, NULL);
     return n && n < count_of(canonical) && w_os_utf8(canonical, utf8, sizeof(utf8)) &&
-           w_launch(desk.config.file_browser, utf8);
+           w_launch(desk.config.file_browser, utf8, admin);
+}
+
+static bool w_panel_command(enum command_kind kind) {
+    switch (kind) {
+    case cmd_activity:
+    case cmd_packages:
+    case cmd_updates:
+    case cmd_google_japanese_input:
+    case cmd_input_methods:
+    case cmd_bar_settings:
+    case cmd_microphone:
+    case cmd_audio:
+    case cmd_project:
+    case cmd_pick_color:
+    case cmd_languages:
+    case cmd_keyboard_settings:
+    case cmd_volume_mixer:
+    case cmd_power_settings:
+    case cmd_date_time:
+    case cmd_network_settings:
+    case cmd_wifi:
+    case cmd_bluetooth:
+    case cmd_display:
+    case cmd_wallpaper:
+    case cmd_sleep:
+    case cmd_restart:
+    case cmd_capture_region:
+    case cmd_record:
+        return true;
+    default: return false;
+    }
+}
+
+bool w_desktop_can_run_admin(enum command_kind kind) {
+    switch (kind) {
+    case cmd_launch: case cmd_program: case cmd_terminal: case cmd_open_tasks:
+    case cmd_open_folder: case cmd_reveal_file: case cmd_open_place: case cmd_edit_config:
+        return true;
+    default:
+        return w_panel_command(kind);
+    }
 }
 
 bool w_desktop_run(const w_command *c) {
-    return w_desktop_run_on(c, -1);
+    return w_desktop_run_on(c, -1, false);
 }
 
-bool w_desktop_run_on(const w_command *c, int output) {
+bool w_desktop_run_on(const w_command *c, int output, bool admin) {
+    if (admin && !w_desktop_can_run_admin(c->kind))
+        return false;
     w_desktop_model *m = &desk.model;
     int i = m->focus, o = m->output, ws = m->selected[o];
     w_model_window *w = i >= 0 ? &m->windows[i] : NULL;
@@ -253,19 +301,25 @@ bool w_desktop_run_on(const w_command *c, int output) {
         if (destination < 0 || destination >= workspace_limit)
             return false;
     }
-    switch (c->kind) {
+    if (w_panel_command(c->kind)) {
+        char mode[64];
+        snprintf(mode, sizeof(mode), "--tool-%s", w_command_name(c->kind));
+        w_rect work = desk.outputs[output].work;
+        POINT origin = {work.x + work.w/2, work.y + work.h/2};
+        ok = w_queue_launch(mode, NULL, launch_panel, &origin, admin);
+    } else switch (c->kind) {
     case cmd_open_place:
-        ok = w_queue_launch(desk.config.file_browser, c->arg, launch_place, NULL);
+        ok = w_queue_launch(desk.config.file_browser, c->arg, launch_place, NULL, admin);
         break;
     case cmd_terminal:
-        ok = w_queue_launch(desk.config.terminal, NULL, launch_terminal, NULL);
+        ok = w_queue_launch(desk.config.terminal, NULL, launch_terminal, NULL, admin);
         break;
     case cmd_open_tasks:
-        ok = w_queue_launch(desk.config.task_manager, NULL, launch_task_manager, NULL);
+        ok = w_queue_launch(desk.config.task_manager, NULL, launch_task_manager, NULL, admin);
         break;
     case cmd_open_folder:
     case cmd_reveal_file:
-        ok = w_open_files(c);
+        ok = w_open_files(c, admin);
         break;
     case cmd_launch: {
         const char *configured = NULL;
@@ -274,38 +328,7 @@ bool w_desktop_run_on(const w_command *c, int output) {
                 configured = desk.config.apps[j].path;
                 break;
             }
-        ok = configured ? w_launch(configured,"") : w_catalog_launch(c->arg) || w_launch(c->arg,"");
-        break;
-    }
-    case cmd_activity:
-    case cmd_packages:
-    case cmd_updates:
-    case cmd_google_japanese_input:
-    case cmd_input_methods:
-    case cmd_bar_settings:
-    case cmd_microphone:
-    case cmd_audio:
-    case cmd_project:
-    case cmd_pick_color:
-    case cmd_languages:
-    case cmd_keyboard_settings:
-    case cmd_volume_mixer:
-    case cmd_power_settings:
-    case cmd_date_time:
-    case cmd_network_settings:
-    case cmd_wifi:
-    case cmd_bluetooth:
-    case cmd_display:
-    case cmd_wallpaper:
-    case cmd_sleep:
-    case cmd_restart:
-    case cmd_capture_region:
-    case cmd_record: {
-        char mode[64];
-        snprintf(mode, sizeof(mode), "--tool-%s", w_command_name(c->kind));
-        w_rect work = desk.outputs[output].work;
-        POINT origin = {work.x + work.w/2, work.y + work.h/2};
-        ok = w_queue_launch(mode, NULL, launch_panel, &origin);
+        ok = configured ? w_launch(configured,"",admin) : w_catalog_launch(c->arg,admin) || w_launch(c->arg,"",admin);
         break;
     }
     case cmd_capture_window: {
@@ -319,7 +342,7 @@ bool w_desktop_run_on(const w_command *c, int output) {
         wchar_t path[os_path_cap];
         char s[4096];
         ok = w_os_config_path(path, count_of(path)) && w_os_utf8(path, s, sizeof(s)) &&
-             w_launch(desk.config.editor, s);
+             w_launch(desk.config.editor, s, admin);
         break;
     }
     case cmd_menu:
@@ -351,7 +374,7 @@ bool w_desktop_run_on(const w_command *c, int output) {
         break;
     }
     case cmd_program:
-        ok = w_queue_launch(c->arg, "", launch_command, NULL);
+        ok = w_queue_launch(c->arg, "", launch_command, NULL, admin);
         break;
     case cmd_resize_mode:
         desk.resize = !desk.resize;
@@ -483,7 +506,7 @@ bool w_desktop_run_on(const w_command *c, int output) {
         ok = LockWorkStation() != 0;
         break;
     case cmd_windows_update:
-        ok = w_queue_launch("Windows Update",NULL,launch_windows_update,NULL);
+        ok = w_queue_launch("Windows Update",NULL,launch_windows_update,NULL,false);
         break;
     case cmd_confirm_sign_out:
         if (MessageBoxW(NULL, L"Sign out and close your applications?", L"Sign out",

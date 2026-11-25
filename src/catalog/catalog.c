@@ -373,10 +373,30 @@ void w_catalog_label(const w_catalog_state *c, int i, wchar_t *out, int cap, int
     }
 }
 
+typedef struct w_catalog_launch_job {
+    w_catalog_item item;
+    bool admin;
+} w_catalog_launch_job;
+
 static DWORD WINAPI w_launch_entry(void *ptr) {
-    w_catalog_item *e = ptr;
+    w_catalog_launch_job *job = ptr;
+    const w_catalog_item *e = &job->item;
     bool launched = false;
-    if (e->packaged) {
+    DWORD error = ERROR_SUCCESS;
+    if (job->admin && e->packaged) {
+        HRESULT apartment = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        wchar_t name[count_of(e->target) + 32];
+        PIDLIST_ABSOLUTE item = NULL;
+        swprintf(name, count_of(name), L"shell:AppsFolder\\%ls", e->target);
+        if (SUCCEEDED(SHParseDisplayName(name, NULL, &item, 0, NULL))) {
+            SHELLEXECUTEINFOW info = {.cbSize=sizeof(info), .lpIDList=item, .lpVerb=L"runas",
+                .fMask=SEE_MASK_INVOKEIDLIST | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI, .nShow=SW_SHOWNORMAL};
+            launched = ShellExecuteExW(&info) != FALSE;
+            if (!launched) error = GetLastError();
+            CoTaskMemFree(item);
+        }
+        if (SUCCEEDED(apartment)) CoUninitialize();
+    } else if (e->packaged) {
         if (SUCCEEDED(CoInitializeEx(NULL, COINIT_APARTMENTTHREADED))) {
             IApplicationActivationManager *am = NULL;
             if (SUCCEEDED(CoCreateInstance(&CLSID_ApplicationActivationManager, NULL, CLSCTX_LOCAL_SERVER,
@@ -391,44 +411,49 @@ static DWORD WINAPI w_launch_entry(void *ptr) {
     } else {
         char name[4096];
         wchar_t resolved[os_path_cap], line[os_path_cap + 520];
-        if (w_os_utf8(e->target, name, sizeof(name)) && w_os_provider(name, resolved, count_of(resolved)) &&
-            swprintf(line, count_of(line), L"\"%ls\" %ls", resolved, e->args) > 0) {
-            STARTUPINFOW si = {.cb = sizeof(si)};
-            PROCESS_INFORMATION pi = {0};
-            if (CreateProcessW(resolved, line, NULL, NULL, FALSE, 0, NULL,
-                               *e->directory ? e->directory : NULL, &si, &pi)) {
-                AllowSetForegroundWindow(pi.dwProcessId);
-                launched = true;
-                CloseHandle(pi.hProcess);
-                CloseHandle(pi.hThread);
+        if (w_os_utf8(e->target, name, sizeof(name)) && w_os_provider(name, resolved, count_of(resolved))) {
+            if (job->admin) {
+                launched = w_os_run_as_admin(resolved, *e->args ? e->args : NULL, *e->directory ? e->directory : NULL);
+                if (!launched) error = GetLastError();
+            } else if (swprintf(line, count_of(line), L"\"%ls\" %ls", resolved, e->args) > 0) {
+                STARTUPINFOW si = {.cb = sizeof(si)};
+                PROCESS_INFORMATION pi = {0};
+                if (CreateProcessW(resolved, line, NULL, NULL, FALSE, 0, NULL,
+                                   *e->directory ? e->directory : NULL, &si, &pi)) {
+                    AllowSetForegroundWindow(pi.dwProcessId);
+                    launched = true;
+                    CloseHandle(pi.hProcess);
+                    CloseHandle(pi.hThread);
+                }
             }
         }
     }
-    free(e);
-    if (!launched) PostMessageW(target_window, ready_message, 1, 0);
+    if (!launched && error != ERROR_CANCELLED) PostMessageW(target_window, ready_message, job->admin ? 2 : 1, 0);
+    free(job);
     return 0;
 }
 
-bool w_catalog_launch_item(const w_catalog_state *c, int index) {
+bool w_catalog_launch_item(const w_catalog_state *c, int index, bool admin) {
     if (!c || (unsigned)index >= (unsigned)c->count) return false;
-    w_catalog_item *entry = malloc(sizeof(*entry));
+    w_catalog_launch_job *entry = malloc(sizeof(*entry));
     if (!entry)
         return false;
-    *entry = c->rows[index].app;
+    entry->item = c->rows[index].app;
+    entry->admin = admin;
     if (QueueUserWorkItem(w_launch_entry, entry, WT_EXECUTEDEFAULT))
         return true;
     free(entry);
     return false;
 }
 
-bool w_catalog_launch(const char *name) {
+bool w_catalog_launch(const char *name, bool admin) {
     wchar_t wide[256];
     if (!w_os_wide(name, wide, count_of(wide))) return false;
     w_catalog_state *c = w_catalog_acquire();
     bool ok = false;
     for (int i = 0; i < w_catalog_count(c); ++i)
         if (!_wcsicmp(c->rows[i].app.name, wide)) {
-            ok = w_catalog_launch_item(c, i);
+            ok = w_catalog_launch_item(c, i, admin);
             break;
         }
     w_catalog_release(c);
