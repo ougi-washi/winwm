@@ -1,5 +1,11 @@
 name: build
-on: [push, pull_request]
+on:
+  push:
+    branches: ['**']
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  pull_request:
+permissions:
+  contents: read
 jobs:
   portable:
     runs-on: ubuntu-latest
@@ -30,3 +36,27 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $seed = Get-FileHash "$env:USERPROFILE/.config/winwm/winwm.lua"
           if ($seed.Hash -ne (Get-FileHash assets/winwm.lua).Hash) { throw 'First-run config differs from shipped config.' }
+      - uses: actions/upload-artifact@v7
+        if: github.event_name == 'push' && github.ref_type == 'tag'
+        with:
+          name: winwm-windows-x64
+          path: bin/*.exe
+          if-no-files-found: error
+  release:
+    if: github.event_name == 'push' && github.ref_type == 'tag'
+    needs: [portable, winwm]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: winwm-windows-x64
+      - name: Publish Windows x64 release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          zip -9 winwm-windows-x64.zip winwm.exe winwm_recovery.exe winwm_install.exe
+          gh release create "$GITHUB_REF_NAME" winwm-windows-x64.zip \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --title "WinWM $GITHUB_REF_NAME" \
+            --notes 'Windows x64. Extract the ZIP. Run `winwm.exe --preview` to try WinWM or `winwm_install.exe /install` to start it at sign-in.'
