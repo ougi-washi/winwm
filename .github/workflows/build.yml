@@ -56,7 +56,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          zip -9 winwm-windows-x64.zip winwm.exe winwm_recovery.exe winwm_install.exe
-          gh release create "$GITHUB_REF_NAME" winwm-windows-x64.zip \
+          executables=(winwm.exe winwm_recovery.exe winwm_install.exe)
+          zip -9 winwm-windows-x64.zip "${executables[@]}"
+          gh release create "$GITHUB_REF_NAME" winwm-windows-x64.zip "${executables[@]}" \
             --repo "$GITHUB_REPOSITORY" --verify-tag --title "WinWM $GITHUB_REF_NAME" \
-            --notes 'Windows x64. Extract the ZIP. Run `winwm.exe --preview` to try WinWM or `winwm_install.exe /install` to start it at sign-in.'
+            --notes 'Windows x64. Extract the ZIP or download all three executables to the same folder. Run `winwm.exe --preview` to try WinWM or `winwm_install.exe /install` to start it at sign-in.'
