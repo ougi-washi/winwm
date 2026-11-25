@@ -15,7 +15,6 @@ src/theme/icon_button.c
 -lshell32
 -lrstrtmgr
 -ladvapi32
--lcrypt32
 -ldwmapi
 -luxtheme
 -lgdi32

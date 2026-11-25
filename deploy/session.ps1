@@ -19,11 +19,17 @@ $sessionSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $version=Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
 $x64=($env:PROCESSOR_ARCHITECTURE -eq 'AMD64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'AMD64')
 $utf8=New-Object System.Text.UTF8Encoding($false)
-function Write-Atomic($path,$text) {
+function Write-Atomic($path,$text,[switch]$IfMissing) {
     $tmp="$path.$([Guid]::NewGuid()).tmp"
-    [IO.File]::WriteAllText($tmp,$text,$utf8)
-    if ([IO.File]::Exists($path)) { [IO.File]::Replace($tmp,$path,[System.Management.Automation.Language.NullString]::Value) }
-    else { [IO.File]::Move($tmp,$path) }
+    try {
+        [IO.File]::WriteAllText($tmp,$text,$utf8)
+        if (!$IfMissing -and [IO.File]::Exists($path)) {
+            [IO.File]::Replace($tmp,$path,[System.Management.Automation.Language.NullString]::Value)
+        } else {
+            try { [IO.File]::Move($tmp,$path) }
+            catch [IO.IOException] { if (!$IfMissing -or ![IO.File]::Exists($path)) {throw} }
+        }
+    } finally { [IO.File]::Delete($tmp) }
 }
 function Get-RegValue($entry) {
     $key=[Microsoft.Win32.Registry]::CurrentUser.OpenSubKey($entry.path)
@@ -79,19 +85,23 @@ if ($Action -eq 'Stage') {
     }
     $config=Join-Path $legacyRoot 'config.jsonc'
     $nativeConfig=Join-Path $env:USERPROFILE '.config\winwm\winwm.conf'
-    if (!(Test-Path $nativeConfig) -and !(Test-Path $config)) {
-        if (!$FileBrowser -or !$TaskManager) {throw 'Specify -FileBrowser and -TaskManager with the installed executable paths.'}
-        $fb=(Get-Item -LiteralPath $FileBrowser).FullName
-        $tm=(Get-Item -LiteralPath $TaskManager).FullName
-        foreach ($provider in $fb,$tm) {
-            if ([IO.Path]::GetExtension($provider) -ine '.exe') {
-                throw "Invalid provider: $provider"
+    $configDir=Split-Path -Parent $nativeConfig
+    $companions=Join-Path $configDir 'companions.jsonc'
+    if (!(Test-Path -LiteralPath $nativeConfig) -and !(Test-Path -LiteralPath $config) -and
+        !(Test-Path -LiteralPath (Join-Path $configDir 'legacy.jsonc'))) {
+        if (!(Test-Path -LiteralPath $companions)) {
+            if (!$FileBrowser -or !$TaskManager) {throw 'Specify -FileBrowser and -TaskManager with the installed executable paths.'}
+            $fb=(Get-Item -LiteralPath $FileBrowser).FullName
+            $tm=(Get-Item -LiteralPath $TaskManager).FullName
+            foreach ($provider in $fb,$tm) {
+                if ([IO.Path]::GetExtension($provider) -ine '.exe') {
+                    throw "Invalid provider: $provider"
+                }
             }
+            [IO.Directory]::CreateDirectory($configDir) | Out-Null
+            Write-Atomic $companions (@{version=1;file_browser=$fb;task_manager=$tm}|ConvertTo-Json) -IfMissing
         }
-        $configDir=Split-Path -Parent $nativeConfig
-        [IO.Directory]::CreateDirectory($configDir) | Out-Null
-        Write-Atomic (Join-Path $configDir 'companions.jsonc') (@{version=1;file_browser=$fb;task_manager=$tm}|ConvertTo-Json)
-        Write-Atomic $nativeConfig "source = companions.jsonc`n"
+        Write-Atomic $nativeConfig "source = companions.jsonc`n" -IfMissing
     }
     $check=Start-Process -FilePath (Join-Path $destination 'winwm.exe') -ArgumentList 'ctl','prepare' -PassThru -Wait -WindowStyle Hidden
     if ($check.ExitCode) {throw 'winwm configuration validation failed.'}

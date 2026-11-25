@@ -57,7 +57,6 @@ src/win_platform/cpu.c
 src/win_platform/percent_slider.c
 src/win_platform/win_platform.c
 -luser32
--lcrypt32
 -ladvapi32
 -ldwmapi
 -ldxva2

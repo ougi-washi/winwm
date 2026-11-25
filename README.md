@@ -28,6 +28,8 @@ Tiling window manager for Windows x64. Normal startup exits Explorer. Exiting wi
 
 `%USERPROFILE%\.config\winwm\winwm.conf` · Reload with Win+Shift+R.
 
+Updates reuse the existing config and its sourced files.
+
 ```ini
 general:gaps_in = 6
 bar:modules_right = network audio keyboard battery

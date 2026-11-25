@@ -1,6 +1,5 @@
 #include "win_platform/win_platform.h"
 #include "config/language.h"
-#include <wincrypt.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
@@ -75,123 +74,6 @@ static bool w_publish(const wchar_t *path, const char *bytes, const wchar_t *cop
     return ok;
 }
 
-// Only a byte-identical shipped profile can be upgraded. Rename the verified open
-// file by handle so a concurrent save cannot transfer a different file to the backup.
-static void w_upgrade_stock_profile(const wchar_t *path) {
-    static const struct stock_version {
-        DWORD size;
-        BYTE hash[32];
-        const wchar_t *suffix;
-    } versions[] = {
-        {3475, {0x37, 0x17, 0xe8, 0x65, 0x5a, 0x4d, 0x4a, 0x89, 0x7a, 0x61, 0x91, 0x54,
-                0x2a, 0xf1, 0x9b, 0x78, 0x81, 0x6d, 0x9b, 0xc8, 0x38, 0xf2, 0x24, 0x17,
-                0x36, 0xd8, 0xbe, 0x9b, 0x7b, 0x1d, 0x14, 0x31}, L".previous"},
-        {4078, {0x23, 0xcf, 0x1d, 0xf3, 0x89, 0xad, 0x0c, 0x74, 0xf0, 0x09, 0x55, 0x43,
-                0xb1, 0x27, 0x78, 0x1d, 0xff, 0x91, 0x3a, 0x01, 0xcb, 0x87, 0xc1, 0x96,
-                0xd0, 0x97, 0x03, 0xca, 0xa3, 0xe1, 0xf6, 0x94}, L".before-move-repeat"},
-    };
-    BYTE hash[32];
-    WIN32_FILE_ATTRIBUTE_DATA attrs;
-    if (!GetFileAttributesExW(path, GetFileExInfoStandard, &attrs) ||
-        (attrs.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_READONLY)) ||
-        attrs.nFileSizeHigh)
-        return;
-    const struct stock_version *version = NULL;
-    for (size_t i = 0; i < count_of(versions); i++)
-        if (attrs.nFileSizeLow == versions[i].size)
-            version = &versions[i];
-    if (!version)
-        return;
-    HANDLE file = CreateFileW(path, GENERIC_READ | DELETE, FILE_SHARE_READ, NULL, OPEN_EXISTING,
-                              FILE_FLAG_OPEN_REPARSE_POINT, NULL);
-    if (file == INVALID_HANDLE_VALUE)
-        return;
-    LARGE_INTEGER length;
-    DWORD read = 0, hash_size = sizeof(hash);
-    BYTE *previous = malloc(version->size);
-    if (previous && GetFileSizeEx(file, &length) && length.QuadPart == version->size &&
-        ReadFile(file, previous, version->size, &read, NULL) && read == version->size &&
-        CryptHashCertificate2(L"SHA256", 0, NULL, previous, read, hash, &hash_size) &&
-        hash_size == sizeof(hash) && !memcmp(hash, version->hash, hash_size)) {
-        size_t bytes = (wcslen(path) + wcslen(version->suffix) + 1) * sizeof(wchar_t);
-        size_t capacity = offsetof(FILE_RENAME_INFO, FileName) + bytes;
-        FILE_RENAME_INFO *rename = calloc(1, capacity);
-        if (rename) {
-            wcscpy(rename->FileName, path);
-            wcscat(rename->FileName, version->suffix);
-            rename->FileNameLength = (DWORD)(bytes - sizeof(wchar_t));
-            if (SetFileInformationByHandle(file, FileRenameInfo, rename, (DWORD)capacity) &&
-                !w_publish(path, starter, NULL)) {
-                wcscpy(rename->FileName, path);
-                rename->FileNameLength = (DWORD)(wcslen(path) * sizeof(wchar_t));
-                SetFileInformationByHandle(file, FileRenameInfo, rename, (DWORD)capacity);
-            }
-            free(rename);
-        }
-    }
-    free(previous);
-    CloseHandle(file);
-}
-
-// Recognize the two previously shipped examples as complete configurations. A customized
-// profile continues to source its preserved copy, including any explicit workspace rules.
-static bool w_previous_starter(const wchar_t *path) {
-    FILE *file = _wfopen(path, L"rb");
-    if (!file)
-        return false;
-    char *text = malloc(file_limit + 2);
-    w_desktop_config *actual = malloc(sizeof(*actual)), *stock = malloc(sizeof(*stock));
-    bool match = false;
-    if (text && actual && stock) {
-        size_t n = fread(text, 1, file_limit + 1, file);
-        text[n] = 0;
-        char err[128];
-        const char *body = n >= 3 && !memcmp(text, "\xef\xbb\xbf", 3) ? text + 3 : text;
-        if (!ferror(file) && n <= file_limit && !memchr(text, 0, n) &&
-            w_config_parse(actual, body, err, sizeof(err))) {
-            w_config_defaults(stock);
-            // The two historical JSON examples used single-press movement bindings.
-            for (int i = 0; i < stock->binding_count; i++) {
-                const w_key_binding *b = &stock->bindings[i];
-                if (b->action.kind == cmd_move && b->repeat) {
-                    char action[sizeof(b->action.arg) + sizeof("move ")];
-                    snprintf(action, sizeof(action), "move %s", b->action.arg);
-                    w_config_bind(stock, b->chord + strlen("repeat:"), action);
-                }
-            }
-            w_config_bind(stock, "super+shift+t", "open_tasks");
-            stock->rule_count = 1;
-            w_window_rule *rule = &stock->rules[0];
-            strcpy(rule->class_name, "#32770");
-            rule->floating = rule->sets_floating = true;
-            rule->workspace = rule->output = rule->layout = -1;
-            stock->app_count = 1;
-            strcpy(stock->apps[0].name, "Notepad");
-            strcpy(stock->apps[0].path, "%SystemRoot%\\System32\\notepad.exe");
-            char inherited[sizeof(stock->bar_right)];
-            memcpy(inherited, stock->bar_right, sizeof(inherited));
-            strcpy(stock->bar_right, "bluetooth network audio battery");
-            match = !memcmp(actual, stock, sizeof(*actual));
-            if (!match) {
-                memcpy(stock->bar_right, inherited, sizeof(inherited));
-                stock->background = 0x1a1b26;
-                stock->foreground = 0xc0caf5;
-                stock->accent = 0x7aa2f7;
-                strcpy(stock->bar_left, "workspaces mode");
-                strcpy(stock->bar_center, "title");
-                strcpy(stock->bar_right, "battery clock");
-                strcpy(stock->terminal, "%SystemRoot%\\System32\\cmd.exe");
-                match = !memcmp(actual, stock, sizeof(*actual));
-            }
-        }
-    }
-    fclose(file);
-    free(stock);
-    free(actual);
-    free(text);
-    return match;
-}
-
 ////////////////
 //~ Configuration setup
 
@@ -199,25 +81,21 @@ bool w_os_config_seed(bool migrate) {
     wchar_t path[os_path_cap], old[os_path_cap], local[os_path_cap];
     if (!w_os_config_path(path, count_of(path)))
         return false;
-    if (w_present(path)) {
-        if (migrate)
-            w_upgrade_stock_profile(path);
+    if (w_present(path))
         return true;
-    }
     if (!w_make_parent(path))
         return false;
-    if (migrate && w_os_legacy_config_path(old, count_of(old)) && w_present(old)) {
+    if (migrate) {
         wcscpy(local, path);
         wchar_t *name = wcsrchr(local, L'\\') + 1;
         if ((size_t)(name - local) + wcslen(L"legacy.jsonc") >= count_of(local))
             return false;
         wcscpy(name, L"legacy.jsonc");
-        if (!w_present(local) && !w_publish(local, NULL, old))
+        if (!w_present(local) && w_os_legacy_config_path(old, count_of(old)) && w_present(old) &&
+            !w_publish(local, NULL, old))
             return false;
-        if (w_previous_starter(local))
-            return w_publish(path, starter, NULL);
-        return w_publish(
-            path, "# Imported settings. Put new directives below this line.\nsource = legacy.jsonc\n", NULL);
+        if (w_present(local))
+            return w_publish(path, "source = legacy.jsonc\n", NULL);
     }
     return w_publish(path, starter, NULL);
 }
