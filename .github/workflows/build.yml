@@ -48,11 +48,11 @@ jobs:
           try {
             $ready = $false
             for ($i = 0; $i -lt 80 -and !$manager.HasExited; $i++) {
-              $status = & $exe doctor 2>$null
-              if ($status -contains 'window events: initialized') { $ready = $true; break }
+              $probe = Start-Process -FilePath $exe -ArgumentList query -WindowStyle Hidden -PassThru -Wait
+              if ($probe.ExitCode -eq 0) { $ready = $true; break }
               Start-Sleep -Milliseconds 250
             }
-            if (!$ready) { throw 'Standalone preview did not initialize.' }
+            if (!$ready) { throw "Standalone preview failed to answer query (manager exit $($manager.ExitCode), query exit $($probe.ExitCode))." }
             $watch = @(Get-CimInstance Win32_Process -Filter "Name='winwm.exe'" | Where-Object {
               $_.ExecutablePath -eq $exe -and $_.CommandLine -like "*--recovery-watch:1:$($manager.Id):*"
             })
@@ -61,6 +61,9 @@ jobs:
             $null = $monitor.Handle
             $manager.Kill()
             if (!$monitor.WaitForExit(20000) -or $monitor.ExitCode -ne 0) { throw 'Crash recovery failed.' }
+          } catch {
+            Write-Output "::error::$($_.Exception.Message)"
+            throw
           } finally {
             if (!$manager.HasExited) { $manager.Kill() }
           }
