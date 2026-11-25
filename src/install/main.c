@@ -22,7 +22,7 @@ static const wchar_t run_name[] = L"winwm";
 typedef wchar_t path_string[path_cap];
 
 typedef struct w_install_paths {
-    path_string root, source_shell, source_setup, source_recovery;
+    path_string root, source_shell, source_setup;
     path_string slot[slot_count], shell[slot_count], command[slot_count], setup[slot_count], recovery[slot_count];
 } w_install_paths;
 
@@ -55,8 +55,6 @@ static DWORD w_get_paths(w_install_paths *p) {
         return ERROR_BAD_PATHNAME;
     *separator = 0;
     error = w_join(p->source_shell, source_directory, L"winwm.exe");
-    if (!error)
-        error = w_join(p->source_recovery, source_directory, L"winwm_recovery.exe");
     for (int i = 0; !error && i < slot_count; i++) {
         error = w_join(p->slot[i], p->root, slot_dirs[i]);
         if (!error)
@@ -259,8 +257,6 @@ static DWORD w_select_release(const w_install_paths *p, int current, bool rollba
         bool identical = false;
         if (current >= 0) {
             error = w_files_equal(p->source_shell, p->shell[current], &identical);
-            if (!error && identical)
-                error = w_files_equal(p->source_recovery, p->recovery[current], &identical);
             if (error)
                 return error;
         }
@@ -281,8 +277,6 @@ static DWORD w_select_release(const w_install_paths *p, int current, bool rollba
         error = w_create_directory(p->slot[slot]);
         if (!error)
             error = w_stage_file(p->source_shell, p->shell[slot]);
-        if (!error)
-            error = w_stage_file(p->source_recovery, p->recovery[slot]);
         if (!error)
             error = w_stage_file(p->source_setup, p->setup[slot]);
     }
@@ -369,7 +363,7 @@ static void w_report(bool interactive, enum operation op, bool files_busy, DWORD
         detail = L"Another installation controls the startup entry or Windows logon shell.";
         break;
     case ERROR_FILE_NOT_FOUND:
-        detail = L"Place winwm.exe and winwm_recovery.exe beside winwm_install.exe and retry.";
+        detail = L"Place winwm.exe beside winwm_install.exe and retry.";
         break;
     case ERROR_INVALID_DATA:
         detail = L"The staged release failed startup validation. Run winwm.exe validate-startup for details.";

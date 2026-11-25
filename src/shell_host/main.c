@@ -61,7 +61,7 @@ static bool w_start_managed_previous(void) {
         return false;
     const wchar_t *file_name = wcsrchr(exe, L'\\');
     if (!file_name || _wcsicmp(file_name + 1, L"winwm.exe")) return false;
-    // Validate the release's recovery companion and configuration before switching.
+    // Ask the previous release to validate its own startup requirements.
     DWORD code = w_check_previous(exe,L"validate-startup");
     // Releases predating direct commands return 2 for unknown CLI syntax.
     if (code == 2) code = w_check_previous(exe,L"ctl validate-startup");
@@ -228,11 +228,6 @@ static int w_host_run(HINSTANCE inst, DWORD pid, uint64_t birth, HANDLE ready) {
     if (error)
         return (int)error;
     if (!w_os_self(session_exe,count_of(session_exe))) { error = GetLastError(); goto done; }
-    wchar_t *name = wcsrchr(session_exe,L'\\');
-    if (!name || (size_t)(name+1-session_exe)+count_of(L"winwm.exe") > count_of(session_exe)) {
-        error = ERROR_BAD_PATHNAME; goto done;
-    }
-    wcscpy(name+1,L"winwm.exe");
     session = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION|SYNCHRONIZE|PROCESS_TERMINATE,FALSE,pid);
     if (!session) { error = GetLastError(); goto done; }
     FILETIME created, exited, kernel, user;
@@ -315,7 +310,7 @@ done:
 static DWORD w_start_watch(const wchar_t *name, unsigned mode, DWORD pid, uint64_t birth) {
     wchar_t self[os_path_cap], watch[96];
     if (!w_os_self(self,count_of(self))) return GetLastError();
-    swprintf(watch,count_of(watch),L"/watch3:%u:%lu:%llu",mode,pid,(unsigned long long)birth);
+    swprintf(watch,count_of(watch),L"--recovery-watch:%u:%lu:%llu",mode,pid,(unsigned long long)birth);
     HANDLE ready = CreateEventW(NULL, TRUE, FALSE, name);
     if (!ready) return GetLastError();
     DWORD error = GetLastError();
@@ -335,37 +330,25 @@ static DWORD w_start_watch(const wchar_t *name, unsigned mode, DWORD pid, uint64
     return error;
 }
 
-int WINAPI wWinMain(HINSTANCE inst,HINSTANCE previous,PWSTR args,int show) {
-    (void)previous; (void)args; (void)show;
-    int argc;
-    wchar_t **argv = CommandLineToArgvW(GetCommandLineW(),&argc);
-    if (!argv) return (int)GetLastError();
-    int result = ERROR_INVALID_PARAMETER;
-    if (argc == 2 && !wcscmp(argv[1],WINWM_RECOVERY_CHECK))
-        result = ERROR_SUCCESS;
-    else if (argc == 2) {
-        const wchar_t *arg = argv[1];
-        bool launch = !wcsncmp(arg,L"/start3:",8);
-        unsigned mode;
-        unsigned long pid;
-        unsigned long long birth;
-        wchar_t extra;
-        if ((launch || !wcsncmp(arg,L"/watch3:",8)) &&
-            swscanf(arg+8,L"%u:%lu:%llu%lc",&mode,&pid,&birth,&extra) == 3 && mode <= 1 && pid && birth) {
-            wchar_t name[96];
-            swprintf(name,count_of(name),L"Local\\winwm.recovery.ready.%lu.%llu",pid,birth);
-            if (launch) result = (int)w_start_watch(name,mode,pid,birth);
-            else {
-                preview = mode != 0;
-                HANDLE ready = OpenEventW(EVENT_MODIFY_STATE,FALSE,name);
-                if (ready) {
-                    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-                    result = w_host_run(inst,pid,birth,ready);
-                    CloseHandle(ready);
-                } else result = (int)GetLastError();
-            }
-        }
-    }
-    LocalFree(argv);
+int w_recovery_run(HINSTANCE inst, const wchar_t *operation) {
+    bool launch = !wcsncmp(operation, L"start:", 6);
+    unsigned mode;
+    unsigned long pid;
+    unsigned long long birth;
+    wchar_t extra;
+    if ((!launch && wcsncmp(operation, L"watch:", 6)) ||
+        swscanf(operation + 6, L"%u:%lu:%llu%lc", &mode, &pid, &birth, &extra) != 3 ||
+        mode > 1 || !pid || !birth)
+        return ERROR_INVALID_PARAMETER;
+    wchar_t name[96];
+    swprintf(name, count_of(name), L"Local\\winwm.recovery.ready.%lu.%llu", pid, birth);
+    if (launch)
+        return (int)w_start_watch(name, mode, pid, birth);
+    HANDLE ready = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
+    if (!ready) return (int)GetLastError();
+    preview = mode != 0;
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    int result = w_host_run(inst, pid, birth, ready);
+    CloseHandle(ready);
     return result;
 }

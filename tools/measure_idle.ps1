@@ -1,9 +1,9 @@
 param([ValidateRange(1,3600)][int]$Seconds=600)
 $ErrorActionPreference='Stop'
 $session=[Diagnostics.Process]::GetCurrentProcess().SessionId
-$candidates=Get-CimInstance Win32_Process -Filter "SessionId=$session AND (Name='winwm.exe' OR Name='winwm_recovery.exe')"
-$desktop=@($candidates | Where-Object { $_.Name -eq 'winwm.exe' -and $_.CommandLine -match '^\s*(?:"[^"]+"|\S+)(?:\s+--preview)?\s*$' })
-$recovery=@($candidates | Where-Object { $_.Name -eq 'winwm_recovery.exe' -and $_.CommandLine -match '\s+"?/watch\d*:' })
+$candidates=Get-CimInstance Win32_Process -Filter "SessionId=$session AND Name='winwm.exe'"
+$desktop=@($candidates | Where-Object { $_.CommandLine -match '^\s*(?:"[^"]+"|\S+)(?:\s+--preview)?\s*$' })
+$recovery=@($candidates | Where-Object { $_.CommandLine -match '\s+"?--recovery-watch:' })
 if ($desktop.Count -ne 1 -or $recovery.Count -ne 1) {
     throw 'Expected one winwm desktop and one recovery process in this session.'
 }

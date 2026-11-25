@@ -1,25 +1,6 @@
 #include "shell_host/entry.h"
 #include <stdio.h>
 
-static bool w_recovery_path(wchar_t path[os_path_cap]) {
-    if (!w_os_self(path,os_path_cap)) return false;
-    wchar_t *file = wcsrchr(path,L'\\');
-    if (!file || (size_t)(file+1-path)+count_of(L"winwm_recovery.exe") > os_path_cap) return false;
-    wcscpy(file+1,L"winwm_recovery.exe");
-    return true;
-}
-
-bool w_recovery_validate(void) {
-    wchar_t path[os_path_cap];
-    if (!w_recovery_path(path)) return false;
-    HANDLE check = w_os_launch(path,WINWM_RECOVERY_CHECK);
-    if (!check) return false;
-    DWORD code = ERROR_TIMEOUT;
-    if (WaitForSingleObject(check,10000) == WAIT_OBJECT_0) GetExitCodeProcess(check,&code);
-    CloseHandle(check);
-    return code == ERROR_SUCCESS;
-}
-
 DWORD w_recovery_take_desktop(HANDLE host, HWND window) {
     // Keep the original shell identifiable if the monitor dies during handoff.
     DWORD pid = 0;
@@ -47,10 +28,10 @@ DWORD w_recovery_take_desktop(HANDLE host, HWND window) {
 HANDLE w_recovery_attach(bool preview, HWND *window) {
     wchar_t path[os_path_cap], args[96];
     FILETIME created, exited, kernel, user;
-    if (!w_recovery_path(path) || !GetProcessTimes(GetCurrentProcess(),&created,&exited,&kernel,&user))
+    if (!w_os_self(path,count_of(path)) || !GetProcessTimes(GetCurrentProcess(),&created,&exited,&kernel,&user))
         return NULL;
     DWORD pid = GetCurrentProcessId();
-    swprintf(args,count_of(args),L"/start3:%u:%lu:%llu",preview,pid,
+    swprintf(args,count_of(args),L"--recovery-start:%u:%lu:%llu",preview,pid,
              ((uint64_t)created.dwHighDateTime << 32) | created.dwLowDateTime);
     // The short-lived launcher exits before we change any windows. Ending the
     // manager's process tree then leaves the recovery monitor running.

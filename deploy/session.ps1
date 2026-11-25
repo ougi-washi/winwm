@@ -74,16 +74,14 @@ if ([int]$version.CurrentBuild -lt 19045 -or !$x64) {
     throw 'A supported x64 Windows installation is required.'
 }
 if ($Action -eq 'Stage') {
-    $names=@('winwm.exe','winwm_recovery.exe')
-    $hashes=foreach ($name in $names) {(Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $Bin $name)).Hash}
-    $tag=($hashes | ForEach-Object {$_.Substring(0,12)}) -join '-'
+    $source=Join-Path $Bin 'winwm.exe'
+    $hash=(Get-FileHash -Algorithm SHA256 -LiteralPath $source).Hash
+    $tag=$hash.Substring(0,12)
     $destination=Join-Path $root "releases\$tag"
     [IO.Directory]::CreateDirectory($destination) | Out-Null
-    foreach ($name in $names) {
-        $to=Join-Path $destination $name
-        if (!(Test-Path $to)) {Copy-Item -LiteralPath (Join-Path $Bin $name) -Destination $to}
-        if ((Get-FileHash $to).Hash -ne (Get-FileHash (Join-Path $Bin $name)).Hash) {throw "Release hash mismatch: $name"}
-    }
+    $to=Join-Path $destination 'winwm.exe'
+    if (!(Test-Path -LiteralPath $to)) {Copy-Item -LiteralPath $source -Destination $to}
+    if ((Get-FileHash -LiteralPath $to).Hash -ne $hash) {throw 'Release hash mismatch: winwm.exe'}
     $configPath=Join-Path $configDir 'winwm.lua'
     if (($FileBrowser -or $TaskManager) -and !(Test-Path -LiteralPath $configPath)) {
         $settings=foreach ($provider in @{file_browser=$FileBrowser;task_manager=$TaskManager}.GetEnumerator()) {
@@ -113,8 +111,6 @@ if (!(Test-Path $manifest)) {throw 'Stage the binaries before activation.'}
 $stage=Get-Content $manifest -Raw|ConvertFrom-Json
 $hostExe=Join-Path $stage.path 'winwm.exe'
 if (!(Test-Path -LiteralPath $hostExe -PathType Leaf)) {throw "Missing $hostExe"}
-$recoveryExe=Join-Path $stage.path 'winwm_recovery.exe'
-if (!(Test-Path -LiteralPath $recoveryExe -PathType Leaf)) {throw "Missing $recoveryExe. Stage the complete release first."}
 $check=Start-Process -FilePath $hostExe -ArgumentList 'validate-activation' -PassThru -Wait -WindowStyle Hidden
 if ($check.ExitCode) {throw 'The release or Windows shell configuration prevents activation.'}
 $startup=@{path=$runKey;name='winwm';value=('"'+$hostExe+'"')}

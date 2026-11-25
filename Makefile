@@ -11,11 +11,10 @@ WINDRES ?= windres
 lua_sources := $(file <lua.rsp)
 link_inputs = $(patsubst third_party/lua/%.c,build/obj/lua/%.o,$(patsubst src/%.c,build/obj/%.o,$(filter-out @compile.rsp,$(subst @lua.rsp,$(lua_sources),$(file <$(1))))))
 main_inputs := $(call link_inputs,build.rsp)
-recovery_inputs := $(call link_inputs,recovery.rsp)
 install_inputs := $(call link_inputs,install.rsp)
-objects := $(sort $(filter build/obj/%.o,$(main_inputs) $(recovery_inputs) $(install_inputs)))
+objects := $(sort $(filter build/obj/%.o,$(main_inputs) $(install_inputs)))
 object_dirs := $(sort $(patsubst %/,%,$(dir $(objects))))
-programs := winwm.exe winwm_recovery.exe winwm_install.exe
+programs := winwm.exe winwm_install.exe
 staged := $(addprefix build/,$(programs))
 
 .PHONY: all
@@ -41,15 +40,12 @@ build/config_res.o: assets/config.rc assets/winwm.lua third_party/lua/LICENSE Ma
 $(staged): compile.rsp Makefile | build
 build/winwm.exe: build.rsp lua.rsp $(filter %.o,$(main_inputs))
 	"$(CC)" @compile.rsp $(main_inputs) -o $@
-build/winwm_recovery.exe: recovery.rsp lua.rsp $(filter %.o,$(recovery_inputs))
-	"$(CC)" @compile.rsp $(recovery_inputs) -o $@
 build/winwm_install.exe: install.rsp $(filter %.o,$(install_inputs))
 	"$(CC)" @compile.rsp $(install_inputs) -o $@
 
 # Publish in order after all links succeed. A running manager can lock the first file.
 $(addprefix bin/,$(programs)): bin/%.exe: build/%.exe | bin $(staged)
 	@copy /b /y "$(subst /,\,$<)" "$(subst /,\,$@).tmp" >nul && move /y "$(subst /,\,$@).tmp" "$(subst /,\,$@)" >nul
-bin/winwm_recovery.exe: | bin/winwm.exe
-bin/winwm_install.exe: | bin/winwm_recovery.exe
+bin/winwm_install.exe: | bin/winwm.exe
 
 -include $(objects:.o=.d)

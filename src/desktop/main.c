@@ -649,7 +649,7 @@ int w_session_run(HINSTANCE instance, bool preview) {
         error = GetLastError();
         if (!preview && !GetShellWindow()) w_os_ensure_shell();
         w_os_instance_release(&lock);
-        MessageBoxW(NULL,L"Could not start winwm. Place the matching winwm_recovery.exe beside winwm.exe.",
+        MessageBoxW(NULL,L"Could not start the WinWM recovery process.",
                     L"winwm recovery unavailable",MB_OK|MB_ICONERROR);
         return error ? (int)error : ERROR_PROCESS_ABORTED;
     }

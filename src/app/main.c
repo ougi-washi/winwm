@@ -1,6 +1,7 @@
 #include "desktop/entry.h"
 #include "desktop_ctl/entry.h"
 #include "desktop_tools/entry.h"
+#include "shell_host/entry.h"
 #include "win_platform/popup.h"
 #include <shellapi.h>
 #include <stdio.h>
@@ -45,6 +46,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR line, int show
         return 1;
     if (argc == 1 || (argc == 2 && !wcscmp(argv[1], L"--preview")))
         result = w_session_run(instance, argc == 2);
+    else if (argc == 2 && !wcsncmp(argv[1], L"--recovery-", 11))
+        result = w_recovery_run(instance, argv[1] + 11);
     else if (argc == 2 && !wcsncmp(argv[1], L"--tool-", 7))
         result = w_tools_run(argv[1] + 7);
     else if (argc == 10 && !wcsncmp(argv[1], L"--tool-", 7) && !wcscmp(argv[2], L"--bar-popup"))

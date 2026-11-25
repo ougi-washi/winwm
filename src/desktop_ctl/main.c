@@ -1,6 +1,5 @@
 #include "desktop_ctl/entry.h"
 #include "ipc/ipc.h"
-#include "shell_host/entry.h"
 #include <stdio.h>
 #include <wchar.h>
 
@@ -34,10 +33,6 @@ int w_ctl_run(int argc, wchar_t **argv) {
     if (argc == 2 && (activate || !wcscmp(argv[1], L"validate") || !wcscmp(argv[1], L"validate-startup") || !wcscmp(argv[1], L"prepare"))) {
         if (activate && w_os_startup_shell()) {
             fputs("Windows shell configuration prevents automatic winwm startup.\n",stderr);
-            return 1;
-        }
-        if ((activate || !wcscmp(argv[1],L"validate-startup")) && !w_recovery_validate()) {
-            fputs("A compatible winwm_recovery.exe is required beside winwm.exe.\n",stderr);
             return 1;
         }
         static w_desktop_config cfg;

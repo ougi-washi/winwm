@@ -37,11 +37,40 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $seed = Get-FileHash "$env:USERPROFILE/.config/winwm/winwm.lua"
           if ($seed.Hash -ne (Get-FileHash assets/winwm.lua).Hash) { throw 'First-run config differs from shipped config.' }
+      - name: Check standalone startup and recovery
+        shell: pwsh
+        run: |
+          $env:USERPROFILE = "$env:RUNNER_TEMP/winwm-profile"
+          $env:LOCALAPPDATA = $env:USERPROFILE
+          $exe = Join-Path $env:USERPROFILE 'winwm.exe'
+          Copy-Item bin/winwm.exe $exe
+          $manager = Start-Process -FilePath $exe -ArgumentList '--preview' -WindowStyle Hidden -PassThru
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 80 -and !$manager.HasExited; $i++) {
+              $status = & $exe doctor 2>$null
+              if ($status -contains 'window events: initialized') { $ready = $true; break }
+              Start-Sleep -Milliseconds 250
+            }
+            if (!$ready) { throw 'Standalone preview did not initialize.' }
+            $watch = @(Get-CimInstance Win32_Process -Filter "Name='winwm.exe'" | Where-Object {
+              $_.ExecutablePath -eq $exe -and $_.CommandLine -like "*--recovery-watch:1:$($manager.Id):*"
+            })
+            if ($watch.Count -ne 1) { throw 'Expected one independent recovery process.' }
+            $monitor = Get-Process -Id $watch[0].ProcessId
+            $null = $monitor.Handle
+            $manager.Kill()
+            if (!$monitor.WaitForExit(20000) -or $monitor.ExitCode -ne 0) { throw 'Crash recovery failed.' }
+          } finally {
+            if (!$manager.HasExited) { $manager.Kill() }
+          }
       - uses: actions/upload-artifact@v7
         if: github.event_name == 'push' && github.ref_type == 'tag'
         with:
           name: winwm-windows-x64
-          path: bin/*.exe
+          path: |
+            bin/winwm.exe
+            bin/winwm_install.exe
           if-no-files-found: error
   release:
     if: github.event_name == 'push' && github.ref_type == 'tag'
@@ -57,8 +86,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          executables=(winwm.exe winwm_recovery.exe winwm_install.exe)
+          executables=(winwm.exe winwm_install.exe)
           zip -9 winwm-windows-x64.zip "${executables[@]}"
           gh release create "$GITHUB_REF_NAME" winwm-windows-x64.zip "${executables[@]}" \
             --repo "$GITHUB_REPOSITORY" --verify-tag --title "WinWM $GITHUB_REF_NAME" \
-            --notes 'Windows x64. Extract the ZIP or download all three executables to the same folder. Run `winwm.exe --preview` to try WinWM or `winwm_install.exe /install` to start it at sign-in.'
+            --notes 'Windows x64. Download `winwm.exe` to run WinWM. Use `winwm.exe --preview` to try it alongside Explorer. For startup at sign-in, extract the ZIP and run `winwm_install.exe /install`.'

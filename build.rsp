@@ -69,6 +69,7 @@ src/palette/palette.c
 src/providers/audio.c
 src/providers/providers.c
 src/shell_host/attach.c
+src/shell_host/main.c
 src/win_platform/snapshot.c
 src/win_platform/cpu.c
 src/win_platform/percent_slider.c
