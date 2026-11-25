@@ -56,11 +56,3 @@ for i = 1, 10 do
     hl.bind(mod .. (i % 10), dsp.focus({ workspace = i }))
 end
 ```
-
-Panel dimensions use device-independent pixels. Set `decoration.panels.button_size` from 24 to 48 and `spacing` from 2 to 12. Icon actions use square targets. Labeled actions and dropdown fields share their height. The bar has its own `bar.height` setting. Run `winwm.exe reload` to apply changes to open panels.
-
-Body text, secondary text, headings and titles follow the Windows message font at the monitor’s DPI. Labels and numeric columns use their measured text widths. Process names, queries and results take the remaining space. Wrapped messages and expanded details grow with their content.
-
-`decoration.rounding` controls floating panel corners. Individual buttons use up to 2 DIP of that radius. Docked edges, list highlights and input outlines are square. Hover, tooltip and panel fades follow the configured layer timings and motion preferences. High contrast uses Windows colors for control states.
-
-Windows controls acrylic availability. WinWM follows system high-contrast and transparency preferences and uses the configured panel color when acrylic is unavailable.
