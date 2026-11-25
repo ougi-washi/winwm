@@ -77,14 +77,29 @@ static bool w_publish(const wchar_t *path, const char *bytes, const wchar_t *cop
 // Only a byte-identical shipped profile can be upgraded. Rename the verified open
 // file by handle so a concurrent save cannot transfer a different file to the backup.
 static void w_upgrade_stock_profile(const wchar_t *path) {
-    static const BYTE previous_hash[32] = {0x37, 0x17, 0xe8, 0x65, 0x5a, 0x4d, 0x4a, 0x89, 0x7a, 0x61, 0x91,
-                                           0x54, 0x2a, 0xf1, 0x9b, 0x78, 0x81, 0x6d, 0x9b, 0xc8, 0x38, 0xf2,
-                                           0x24, 0x17, 0x36, 0xd8, 0xbe, 0x9b, 0x7b, 0x1d, 0x14, 0x31};
-    BYTE previous[3475], hash[sizeof(previous_hash)];
+    static const struct stock_version {
+        DWORD size;
+        BYTE hash[32];
+        const wchar_t *suffix;
+    } versions[] = {
+        {3475, {0x37, 0x17, 0xe8, 0x65, 0x5a, 0x4d, 0x4a, 0x89, 0x7a, 0x61, 0x91, 0x54,
+                0x2a, 0xf1, 0x9b, 0x78, 0x81, 0x6d, 0x9b, 0xc8, 0x38, 0xf2, 0x24, 0x17,
+                0x36, 0xd8, 0xbe, 0x9b, 0x7b, 0x1d, 0x14, 0x31}, L".previous"},
+        {4078, {0x23, 0xcf, 0x1d, 0xf3, 0x89, 0xad, 0x0c, 0x74, 0xf0, 0x09, 0x55, 0x43,
+                0xb1, 0x27, 0x78, 0x1d, 0xff, 0x91, 0x3a, 0x01, 0xcb, 0x87, 0xc1, 0x96,
+                0xd0, 0x97, 0x03, 0xca, 0xa3, 0xe1, 0xf6, 0x94}, L".before-move-repeat"},
+    };
+    BYTE hash[32];
     WIN32_FILE_ATTRIBUTE_DATA attrs;
     if (!GetFileAttributesExW(path, GetFileExInfoStandard, &attrs) ||
         (attrs.dwFileAttributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_READONLY)) ||
-        attrs.nFileSizeHigh || attrs.nFileSizeLow != sizeof(previous))
+        attrs.nFileSizeHigh)
+        return;
+    const struct stock_version *version = NULL;
+    for (size_t i = 0; i < count_of(versions); i++)
+        if (attrs.nFileSizeLow == versions[i].size)
+            version = &versions[i];
+    if (!version)
         return;
     HANDLE file = CreateFileW(path, GENERIC_READ | DELETE, FILE_SHARE_READ, NULL, OPEN_EXISTING,
                               FILE_FLAG_OPEN_REPARSE_POINT, NULL);
@@ -92,17 +107,17 @@ static void w_upgrade_stock_profile(const wchar_t *path) {
         return;
     LARGE_INTEGER length;
     DWORD read = 0, hash_size = sizeof(hash);
-    if (GetFileSizeEx(file, &length) && length.QuadPart == sizeof(previous) &&
-        ReadFile(file, previous, sizeof(previous), &read, NULL) && read == sizeof(previous) &&
+    BYTE *previous = malloc(version->size);
+    if (previous && GetFileSizeEx(file, &length) && length.QuadPart == version->size &&
+        ReadFile(file, previous, version->size, &read, NULL) && read == version->size &&
         CryptHashCertificate2(L"SHA256", 0, NULL, previous, read, hash, &hash_size) &&
-        hash_size == sizeof(previous_hash) && !memcmp(hash, previous_hash, hash_size)) {
-        const wchar_t suffix[] = L".previous";
-        size_t bytes = (wcslen(path) + count_of(suffix)) * sizeof(wchar_t);
+        hash_size == sizeof(hash) && !memcmp(hash, version->hash, hash_size)) {
+        size_t bytes = (wcslen(path) + wcslen(version->suffix) + 1) * sizeof(wchar_t);
         size_t capacity = offsetof(FILE_RENAME_INFO, FileName) + bytes;
         FILE_RENAME_INFO *rename = calloc(1, capacity);
         if (rename) {
             wcscpy(rename->FileName, path);
-            wcscat(rename->FileName, suffix);
+            wcscat(rename->FileName, version->suffix);
             rename->FileNameLength = (DWORD)(bytes - sizeof(wchar_t));
             if (SetFileInformationByHandle(file, FileRenameInfo, rename, (DWORD)capacity) &&
                 !w_publish(path, starter, NULL)) {
@@ -113,6 +128,7 @@ static void w_upgrade_stock_profile(const wchar_t *path) {
             free(rename);
         }
     }
+    free(previous);
     CloseHandle(file);
 }
 
@@ -133,6 +149,15 @@ static bool w_previous_starter(const wchar_t *path) {
         if (!ferror(file) && n <= file_limit && !memchr(text, 0, n) &&
             w_config_parse(actual, body, err, sizeof(err))) {
             w_config_defaults(stock);
+            // The two historical JSON examples used single-press movement bindings.
+            for (int i = 0; i < stock->binding_count; i++) {
+                const w_key_binding *b = &stock->bindings[i];
+                if (b->action.kind == cmd_move && b->repeat) {
+                    char action[sizeof(b->action.arg) + sizeof("move ")];
+                    snprintf(action, sizeof(action), "move %s", b->action.arg);
+                    w_config_bind(stock, b->chord + strlen("repeat:"), action);
+                }
+            }
             w_config_bind(stock, "super+shift+t", "open_tasks");
             stock->rule_count = 1;
             w_window_rule *rule = &stock->rules[0];

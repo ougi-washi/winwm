@@ -241,6 +241,7 @@ static DWORD WINAPI w_launch_entry(void *ptr) {
             if (SUCCEEDED(CoCreateInstance(&CLSID_ApplicationActivationManager, NULL, CLSCTX_LOCAL_SERVER,
                                            &IID_IApplicationActivationManager, (void **)&am))) {
                 DWORD pid;
+                CoAllowSetForegroundWindow((IUnknown *)am, NULL);
                 IApplicationActivationManager_ActivateApplication(am, e->target, NULL, AO_NONE, &pid);
                 IApplicationActivationManager_Release(am);
             }
@@ -255,6 +256,7 @@ static DWORD WINAPI w_launch_entry(void *ptr) {
             PROCESS_INFORMATION pi = {0};
             if (CreateProcessW(resolved, line, NULL, NULL, FALSE, 0, NULL,
                                *e->directory ? e->directory : NULL, &si, &pi)) {
+                AllowSetForegroundWindow(pi.dwProcessId);
                 CloseHandle(pi.hProcess);
                 CloseHandle(pi.hThread);
             }

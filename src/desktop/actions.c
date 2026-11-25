@@ -7,10 +7,11 @@
 ////////////////
 //~ Actions
 
-enum launch_kind { launch_executable, launch_terminal, launch_command, launch_task_manager };
+enum launch_kind { launch_executable, launch_terminal, launch_command, launch_task_manager, launch_panel };
 typedef struct w_launch_job {
     char exe[1024], arg[4096];
     enum launch_kind kind;
+    POINT origin;
 } w_launch_job;
 
 ////////////////
@@ -20,6 +21,14 @@ static DWORD WINAPI w_launch_thread(void *ptr) {
     w_launch_job *j = ptr;
     bool launched;
     switch (j->kind) {
+    case launch_panel: {
+        wchar_t self[os_path_cap], mode[96];
+        HANDLE child = w_os_self(self, count_of(self)) && w_os_wide(j->exe, mode, count_of(mode)) ?
+                       w_os_launch_positioned(self, mode, j->origin) : NULL;
+        launched = child != NULL;
+        if (child) CloseHandle(child);
+        break;
+    }
     case launch_command:
         launched = w_os_launch_line(j->exe);
         break;
@@ -50,11 +59,12 @@ static DWORD WINAPI w_launch_thread(void *ptr) {
     return 0;
 }
 
-static bool w_queue_launch(const char *exe, const char *arg, enum launch_kind kind) {
+static bool w_queue_launch(const char *exe, const char *arg, enum launch_kind kind, const POINT *origin) {
     w_launch_job *j = calloc(1, sizeof(*j));
     if (!j)
         return false;
     j->kind = kind;
+    if (origin) j->origin = *origin;
     if (!w_str_copy(j->exe, sizeof(j->exe), exe) || !w_str_copy(j->arg, sizeof(j->arg), arg ? arg : "") ||
         !QueueUserWorkItem(w_launch_thread, j, WT_EXECUTEDEFAULT)) {
         free(j);
@@ -96,7 +106,7 @@ void w_desktop_start_programs(bool first_load) {
 }
 
 static bool w_launch(const char *exe, const char *arg) {
-    return w_queue_launch(exe, arg, launch_executable);
+    return w_queue_launch(exe, arg, launch_executable, NULL);
 }
 
 ////////////////
@@ -183,10 +193,10 @@ bool w_desktop_run_on(const w_command *c, int output) {
     }
     switch (c->kind) {
     case cmd_terminal:
-        ok = w_queue_launch(desk.config.terminal, NULL, launch_terminal);
+        ok = w_queue_launch(desk.config.terminal, NULL, launch_terminal, NULL);
         break;
     case cmd_open_tasks:
-        ok = w_queue_launch(desk.config.task_manager, NULL, launch_task_manager);
+        ok = w_queue_launch(desk.config.task_manager, NULL, launch_task_manager, NULL);
         break;
     case cmd_open_folder:
     case cmd_reveal_file:
@@ -218,11 +228,11 @@ bool w_desktop_run_on(const w_command *c, int output) {
     case cmd_capture_region:
     case cmd_capture_window:
     case cmd_record: {
-        wchar_t exe[os_path_cap];
-        char path[4096];
         char mode[64];
         snprintf(mode, sizeof(mode), "--tool-%s", w_command_name(c->kind));
-        ok = w_os_self(exe, count_of(exe)) && w_os_utf8(exe, path, sizeof(path)) && w_launch(path, mode);
+        w_rect work = desk.outputs[output].work;
+        POINT origin = {work.x + work.w/2, work.y + work.h/2};
+        ok = w_queue_launch(mode, NULL, launch_panel, &origin);
         break;
     }
     case cmd_edit_config: {
@@ -261,7 +271,7 @@ bool w_desktop_run_on(const w_command *c, int output) {
         break;
     }
     case cmd_program:
-        ok = w_queue_launch(c->arg, "", launch_command);
+        ok = w_queue_launch(c->arg, "", launch_command, NULL);
         break;
     case cmd_resize_mode:
         desk.resize = !desk.resize;
@@ -348,11 +358,10 @@ bool w_desktop_run_on(const w_command *c, int output) {
     }
     case cmd_floating:
         if (w) {
-            desk.windows[i].floating_update = 0;
-            desk.windows[i].float_request_sent = false;
-            w->floating = !w->floating;
-            if (w->floating && !w->fullscreen)
-                w->floating_bounds = w_os_bounds(desk.windows[i].hwnd);
+            bool floating = w->fullscreen || !w->floating;
+            if (w->fullscreen)
+                w_desktop_toggle_fullscreen(i);
+            w_desktop_set_floating(i, floating);
         }
         break;
     case cmd_fullscreen:
@@ -361,11 +370,11 @@ bool w_desktop_run_on(const w_command *c, int output) {
         break;
     case cmd_scratch_send:
         if (w) {
-            if (!w->floating && !w->fullscreen)
-                w->floating_bounds = w_os_bounds(desk.windows[i].hwnd);
+            if (w->fullscreen)
+                w_desktop_toggle_fullscreen(i);
+            w_desktop_set_floating(i, true);
             w->scratch = true;
             w->scratch_visible = false;
-            w->floating = true;
             w_desktop_select(w_model_recent(m, o, ws));
         }
         break;
@@ -426,8 +435,12 @@ bool w_desktop_run_on(const w_command *c, int output) {
     case cmd_volume_set:
         ok = w_audio_start(desk.root, msg_audio) && w_audio_set_percent(atoi(c->arg));
         break;
-    case cmd_media_play: {
-        UINT key = VK_MEDIA_PLAY_PAUSE;
+    case cmd_media_play:
+    case cmd_media_previous:
+    case cmd_media_next:
+    case cmd_media_stop: {
+        UINT key = c->kind == cmd_media_next ? VK_MEDIA_NEXT_TRACK : c->kind == cmd_media_previous ?
+                   VK_MEDIA_PREV_TRACK : c->kind == cmd_media_stop ? VK_MEDIA_STOP : VK_MEDIA_PLAY_PAUSE;
         INPUT keys[2] = {0};
         keys[0].type = keys[1].type = INPUT_KEYBOARD;
         keys[0].ki.wVk = keys[1].ki.wVk = (WORD)key;
@@ -473,6 +486,7 @@ static w_palette_entry entries[palette_limit];
 static w_command actions[palette_limit];
 static w_window_id targets[palette_limit];
 static int row_count;
+static int row_output[palette_limit], palette_output;
 static enum command_kind current_palette;
 
 ////////////////
@@ -482,6 +496,7 @@ static void w_add_row(const wchar_t *label, const char *action, w_window_id targ
     if (row_count >= palette_limit)
         return;
     int n = row_count++;
+    row_output[n] = palette_output;
     entries[n].id = n;
     wcsncpy(entries[n].label, label, 255);
     entries[n].label[255] = 0;
@@ -520,7 +535,7 @@ static void w_pick(int n) {
         if (mem)
             GlobalFree(mem);
     } else if (actions[n].kind)
-        w_desktop_run(&actions[n]);
+        w_desktop_run_on(&actions[n], row_output[n]);
 }
 
 static void w_action_row(const char *label, const char *action) {
@@ -531,6 +546,7 @@ static void w_action_row(const char *label, const char *action) {
 
 void w_desktop_palette(enum command_kind kind, int output) {
     current_palette = kind;
+    palette_output = output;
     row_count = 0;
     const wchar_t *title = L"Run";
     if (kind == cmd_switcher) {
@@ -575,6 +591,7 @@ void w_desktop_palette(enum command_kind kind, int output) {
                 swprintf(s, count_of(s), L"Display %ls   ·   %d × %d   ·   %d%%", number, d->screen.w, d->screen.h,
                          MulDiv(d->dpi, 100, 96));
                 w_add_row(s, "display", (w_window_id){-1, 0});
+                row_output[row_count-1] = o;
             }
         static const struct { const char *label, *action; } items[] = {
             {"Sound devices", "audio"}, {"Volume mixer", "volume_mixer"}, {"Wi-Fi and networks", "wifi"},

@@ -9,7 +9,8 @@ void w_layout_compute(w_desktop_model *m, int output, w_rect usable, w_rect scre
 int w_layout_neighbor(const w_desktop_model *m, int output, w_rect origin, enum direction dir, bool tiles_only);
 int w_layout_adjacent_output(const w_rect screens[output_limit], int output, w_rect origin, enum direction dir);
 int w_layout_sibling(const w_desktop_model *m, int slot, enum direction dir);
-w_rect w_layout_relocate(w_rect r, w_rect from, w_rect to);
+w_rect w_layout_initial_float(w_rect original, w_rect work);
+w_rect w_layout_relocate(w_rect r, w_rect from, w_rect to, int from_dpi, int to_dpi);
 int w_layout_output_for_bounds(const w_rect screens[output_limit], int current, w_rect bounds);
 
 typedef struct w_split_grab {

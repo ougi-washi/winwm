@@ -90,7 +90,7 @@ class Importer:
                     self.config.setdefault("rules",[]).append(rule)
                 elif key in {"bind", "binde"}:
                     terms = [v.strip() for v in val.split(",", 3)]
-                    self.binding(path, n, terms)
+                    self.binding(path, n, terms, repeat=key == "binde")
                 elif kind == "lua":
                     call = re.fullmatch(r"""(?:\w+\.)?bind\(\s*["']([^"']+)["']\s*,\s*(?:\w+\.)?(?:dsp\.)?(\w+)\(\s*(?:["']?([\w-]+)["']?)?\s*\)\s*\)\s*""", line)
                     if call:
@@ -101,7 +101,7 @@ class Importer:
                 else:
                     self.report(path, n, f"unmapped directive {key}")
 
-    def binding(self, path, line, parts):
+    def binding(self, path, line, parts, repeat=False):
         if len(parts) < 3:
             self.report(path, line, "incomplete binding")
             return
@@ -130,7 +130,9 @@ class Importer:
                 (key not in keys and not re.fullmatch(r"[a-z0-9]|f(?:[1-9]|1\d|2[0-4])",key))):
             self.report(path,line,f"unavailable binding {chord}")
             return
-        self.config.setdefault("bindings", {})[chord] = action
+        bindings = self.config.setdefault("bindings", {})
+        bindings.pop(chord if repeat else "repeat:" + chord, None)
+        bindings[("repeat:" if repeat else "") + chord] = action
 
     def bar(self, path, source):
         root = read_jsonc(source)

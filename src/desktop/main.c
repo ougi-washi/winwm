@@ -129,7 +129,7 @@ static void w_discover_initial(void) {
         }
     }
     w_os_restore_all();
-    w_desktop_scan();
+    w_desktop_scan(false);
     desk.ready = true;
     for (int i = 0; i < command_count; i++)
         w_desktop_run_on(&pending_commands[i].action, pending_commands[i].output);
@@ -366,7 +366,7 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         return 0;
     case msg_window:
         if (wp == EVENT_SYSTEM_DESKTOPSWITCH) {
-            w_desktop_scan();
+            w_desktop_scan(false);
             return 0;
         }
         pending_events--;
@@ -375,7 +375,7 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             w_invalidate_language();
         if (!pending_events && event_overflow) {
             event_overflow = false;
-            w_desktop_scan();
+            w_desktop_scan(true);
         }
         return 0;
     case msg_refresh:
@@ -397,7 +397,7 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             return 0;
         }
         if (wp == discovery_timer) {
-            w_desktop_scan();
+            w_desktop_scan(true);
             return 0;
         }
         if (wp == 28) {

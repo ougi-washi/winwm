@@ -31,6 +31,8 @@ static int w_lerp(int a, int b, double t) {
 
 void w_effects_opacity(int slot, bool focused, bool entering) {
     w_window_state *s = &desk.windows[slot];
+    if (s->direct_surface)
+        return;
     BYTE target = focused ? 255 : desk.config.inactive_alpha;
     if (s->decorated && !entering && target == s->opacity.target && s->alpha == desk.config.inactive_alpha)
         return;
@@ -56,8 +58,12 @@ static uint32_t w_color_at(uint32_t a, uint32_t b, double t) {
            w_lerp(a & 255, b & 255, t);
 }
 
-static bool w_place(HWND hwnd, w_rect r) {
-    return SetWindowPos(hwnd, NULL, r.x, r.y, r.w, r.h, place_flags) != 0;
+static bool w_place(HWND hwnd, w_rect from, w_rect to) {
+    UINT flags = place_flags;
+    if (from.w == to.w && from.h == to.h) flags |= SWP_NOSIZE;
+    if (from.x == to.x && from.y == to.y) flags |= SWP_NOMOVE;
+    if ((flags & (SWP_NOMOVE | SWP_NOSIZE)) == (SWP_NOMOVE | SWP_NOSIZE)) return true;
+    return SetWindowPos(hwnd, NULL, to.x, to.y, to.w, to.h, flags) != 0;
 }
 
 bool w_effects_move(int slot, w_rect target, enum motion_kind kind, int direction) {
@@ -67,6 +73,7 @@ bool w_effects_move(int slot, w_rect target, enum motion_kind kind, int directio
     if (!desk.motion_allowed || !timing.ms || IsHungAppWindow(s->hwnd))
         return false;
     w_rect from = w_os_bounds(s->hwnd);
+    w_rect actual = from;
     if (kind == motion_move) {
         RECT to = w_os_to_rect(target);
         if (MonitorFromWindow(s->hwnd, MONITOR_DEFAULTTONEAREST) != MonitorFromRect(&to, MONITOR_DEFAULTTONEAREST))
@@ -108,9 +115,17 @@ bool w_effects_move(int slot, w_rect target, enum motion_kind kind, int directio
         else
             from.x += direction * distance;
     }
+    if (s->direct_surface) {
+        // A framebuffer resize can clear the client until its next present.
+        // Resize once and animate translation without rebuilding the swapchain.
+        if (kind == motion_open && timing.style < style_slide)
+            return false;
+        from.w = target.w;
+        from.h = target.h;
+    }
     if (from.w <= 0 || from.h <= 0 || w_rect_equal(from, target) || !w_start_timer())
         return false;
-    if (kind != motion_move && !w_place(s->hwnd, from))
+    if (!w_place(s->hwnd, actual, from))
         return false;
     s->motion.from = from;
     s->motion.last = from;
@@ -321,7 +336,7 @@ void w_effects_tick(void) {
             w_rect next = {w_lerp(a.x,b.x,t), w_lerp(a.y,b.y,t), w_lerp(a.w,b.w,t), w_lerp(a.h,b.h,t)};
             next.w = max(1,next.w);
             next.h = max(1,next.h);
-            if (!w_rect_equal(next, s->motion.last) && !w_place(s->hwnd, next)) {
+            if (!w_place(s->hwnd, s->motion.last, next)) {
                 s->has_issued = false;
                 w_desktop_schedule();
                 s->motion.start = 0;

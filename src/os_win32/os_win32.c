@@ -3,6 +3,7 @@
 #include <shellapi.h>
 #include <shlwapi.h>
 #include <evntprov.h>
+#include <tlhelp32.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
@@ -203,7 +204,7 @@ static wchar_t *w_quote(wchar_t *p, const wchar_t *s) {
     return p;
 }
 
-static HANDLE w_launch_at(const wchar_t *exe, const wchar_t *arg, const wchar_t *directory) {
+static HANDLE w_launch_at(const wchar_t *exe, const wchar_t *arg, const wchar_t *directory, const POINT *origin) {
     size_t len = 2 * (wcslen(exe) + (arg ? wcslen(arg) : 0)) + 10;
     if (len > 32767)
         return NULL;
@@ -216,18 +217,28 @@ static HANDLE w_launch_at(const wchar_t *exe, const wchar_t *arg, const wchar_t 
         w_quote(p, arg);
     }
     STARTUPINFOW si = {.cb = sizeof(si)};
+    if (origin) {
+        si.dwFlags |= STARTF_USEPOSITION;
+        si.dwX = (DWORD)origin->x;
+        si.dwY = (DWORD)origin->y;
+    }
     PROCESS_INFORMATION pi = {0};
     BOOL ok =
         CreateProcessW(exe, line, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, directory, &si, &pi);
     free(line);
     if (!ok)
         return NULL;
+    AllowSetForegroundWindow(pi.dwProcessId);
     CloseHandle(pi.hThread);
     return pi.hProcess;
 }
 
 HANDLE w_os_launch(const wchar_t *exe, const wchar_t *arg) {
-    return w_launch_at(exe, arg, NULL);
+    return w_launch_at(exe, arg, NULL, NULL);
+}
+
+HANDLE w_os_launch_positioned(const wchar_t *exe, const wchar_t *arg, POINT origin) {
+    return w_launch_at(exe, arg, NULL, &origin);
 }
 
 bool w_os_launch_line(const char *command) {
@@ -248,6 +259,7 @@ bool w_os_launch_line(const char *command) {
     PROCESS_INFORMATION pi = {0};
     if (!CreateProcessW(path, line, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, home, &si, &pi))
         return false;
+    AllowSetForegroundWindow(pi.dwProcessId);
     CloseHandle(pi.hThread);
     CloseHandle(pi.hProcess);
     return true;
@@ -265,7 +277,7 @@ bool w_os_launch_terminal(const char *name) {
             return false;
     } else if (!w_os_provider(name, path, count_of(path)))
         return false;
-    HANDLE p = w_launch_at(path, NULL, home);
+    HANDLE p = w_launch_at(path, NULL, home, NULL);
     if (!p)
         return false;
     CloseHandle(p);
@@ -374,9 +386,18 @@ static const wchar_t *const coords[] = {L"winwm.x", L"winwm.y", L"winwm.w",
 ////////////////
 //~ Window recovery
 
-bool w_os_remember(HWND w) {
-    if (GetPropW(w, L"winwm.managed"))
+static w_rect w_remembered_bounds(HWND w) {
+    int v[4];
+    for (int i = 0; i < 4; i++)
+        v[i] = (int)((uintptr_t)GetPropW(w, coords[i]) - 1);
+    return (w_rect){v[0], v[1], v[2], v[3]};
+}
+
+bool w_os_remember(HWND w, w_rect *original) {
+    if (GetPropW(w, L"winwm.managed")) {
+        *original = w_remembered_bounds(w);
         return true;
+    }
     w_rect r = w_os_bounds(w);
     bool zoomed = IsZoomed(w) != 0;
     WINDOWPLACEMENT placement = {.length = sizeof(placement)};
@@ -398,6 +419,7 @@ bool w_os_remember(HWND w) {
         }
     }
     if (SetPropW(w, L"winwm.managed", (HANDLE)1)) {
+        *original = r;
         if (zoomed)
             SetPropW(w, L"winwm.zoomed", (HANDLE)1);
         return true;
@@ -477,6 +499,31 @@ void w_os_window_appearance(HWND w, DWORD color, DWORD corner) {
         DwmSetWindowAttribute(w, 34, &color, sizeof(color));
 }
 
+bool w_os_direct_surface(HWND w) {
+    if ((GetWindowLongPtrW(w, GWL_EXSTYLE) & (WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP)) ||
+        (GetClassLongPtrW(w, GCL_STYLE) & (CS_OWNDC | CS_CLASSDC)))
+        return true;
+    // A foreign GetDC can return a common DC with no pixel format even when
+    // the application is already presenting with OpenGL. In particular Winit
+    // uses a full-redraw window class without CS_OWNDC. Check the rendering
+    // runtime once at discovery, never in the animation or input loop.
+    DWORD pid = 0;
+    GetWindowThreadProcessId(w, &pid);
+    HANDLE modules = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
+    if (modules == INVALID_HANDLE_VALUE)
+        return true;
+    MODULEENTRY32W entry = {.dwSize = sizeof(entry)};
+    bool direct = !Module32FirstW(modules, &entry);
+    if (!direct) {
+        do {
+            direct = !_wcsicmp(entry.szModule, L"opengl32.dll") || !_wcsicmp(entry.szModule, L"libEGL.dll") ||
+                     !_wcsicmp(entry.szModule, L"vulkan-1.dll");
+        } while (!direct && Module32NextW(modules, &entry));
+    }
+    CloseHandle(modules);
+    return direct;
+}
+
 bool w_os_window_opacity(HWND w, BYTE alpha, bool retain_layer) {
     if (alpha == 255 && !retain_layer) {
         w_remove_dim(w);
@@ -518,16 +565,14 @@ void w_os_restore(HWND w) {
         DWORD color = (DWORD)((uintptr_t)border - 1);
         DwmSetWindowAttribute(w, 34, &color, sizeof(color));
     }
-    int v[4];
-    for (int i = 0; i < 4; i++)
-        v[i] = (int)((uintptr_t)GetPropW(w, coords[i]) - 1);
+    w_rect r = w_remembered_bounds(w);
     bool zoomed = GetPropW(w, L"winwm.zoomed") != NULL;
     bool iconic = IsIconic(w) != 0;
     bool visible = IsWindowVisible(w) || w_os_shell_hidden(w);
     bool restored;
     if (iconic || IsZoomed(w) || (visible && zoomed)) {
         WINDOWPLACEMENT placement = {.length = sizeof(placement)};
-        RECT normal = {v[0], v[1], v[0]+v[2], v[1]+v[3]};
+        RECT normal = w_os_to_rect(r);
         MONITORINFO mon = {.cbSize = sizeof(mon)};
         restored = GetWindowPlacement(w, &placement) &&
                    GetMonitorInfoW(MonitorFromRect(&normal, MONITOR_DEFAULTTONEAREST), &mon);
@@ -542,7 +587,7 @@ void w_os_restore(HWND w) {
             restored = SetWindowPlacement(w, &placement) != 0;
         }
     } else
-        restored = SetWindowPos(w, NULL, v[0], v[1], v[2], v[3],
+        restored = SetWindowPos(w, NULL, r.x, r.y, r.w, r.h,
                                 SWP_ASYNCWINDOWPOS | SWP_NOZORDER | SWP_NOACTIVATE) != 0;
     w_release_visibility(w);
     if (restored) {

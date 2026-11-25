@@ -9,8 +9,14 @@ A tiling window manager and desktop shell for Windows x64.
 
 New app windows tile automatically on the selected workspace of their monitor. With
 `follow_mouse = 1` in the `input` section, moving
-the pointer into a tile gives it keyboard focus. Use Win+Shift+Arrow to move the
-focused tile. Win+Shift+Space toggles floating.
+the pointer into a tile gives it keyboard focus. Hold Win+Shift+Arrow to move the
+focused window repeatedly at your keyboard's repeat rate. Win+Shift+Space restores
+the window's last floating size and position. Press it again to tile the window.
+On first use, winwm uses the app's normal window bounds, or a centered window
+covering two-thirds of each work-area dimension if those bounds fill the display.
+Newly opened windows on a visible workspace receive focus. Opening Run or a toolbar
+menu keeps the keyboard with that control. Run ranks exact app names first, then
+matching phrases and word prefixes, so typing `task manager` selects Task Manager.
 
 ## Mouse gestures
 
@@ -85,6 +91,11 @@ Use `animation = barModules, 0` or `animation = workspaces, 0` to disable an
 individual effect. Mouse dragging follows the pointer directly. Application
 closing uses the native Windows behavior.
 
+For OpenGL, EGL, Vulkan, and application-managed layered surfaces, winwm preserves
+the application's native presentation. It applies a resize once, animates position
+changes, and uses the focus border for feedback. This keeps GPU terminals such as
+Alacritty from flashing as focus or tile geometry changes.
+
 Border width and corner radius use DPI-scaled units. A single color makes a solid
 outline, and two colors plus an optional angle make a gradient. Set `border_size = 0`
 to hide it. `winwm.exe ctl doctor` shows the effective motion setting and border width.
@@ -94,14 +105,15 @@ The configuration follows [Hyprland’s animation controls](https://wiki.hypr.la
 
 | Control | Interaction |
 | --- | --- |
-| Speaker | Click and drag the volume slider, or use its arrow keys. Scroll the speaker in five-point steps. Right-click or middle-click to mute. The flyout also opens the per-app mixer and sound device chooser. |
+| Speaker | Click for the volume slider, scroll in five-point steps, or right-click to mute. **Volume mixer** adjusts individual playback sessions. **Choose sound devices** changes input and output levels, mute, and the default device. |
 | Keyboard (such as **EN**) | Click to choose a layout for the focused app. A check marks its current layout. Scroll to cycle layouts or right-click to open input setup. |
-| Network and throughput | Click to see Wi-Fi networks or, on Ethernet-only systems, network adapters. Right-click for adapter settings. |
-| Bluetooth | Click to inspect known devices or start pairing. |
-| Battery or plug | Click for power status and **Keep awake**. Right-click for power settings. |
-| Clock | Click to alternate between time and date. Right-click for date and time settings. |
+| Network and throughput | Click to scan for Wi-Fi or right-click to inspect network adapters. Switch between both views inside the panel. Select an unavailable controller to see its hardware ID and Windows device problem code. |
+| Bluetooth | Use **Scan nearby** to discover Bluetooth Classic devices, then select **Pair device** or **Forget device**. **More devices** opens Windows pairing for Bluetooth LE accessories. |
+| Battery or plug | Click for **Keep awake**, power plans, sleep, and restart. Right-click to open the power-plan chooser directly. |
+| Clock | Click for a calendar and time-zone selector. Right-click to switch the bar between time and date. |
 | Run and window title | Click **Run** for the launcher or right-click for settings. Click the window title for the window switcher. Click a result once or use the arrow keys and Enter. |
-| Workspaces, CPU, memory, and media | Click a workspace or scroll to switch. CPU and memory open the configured task manager. Media toggles playback. |
+| Displays in Settings | Choose a monitor to adjust hardware brightness on supported DDC/CI displays. Preview a resolution and refresh rate, then choose **Keep** within 12 seconds. |
+| Workspaces, CPU, memory, and media | Click a workspace or scroll to switch. CPU and memory open the configured task manager. Click media to toggle playback, or right-click for track and stop controls. |
 
 To add an input language, right-click the keyboard indicator, search by language
 name or region code, select the result and choose **Add language**. To enable

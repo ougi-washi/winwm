@@ -561,8 +561,7 @@ bool w_bar_menu_open(w_bar_window *b, int hit) {
     }
     if (!strcmp(key, "clock")) {
         w_bar_menu_close(NULL, true);
-        b->calendar_date = !b->calendar_date;
-        InvalidateRect(b->hwnd, NULL, FALSE);
+        b->invoke(b->output, "date_time");
         return true;
     }
     w_menu_row rows[5] = {0};
@@ -582,6 +581,14 @@ bool w_bar_menu_open(w_bar_window *b, int hit) {
         wcsncpy(rows[0].label, b->hits[hit].tooltip, count_of(rows[0].label) - 1);
         rows[n++] = (w_menu_row){.label = L"Keep awake", .checked = b->view.inhibit, .action = "idle_inhibit"};
         rows[n++] = (w_menu_row){.label = L"Power settings\u2026", .action = "power_settings"};
+        rows[n++] = (w_menu_row){.label = L"Sleep\u2026", .action = "sleep"};
+        rows[n++] = (w_menu_row){.label = L"Restart\u2026", .action = "restart"};
+    } else if (!strcmp(key, "media")) {
+        wcscpy(rows[0].label, L"Playback");
+        rows[n++] = (w_menu_row){.label = L"Play / pause", .action = "media_play"};
+        rows[n++] = (w_menu_row){.label = L"Previous track", .action = "media_previous"};
+        rows[n++] = (w_menu_row){.label = L"Next track", .action = "media_next"};
+        rows[n++] = (w_menu_row){.label = L"Stop", .action = "media_stop"};
     } else
         return false;
     w_show(b, hit, rows, n, NULL);

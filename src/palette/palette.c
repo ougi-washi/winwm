@@ -7,6 +7,7 @@
 #include <shellscalingapi.h>
 #include <uxtheme.h>
 #include <wctype.h>
+#include <stdlib.h>
 enum { check_deactivation = WM_APP + 1, restore_foreground };
 
 ////////////////
@@ -19,6 +20,7 @@ static UINT palette_dpi;
 static w_palette_entry rows[palette_limit];
 static int row_count;
 static int pressed_result = -1;
+static bool manual_selection;
 static palette_callback select_entry;
 
 static void w_palette_size(void) {
@@ -55,27 +57,148 @@ static void w_palette_size(void) {
 ////////////////
 //~ Window matching
 
-static bool w_matches(const wchar_t *s, const wchar_t *q) {
-    while (*s && *q) {
-        if (towlower(*s) == towlower(*q))
-            ++q;
-        ++s;
+static void w_search_text(wchar_t *out, const wchar_t *text) {
+    int n = 0;
+    bool space = false;
+    for (; *text; text++) {
+        if (iswspace(*text) || *text == L'_' || *text == L'-') {
+            space = n != 0;
+            continue;
+        }
+        if (space)
+            out[n++] = L' ';
+        space = false;
+        out[n++] = *text;
     }
-    return !*q;
+    out[n] = 0;
+    CharLowerBuffW(out, n);
+}
+
+typedef struct w_query_word {
+    const wchar_t *start;
+    size_t length;
+} w_query_word;
+
+// Match the longest prefixes first so that "man manage" can use two distinct words.
+static int w_query_words(const wchar_t *query, w_query_word *words) {
+    int count = 0;
+    while (*query) {
+        size_t length = wcscspn(query, L" ");
+        int i = count++;
+        while (i > 0 && words[i - 1].length < length) {
+            words[i] = words[i - 1];
+            i--;
+        }
+        words[i] = (w_query_word){query, length};
+        query += length;
+        if (*query)
+            query++;
+    }
+    return count;
+}
+
+static bool w_word_start(const wchar_t *text, const wchar_t *position) {
+    return position == text || !IsCharAlphaNumericW(position[-1]);
+}
+
+static int w_match_tier(const wchar_t *text, const wchar_t *query, const w_query_word *words,
+                        int count, int *cost) {
+    if (!wcscmp(text, query))
+        return 0;
+    *cost = (int)wcslen(text);
+    const wchar_t *hit = wcsstr(text, query);
+    if (hit == text)
+        return 1;
+    for (const wchar_t *p = hit; p; p = wcsstr(p + 1, query)) {
+        if (w_word_start(text, p)) {
+            *cost += (int)(p - text);
+            return 2;
+        }
+    }
+    if (count > 1) {
+        bool used[palette_text_capacity] = {0};
+        int i;
+        for (i = 0; i < count; i++) {
+            const wchar_t *p = text;
+            while (*p && (used[p - text] || !w_word_start(text, p) ||
+                          wcsncmp(p, words[i].start, words[i].length)))
+                p++;
+            if (!*p)
+                break;
+            used[p - text] = true;
+        }
+        if (i == count)
+            return 3;
+    }
+    if (hit) {
+        *cost += (int)(hit - text);
+        return 4;
+    }
+    const wchar_t *initials = query, *fuzzy = query;
+    int gaps = 0;
+    for (const wchar_t *p = text; *p; p++) {
+        if (*initials && w_word_start(text, p) && *p == *initials)
+            initials++;
+        if (*fuzzy) {
+            if (*p == *fuzzy) {
+                fuzzy++;
+                if (*fuzzy == L' ')
+                    fuzzy++;
+            } else {
+                gaps++;
+            }
+        }
+    }
+    if (!*initials)
+        return 5;
+    *cost += gaps;
+    return *fuzzy ? -1 : 6;
+}
+
+typedef struct w_result {
+    int row, tier, cost;
+} w_result;
+
+static int w_compare_result(const void *left, const void *right) {
+    const w_result *a = left, *b = right;
+    if (a->tier != b->tier)
+        return a->tier - b->tier;
+    if (a->cost != b->cost)
+        return a->cost - b->cost;
+    int order = CompareStringOrdinal(rows[a->row].label, -1, rows[b->row].label, -1, TRUE);
+    return order == CSTR_EQUAL ? a->row - b->row : order - CSTR_EQUAL;
 }
 
 static void w_filter(void) {
     pressed_result = -1;
-    wchar_t q[palette_text_capacity];
-    GetWindowTextW(edit, q, count_of(q));
+    manual_selection = false;
+    wchar_t input[palette_text_capacity], query[palette_text_capacity];
+    GetWindowTextW(edit, input, count_of(input));
+    w_search_text(query, input);
+    w_query_word words[palette_text_capacity / 2];
+    int word_count = w_query_words(query, words);
+    w_result results[palette_limit];
+    int matches = 0;
+    for (int i = 0; i < row_count; i++) {
+        int tier = 0, cost = 0;
+        if (word_count) {
+            wchar_t text[palette_text_capacity];
+            w_search_text(text, rows[i].label);
+            tier = w_match_tier(text, query, words, word_count, &cost);
+        }
+        if (tier >= 0)
+            results[matches++] = (w_result){i, tier, cost};
+    }
+    if (word_count)
+        qsort(results, matches, sizeof(*results), w_compare_result);
     SendMessageW(list, WM_SETREDRAW, FALSE, 0);
     SendMessageW(list, LB_RESETCONTENT, 0, 0);
-    for (int i = 0; i < row_count; i++)
-        if (w_matches(rows[i].label, q)) {
-            LRESULT n = SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)rows[i].label);
-            if (n >= 0)
-                SendMessageW(list, LB_SETITEMDATA, n, rows[i].id);
-        }
+    for (int j = 0; j < matches; j++) {
+        const w_palette_entry *entry = &rows[results[j].row];
+        LRESULT n = SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)entry->label);
+        if (n >= 0)
+            SendMessageW(list, LB_SETITEMDATA, n, entry->id);
+    }
     SendMessageW(list, LB_SETCURSEL, 0, 0);
     SendMessageW(list, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(list, NULL, TRUE);
@@ -182,8 +305,10 @@ static LRESULT CALLBACK w_palette_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_COMMAND) {
         if ((HWND)lp == edit && HIWORD(wp) == EN_CHANGE)
             w_filter();
-        if ((HWND)lp == list && HIWORD(wp) == LBN_SELCHANGE)
+        if ((HWND)lp == list && HIWORD(wp) == LBN_SELCHANGE) {
+            manual_selection = true;
             SetFocus(edit);
+        }
         return 0;
     }
     if (msg == WM_SIZE) {
@@ -274,14 +399,19 @@ void w_palette_open(HMONITOR monitor, const wchar_t *title, const w_palette_entr
     SetWindowTextW(panel, title);
     if (!preserve)
         SetWindowTextW(edit, L"");
-    LRESULT selected = preserve ? SendMessageW(list, LB_GETCURSEL, 0, 0) : LB_ERR;
+    LRESULT selected = preserve && manual_selection ? SendMessageW(list, LB_GETCURSEL, 0, 0) : LB_ERR;
     wchar_t label[palette_text_capacity] = {0};
     if (selected != LB_ERR)
         SendMessageW(list, LB_GETTEXT, selected, (LPARAM)label);
     w_filter();
     if (preserve) {
-        if (*label)
-            SendMessageW(list, LB_SELECTSTRING, -1, (LPARAM)label);
+        if (*label) {
+            LRESULT found = SendMessageW(list, LB_FINDSTRINGEXACT, -1, (LPARAM)label);
+            if (found != LB_ERR) {
+                SendMessageW(list, LB_SETCURSEL, found, 0);
+                manual_selection = true;
+            }
+        }
         return;
     }
     if (!w_palette_shown())
@@ -360,8 +490,10 @@ bool w_palette_message(MSG *msg) {
     case VK_UP:
     case VK_DOWN: {
         int n = (int)SendMessageW(list, LB_GETCURSEL, 0, 0), len = (int)SendMessageW(list, LB_GETCOUNT, 0, 0);
-        if (len)
+        if (len) {
             SendMessageW(list, LB_SETCURSEL, w_clamp_int(n + (msg->wParam == VK_UP ? -1 : 1), 0, len - 1), 0);
+            manual_selection = true;
+        }
         return true;
     }
     }

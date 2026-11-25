@@ -118,9 +118,11 @@ void w_desktop_place_floating(int slot, w_rect bounds) {
 void w_desktop_outputs(void) {
     w_desktop_cancel_drag();
     w_rect previous_work[output_limit];
+    int previous_dpi[output_limit];
     bool previously_live[output_limit];
     for (int i = 0; i < output_limit; i++) {
         previous_work[i] = desk.outputs[i].work;
+        previous_dpi[i] = desk.outputs[i].dpi;
         previously_live[i] = desk.outputs[i].live;
         desk.outputs[i].live = false;
     }
@@ -153,8 +155,10 @@ void w_desktop_outputs(void) {
             if (home < 0)
                 state->displaced_from = from + 1;
         }
-        if (w->floating && !w_rect_equal(previous_work[from], desk.outputs[to].work))
-            w_desktop_place_floating(i, w_layout_relocate(w->floating_bounds, previous_work[from], desk.outputs[to].work));
+        if (w->floating && (!w_rect_equal(previous_work[from], desk.outputs[to].work) ||
+                            previous_dpi[from] != desk.outputs[to].dpi))
+            w_desktop_place_floating(i, w_layout_relocate(w->floating_bounds, previous_work[from],
+                                      desk.outputs[to].work, previous_dpi[from], desk.outputs[to].dpi));
         if (from != to)
             w_model_move(&desk.model, i, to, w->workspace);
     }
@@ -190,7 +194,7 @@ static void w_forget(int i) {
     w_desktop_schedule();
 }
 
-static int w_discover(HWND w) {
+static int w_discover(HWND w, bool *focus_new) {
     int i = w_desktop_find(w);
     DWORD pid = 0;
     GetWindowThreadProcessId(w, &pid);
@@ -241,7 +245,8 @@ static int w_discover(HWND w) {
     w_rect bounds = w_os_bounds(w);
     if (!(style & (WS_CAPTION | WS_THICKFRAME)) && w_rect_equal(bounds, desk.outputs[initial_output].screen))
         return -1;
-    if (!w_os_remember(w))
+    w_rect original;
+    if (!w_os_remember(w, &original))
         return -1;
     if (ws < 0)
         ws = desk.model.selected[output];
@@ -250,14 +255,24 @@ static int w_discover(HWND w) {
         w_os_restore(w);
         return -1;
     }
-    desk.windows[id.slot] = (w_window_state){
-        .hwnd = w, .pid = pid, .custom_border = colored, .border = RGB(border >> 16, border >> 8, border)};
-    desk.model.windows[id.slot].floating = floating;
+    int saved_output = w_desktop_output_for_bounds(initial_output, original);
+    w_output_state *saved = &desk.outputs[saved_output];
+    desk.windows[id.slot] = (w_window_state){.hwnd = w, .pid = pid, .custom_border = colored,
+        .border = RGB(border >> 16, border >> 8, border), .saved_float_work = saved->work, .saved_float_dpi = saved->dpi,
+        .direct_surface = w_os_direct_surface(w)};
+    w_model_window *window = &desk.model.windows[id.slot];
+    window->floating = floating;
+    if (!floating)
+        window->floating_bounds = w_layout_initial_float(original, saved->work);
+    else if (IsZoomed(w))
+        window->floating_bounds = original;
     if (floating && initial_output != output)
-        w_desktop_place_floating(id.slot, w_layout_relocate(bounds, desk.outputs[initial_output].work,
-                                                        desk.outputs[output].work));
+        w_desktop_place_floating(id.slot, w_layout_relocate(window->floating_bounds, desk.outputs[initial_output].work,
+                                 desk.outputs[output].work, desk.outputs[initial_output].dpi, desk.outputs[output].dpi));
     if (layout >= 0)
         desk.model.spaces[output][ws].layout = (enum layout_kind)layout;
+    if (*focus_new && w_desktop_focus_new(id))
+        *focus_new = false;
     // A late size or position change can be the first eligible event.
     w_desktop_schedule();
     return id.slot;
@@ -290,7 +305,7 @@ static void w_observe_floating(int slot) {
         w_desktop_drag_client_resized(slot);
         return;
     }
-    if (state->floating_update)
+    if (state->floating_update || IsZoomed(state->hwnd))
         return;
     w_rect actual = w_os_bounds(state->hwnd);
     // The hook delivers notifications asynchronously. A queued event may still
@@ -325,13 +340,43 @@ static void w_observe_floating(int slot) {
     }
 }
 
-static BOOL CALLBACK w_enumerate(HWND w, LPARAM unused) {
-    (void)unused;
-    int slot = w_discover(w);
+void w_desktop_set_floating(int slot, bool floating) {
+    w_model_window *w = &desk.model.windows[slot];
+    if (w->floating == floating)
+        return;
+    w_window_state *state = &desk.windows[slot];
+    w_output_state *out = &desk.outputs[w->output];
+    if (floating) {
+        if (!w_rect_equal(state->saved_float_work, out->work) || state->saved_float_dpi != out->dpi)
+            w->floating_bounds = w_layout_relocate(w->floating_bounds, state->saved_float_work, out->work,
+                                                   state->saved_float_dpi, out->dpi);
+    } else {
+        // Native resize notifications can still be queued when the shortcut arrives.
+        if (!w->fullscreen && !IsIconic(state->hwnd) && IsWindowVisible(state->hwnd))
+            w_observe_floating(slot);
+        out = &desk.outputs[w->output];
+        state->saved_float_work = out->work;
+        state->saved_float_dpi = out->dpi;
+    }
+    state->motion.start = 0;
+    state->native_move = move_idle;
+    state->has_issued = false;
+    state->float_request_sent = false;
+    state->floating_update = floating ? float_move | float_size : 0;
+    w->floating = floating;
+    w_desktop_schedule();
+}
+
+static BOOL CALLBACK w_enumerate(HWND w, LPARAM focus_new) {
+    int slot = w_discover(w, (bool *)focus_new);
     if (slot >= 0) {
         w_window_state *state = &desk.windows[slot];
         w_observe_visibility(slot);
-        state->has_issued = false;
+        if (state->has_issued && !state->motion.start && state->native_move != move_dragging) {
+            w_rect actual = w_os_bounds(w);
+            if (!w_rect_equal(actual, state->issued_native) && !w_rect_equal(actual, state->rejected_bounds))
+                state->has_issued = false;
+        }
         if (!IsZoomed(w))
             state->restoring = false;
         if (desk.model.windows[slot].floating && !desk.model.windows[slot].fullscreen &&
@@ -344,8 +389,10 @@ static BOOL CALLBACK w_enumerate(HWND w, LPARAM unused) {
 ////////////////
 //~ Window discovery
 
-void w_desktop_scan(void) {
-    EnumWindows(w_enumerate, 0);
+void w_desktop_scan(bool focus_new) {
+    // Enumeration is in z-order. When recovering missed events, give at most
+    // one newly eligible window the same activation as a normal first map.
+    EnumWindows(w_enumerate, (LPARAM)&focus_new);
     for (int i = 0; i < window_limit; i++)
         if (desk.model.windows[i].live && !IsWindow(desk.windows[i].hwnd))
             w_forget(i);
@@ -363,7 +410,9 @@ void w_desktop_event(HWND w, DWORD event) {
     }
     if (event == EVENT_SYSTEM_FOREGROUND)
         w = w_os_app_window(w);
-    i = w_discover(w);
+    bool focus_new = event != EVENT_OBJECT_HIDE && event != EVENT_OBJECT_CLOAKED &&
+                     event != EVENT_SYSTEM_MINIMIZESTART;
+    i = w_discover(w, &focus_new);
     if (i < 0) {
         if (event == EVENT_SYSTEM_FOREGROUND) {
             w_desktop_focus_observe(w);
@@ -634,6 +683,13 @@ void w_desktop_apply(void) {
                     continue;
                 }
                 s->motion.start = 0;
+                // A recovered event or refreshed configuration can invalidate
+                // the layout cache while the actual placement is already right.
+                if (w_rect_equal(w_os_bounds(hwnd), target)) {
+                    s->issued = w->desired;
+                    s->has_issued = true;
+                    continue;
+                }
                 if (!batch && !batch_failed) {
                     batch = BeginDeferWindowPos(8);
                     batch_failed = !batch;

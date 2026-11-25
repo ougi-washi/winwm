@@ -75,7 +75,8 @@ static void w_move_to(int slot, int output, int ws, int anchor, enum split_axis 
         return;
     if (w->floating && w->output != output) {
         w_rect next =
-            w_layout_relocate(w->floating_bounds, desk.outputs[w->output].work, desk.outputs[output].work);
+            w_layout_relocate(w->floating_bounds, desk.outputs[w->output].work, desk.outputs[output].work,
+                              desk.outputs[w->output].dpi, desk.outputs[output].dpi);
         w_desktop_place_floating(slot, next);
     }
     if (w->fullscreen)

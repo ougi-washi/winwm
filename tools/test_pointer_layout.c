@@ -111,6 +111,16 @@ int main(void) {
     memset(unplugged,0,sizeof(unplugged));
     assert(w_layout_output_for_bounds(unplugged,1,(w_rect){-500,300,300,220}) == -1);
     w_rect original = {-120,35,800,420};
+    w_rect work = {-1600,-200,1600,900};
+    w_rect natural = {-1400,-100,800,450};
+    assert(w_rect_equal(w_layout_initial_float(natural,work), natural));
+    assert(w_rect_equal(w_layout_initial_float(work,work), (w_rect){-1333,-50,1066,600}));
+    w_rect larger = {100,40,2400,1350};
+    w_rect destination = w_layout_relocate(natural,work,larger,96,144);
+    assert(w_rect_equal(destination,(w_rect){400,190,1200,675}));
+    assert(w_rect_equal(w_layout_relocate(destination,larger,work,144,96),natural));
+    w_rect tiny = {-7,20,1,1};
+    assert(w_rect_equal(w_layout_relocate(natural,work,tiny,96,96),tiny));
     w_rect scaled = w_layout_drag_position(original,(w_rect){0,0,1200,630},200,315,-900,-130);
     assert(scaled.x == -1200 && scaled.y == -603 && scaled.w == 1200 && scaled.h == 630);
     w_rect back = w_layout_drag_position(original,original,200,315,80,350);

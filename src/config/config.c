@@ -245,9 +245,9 @@ void w_config_defaults(w_desktop_config *c) {
         snprintf(chord, sizeof(chord), "super+%c", "hjkl"[i]);
         w_config_bind(c, chord, action);
         snprintf(action, sizeof(action), "move %s", dirs[i]);
-        snprintf(chord, sizeof(chord), "super+shift+%s", dirs[i]);
+        snprintf(chord, sizeof(chord), "repeat:super+shift+%s", dirs[i]);
         w_config_bind(c, chord, action);
-        snprintf(chord, sizeof(chord), "super+shift+%c", "hjkl"[i]);
+        snprintf(chord, sizeof(chord), "repeat:super+shift+%c", "hjkl"[i]);
         w_config_bind(c, chord, action);
     }
     w_config_bind(c, "super+h", "split horizontal");

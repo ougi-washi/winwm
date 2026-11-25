@@ -213,11 +213,8 @@ int w_language_setup(bool start_keyboards) {
     WNDCLASSW wc = {.lpfnWndProc = w_setup_proc, .hInstance = instance,
                     .hCursor = LoadCursorW(NULL, IDC_ARROW), .lpszClassName = L"WinwmInputSetup"};
     RegisterClassW(&wc);
-    HWND foreground = GetForegroundWindow();
-    dpi = foreground ? (int)GetDpiForWindow(foreground) : 96;
-    if (!dpi) dpi = 96;
     MONITORINFO mi = {.cbSize = sizeof(mi)};
-    GetMonitorInfoW(MonitorFromWindow(foreground, MONITOR_DEFAULTTOPRIMARY), &mi);
+    dpi = (int)w_tool_work_area(&mi);
     RECT r = {0, 0, px(500), px(374)};
     DWORD style = WS_CAPTION | WS_SYSMENU;
     AdjustWindowRectExForDpi(&r, style, FALSE, WS_EX_TOOLWINDOW, dpi);

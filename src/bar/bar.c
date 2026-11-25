@@ -477,7 +477,7 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (hit != w_hit_at(b, start))
             return 0;
         bool custom_action = hit >= 0 && b->hits[hit].style && *b->hits[hit].style->action;
-        if (hit >= 0 && !custom_action && w_bar_menu_open(b, hit))
+        if (hit >= 0 && !custom_action && strcmp(b->hits[hit].module, "media") && w_bar_menu_open(b, hit))
             return 0;
         w_bar_menu_close(NULL, true);
         if (hit >= 0 && *b->hits[hit].action)
@@ -498,9 +498,16 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (!strcmp(key, "audio"))
             action = "mute";
         else if (msg == WM_RBUTTONUP) {
+            if (!strcmp(key, "media")) {
+                w_bar_menu_open(b, hit);
+                return 0;
+            }
             if (!strcmp(key, "keyboard")) action = "languages";
             else if (!strcmp(key, "menu")) action = "settings";
-            else if (!strcmp(key, "clock")) action = "date_time";
+            else if (!strcmp(key, "clock")) {
+                b->calendar_date = !b->calendar_date;
+                InvalidateRect(w, NULL, FALSE);
+            }
             else if (!strcmp(key, "battery")) action = "power_settings";
             else if (!strcmp(key, "network") || !strcmp(key, "throughput")) action = "network_settings";
         }

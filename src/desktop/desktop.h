@@ -43,6 +43,8 @@ typedef struct w_window_state {
     DWORD pid;
     int displaced_from;
     w_rect issued, issued_native, rejected_bounds, float_before_request, drag_start;
+    w_rect saved_float_work;
+    int saved_float_dpi;
     RECT frame_margins;
     LONG_PTR frame_style, frame_exstyle;
     UINT frame_dpi;
@@ -71,7 +73,7 @@ typedef struct w_window_state {
         ULONGLONG start;
         bool initialized;
     } outline;
-    bool presented;
+    bool presented, direct_surface;
 } w_window_state;
 
 typedef struct w_desktop_state {
@@ -99,7 +101,7 @@ extern w_desktop_state desk;
 //~ Desktop Interface
 
 void w_desktop_schedule(void);
-void w_desktop_scan(void);
+void w_desktop_scan(bool focus_new);
 void w_desktop_event(HWND hwnd, DWORD event);
 void w_desktop_outputs(void);
 int w_desktop_output_for_bounds(int current, w_rect r);
@@ -113,6 +115,7 @@ void w_desktop_navigate(enum direction dir, bool move);
 void w_desktop_resize_axis(enum split_axis axis, int delta);
 void w_desktop_resize_direction(int direction);
 void w_desktop_place_floating(int slot, w_rect bounds);
+void w_desktop_set_floating(int slot, bool floating);
 void w_desktop_apply(void);
 enum { animation_timer = 30 };
 void w_effects_preferences(void);
@@ -138,6 +141,7 @@ int w_desktop_find(HWND w);
 void w_desktop_activate(int slot);
 void w_desktop_hover(POINT p);
 void w_desktop_focus_cancel(void);
+bool w_desktop_focus_new(w_window_id id);
 void w_desktop_focus_empty(void);
 bool w_desktop_close_foreground(void);
 void w_desktop_focus_apply(void);

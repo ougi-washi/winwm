@@ -37,7 +37,7 @@ static HANDLE key_thread;
 static DWORD key_thread_id;
 static SRWLOCK matcher_lock = SRWLOCK_INIT;
 static bool modal, held[256];
-static int on_release[256];
+static int on_release[256], on_repeat[256];
 static unsigned prefix_key, prefix_mods;
 static DWORD prefix_time, generation;
 static bool super_down[2], mapped_super[2];
@@ -114,7 +114,7 @@ static bool w_match_key(unsigned key, unsigned vk, unsigned scan) {
     return key == vk || (scan && key == 0x400 + scan);
 }
 
-static int w_match(unsigned vk, unsigned scan, unsigned mods, DWORD time, bool repeat, int *release_id) {
+static int w_match(unsigned vk, unsigned scan, unsigned mods, DWORD time, int *release_id) {
     if (prefix_key && time - prefix_time > 800)
         prefix_key = 0;
     unsigned candidate = 0;
@@ -134,10 +134,10 @@ static int w_match(unsigned vk, unsigned scan, unsigned mods, DWORD time, bool r
             candidate = b->key;
         else if (b->release)
             *release_id = i;
-        else if (!repeat || b->repeat)
+        else
             found = i;
     }
-    if (candidate && !repeat) {
+    if (candidate) {
         prefix_key = candidate;
         prefix_mods = mods;
         prefix_time = time;
@@ -175,7 +175,7 @@ static bool w_consume_key(WPARAM event, const KBDLLHOOKSTRUCT *key) {
             if (on_release[vk] > 0)
                 PostMessageW(target, action_msg, on_release[vk] - 1, generation);
             held[vk] = false;
-            on_release[vk] = 0;
+            on_release[vk] = on_repeat[vk] = 0;
             return true;
         }
     } else {
@@ -186,15 +186,28 @@ static bool w_consume_key(WPARAM event, const KBDLLHOOKSTRUCT *key) {
         unsigned mods = w_modifiers();
         if ((vk == VK_DELETE && (mods & 3) == 3) || (vk == VK_F12 && mods == (MOD_CONTROL | MOD_ALT)))
             return false;
-        int release_id = -1, id = w_match(vk, scan, mods, key->time, held[vk], &release_id);
+        if (held[vk]) {
+            // Typematic keydowns belong to the original press. Changing modifiers
+            // must not fire a different action before the physical key is released.
+            int id = on_repeat[vk] - 1;
+            if (id >= 0 && bindings[id].mods == mods && (!bindings[id].modal || modal))
+                PostMessageW(target, action_msg, id, generation);
+            else
+                on_repeat[vk] = 0;
+            return true;
+        }
+        int release_id = -1, id = w_match(vk, scan, mods, key->time, &release_id);
         if (id >= 0 && id == registered_launcher && generation == launcher_generation) {
             held[vk] = true;
             PostThreadMessageW(key_thread_id, key_dispatch, id, generation);
             return false;
         }
-        if (id != -1 || release_id >= 0 || held[vk] || (mods & MOD_WIN)) {
-            if (id >= 0)
+        if (id != -1 || release_id >= 0 || (mods & MOD_WIN)) {
+            if (id >= 0) {
                 PostMessageW(target, action_msg, id, generation);
+                if (bindings[id].repeat)
+                    on_repeat[vk] = id + 1;
+            }
             if (release_id >= 0)
                 on_release[vk] = release_id + 1;
             held[vk] = true;
@@ -351,7 +364,7 @@ static LRESULT CALLBACK w_mouse_proc(int code, WPARAM event, LPARAM data) {
     }
     if (key) {
         AcquireSRWLockExclusive(&matcher_lock);
-        int release_id = -1, id = w_match(key, 0, w_modifiers(), m->time, false, &release_id);
+        int release_id = -1, id = w_match(key, 0, w_modifiers(), m->time, &release_id);
         ReleaseSRWLockExclusive(&matcher_lock);
         if (id >= 0) {
             PostMessageW(target, action_msg, id, generation);
@@ -396,6 +409,7 @@ void w_input_reset(void) {
     prefix_key = 0;
     memset(held, 0, sizeof(held));
     memset(on_release, 0, sizeof(on_release));
+    memset(on_repeat, 0, sizeof(on_repeat));
     memset(mouse_held, 0, sizeof(mouse_held));
     ReleaseSRWLockExclusive(&matcher_lock);
 }
@@ -429,6 +443,7 @@ void w_input_bind(HWND w, UINT message, UINT hover_message, UINT context_message
         PostThreadMessageW(key_thread_id, WM_APP, 0, 0);
     prefix_key = 0;
     memset(on_release, 0, sizeof(on_release));
+    memset(on_repeat, 0, sizeof(on_repeat));
     SetPropW(target, L"winwm.binding_generation", (HANDLE)(uintptr_t)generation);
     ReleaseSRWLockExclusive(&matcher_lock);
     if (!key_thread)

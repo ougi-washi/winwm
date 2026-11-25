@@ -269,20 +269,39 @@ int w_layout_adjacent_output(const w_rect screens[output_limit], int output, w_r
 //~ Window relocation
 
 // Preserve relative position when a work area changes size, including negative desktop origins.
-static int w_relocate_axis(int position, int extent, int old_start, int old_size, int new_start, int new_size) {
-    int travel = old_size - extent;
-    if (travel <= 0 || new_size <= extent)
-        return new_start;
+static int w_relocate_axis(int position, int old_start, int travel, int new_start, int new_travel) {
+    if (travel <= 0)
+        return new_start + new_travel / 2;
     return new_start +
-           (int)((int64_t)w_clamp_int(position - old_start, 0, travel) * (new_size - extent) / travel);
+           (int)((int64_t)w_clamp_int(position - old_start, 0, travel) * new_travel / travel);
 }
 
-w_rect w_layout_relocate(w_rect r, w_rect from, w_rect to) {
-    r.x = w_relocate_axis(r.x, r.w, from.x, from.w, to.x, to.w);
-    r.y = w_relocate_axis(r.y, r.h, from.y, from.h, to.y, to.h);
-    r.w = w_clamp_int(r.w, 1, to.w);
-    r.h = w_clamp_int(r.h, 1, to.h);
-    return r;
+w_rect w_layout_relocate(w_rect r, w_rect from, w_rect to, int from_dpi, int to_dpi) {
+    if (to.w < 1 || to.h < 1)
+        return r;
+    int w = r.w, h = r.h;
+    if (from_dpi > 0 && to_dpi > 0 && from_dpi != to_dpi) {
+        w = (int)(((int64_t)r.w * to_dpi + from_dpi / 2) / from_dpi);
+        h = (int)(((int64_t)r.h * to_dpi + from_dpi / 2) / from_dpi);
+    }
+    w = w_clamp_int(w, 1, to.w);
+    h = w_clamp_int(h, 1, to.h);
+    return (w_rect){w_relocate_axis(r.x, from.x, from.w-r.w, to.x, to.w-w),
+                    w_relocate_axis(r.y, from.y, from.h-r.h, to.y, to.h-h), w, h};
+}
+
+w_rect w_layout_initial_float(w_rect original, w_rect work) {
+    if (work.w < 1 || work.h < 1)
+        return original;
+    // Apps can launch maximized or reopen at the size winwm previously tiled them to.
+    if (original.w < 1 || original.h < 1 ||
+        ((int64_t)original.w * 10 >= (int64_t)work.w * 9 &&
+         (int64_t)original.h * 10 >= (int64_t)work.h * 9)) {
+        int w = w_clamp_int(work.w * 2 / 3, 1, work.w);
+        int h = w_clamp_int(work.h * 2 / 3, 1, work.h);
+        return (w_rect){work.x + (work.w-w)/2, work.y + (work.h-h)/2, w, h};
+    }
+    return w_layout_relocate(original, work, work, 96, 96);
 }
 
 // Tabs and stacked windows can occupy the same rectangle. Navigate their actual tree order.
