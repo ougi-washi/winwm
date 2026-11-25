@@ -9,7 +9,7 @@ static w_rect screens[output_limit] = {
 };
 
 static void measure(int o) {
-    w_layout_compute_margins(&m, o, screens[o], screens[o], 10, 8);
+    w_layout_compute_margins(&m, o, screens[o], screens[o], 10, 8, 0, NULL);
 }
 
 static void visit_tile(int node, int parent, int output, int workspace, bool *seen) {
@@ -80,7 +80,7 @@ static void crowded_master(w_rect area, int count, int gap) {
         assert(w_model_add(&m,0,0,area).slot == i);
         m.windows[i].stack_weight = i == 1 ? 65536 : 1;
     }
-    w_layout_compute_margins(&m,0,area,area,gap,0);
+    w_layout_compute_margins(&m,0,area,area,gap,0,0,NULL);
     for (int i = 0; i < count; i++) {
         w_rect r = m.windows[i].desired;
         assert(r.w > 0 && r.h > 0 && r.x >= area.x && r.y >= area.y);
@@ -96,6 +96,39 @@ static void crowded_master(w_rect area, int count, int gap) {
             assert(grips[1].kind == grab_row && grips[1].second.slot == peer);
         }
     }
+}
+
+static void tab_geometry(void) {
+    w_model_init(&m);
+    w_rect area = screens[1];
+    m.spaces[1][0].layout = layout_tabs;
+    int a = w_model_add(&m,1,0,area).slot, b = w_model_add(&m,1,0,area).slot;
+    int floater = w_model_add(&m,1,0,area).slot;
+    m.windows[floater].floating = true;
+    w_model_add(&m,1,1,area);
+    w_model_add(&m,0,0,area);
+    w_model_focus(&m,a);
+    w_model_focus(&m,floater);
+    w_tab_layout tabs;
+    w_layout_compute_margins(&m,1,area,area,6,8,45,&tabs);
+    assert(tabs.count == 2 && tabs.slots[0] == a && tabs.slots[1] == b && tabs.selected == a);
+    assert(w_rect_equal(tabs.bounds,(w_rect){area.x+8,area.y+8,area.w-16,45}));
+    assert(w_rect_equal(m.windows[a].desired,(w_rect){area.x+8,area.y+53,area.w-16,area.h-61}));
+    assert(w_rect_equal(m.windows[b].desired,m.windows[a].desired));
+    assert(w_rect_equal(m.windows[floater].desired,area));
+    w_model_swap(&m,a,b);
+    w_model_focus(&m,b);
+    w_layout_compute_margins(&m,1,area,area,6,8,45,&tabs);
+    assert(tabs.slots[0] == b && tabs.slots[1] == a && tabs.selected == b);
+    m.windows[b].fullscreen = true;
+    w_layout_compute_margins(&m,1,area,area,6,8,45,&tabs);
+    assert(!tabs.bounds.h && w_rect_equal(m.windows[b].desired,area));
+    m.windows[b].minimized = true;
+    w_layout_compute_margins(&m,1,(w_rect){-5,0,1,2},area,0,8,45,&tabs);
+    assert(tabs.count == 1 && tabs.selected == a && tabs.bounds.h == 1 && m.windows[a].desired.h == 1);
+    m.windows[a].withdrawn = true;
+    w_layout_compute_margins(&m,1,area,area,6,8,45,&tabs);
+    assert(!tabs.count && tabs.selected == -1 && !tabs.bounds.h);
 }
 
 int main(void) {
@@ -194,6 +227,7 @@ int main(void) {
     assert(m.windows[c].desired.y < 0 && m.windows[c].desired.w == screens[2].w-16);
     crowded_master((w_rect){-320,-180,320,240},40,10);
     crowded_master((w_rect){-40,80,1,3},16,128);
+    tab_geometry();
     stress_reparenting();
     puts("Workspace trees stayed acyclic and retained every window through 4,096 mutations at full capacity.");
     puts("Three-output ownership, seams, monitor gaps, workspace membership, tile drops, split resizing, DPI grab offsets and floating size limits passed.");

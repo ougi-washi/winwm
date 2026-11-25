@@ -10,10 +10,10 @@ void w_desktop_select(int i) {
         w_desktop_focus_empty();
 }
 
-static void w_measure_output(int output) {
+void w_desktop_measure_output(int output) {
     w_output_state *o = &desk.outputs[output];
     w_layout_compute_margins(&desk.model, output, o->work, o->screen, MulDiv(desk.config.gap, o->dpi, 96),
-                           MulDiv(desk.config.outer_gap, o->dpi, 96));
+                           MulDiv(desk.config.outer_gap, o->dpi, 96), MulDiv(30, o->dpi, 96), &o->tab_layout);
 }
 
 void w_desktop_resize_axis(enum split_axis axis, int delta) {
@@ -38,7 +38,7 @@ void w_desktop_resize_axis(enum split_axis axis, int delta) {
         return;
     }
     // Measure from the latest ratios even when multiple key repeats share one paint batch.
-    w_measure_output(w->output);
+    w_desktop_measure_output(w->output);
     w_model_resize_pixels(m, axis, delta);
 }
 
@@ -186,7 +186,7 @@ void w_desktop_navigate(enum direction dir, bool move) {
     if (!screens[from].w || (move && !w))
         return;
     if (w && desk.refresh_pending)
-        w_measure_output(from);
+        w_desktop_measure_output(from);
     w_rect origin = w ? w->desired : screens[from];
     if (w && w->floating && !w->fullscreen)
         origin = w->floating_bounds;
@@ -219,7 +219,7 @@ void w_desktop_navigate(enum direction dir, bool move) {
         return;
     }
     if (desk.refresh_pending)
-        w_measure_output(target);
+        w_desktop_measure_output(target);
     int anchor = w_layout_neighbor(m, target, origin, dir, move);
     if (move)
         w_transfer(slot, target, anchor, dir);

@@ -4,7 +4,13 @@
 ////////////////
 //~ Layout
 
-void w_layout_compute_margins(w_desktop_model *m, int output, w_rect usable, w_rect screen, int gap, int outer);
+typedef struct w_tab_layout {
+    w_rect bounds;
+    int slots[window_limit], count, selected;
+} w_tab_layout;
+
+void w_layout_compute_margins(w_desktop_model *m, int output, w_rect usable, w_rect screen, int gap, int outer,
+                              int tab_height, w_tab_layout *tabs);
 void w_layout_compute(w_desktop_model *m, int output, w_rect usable, w_rect screen, int gap);
 int w_layout_neighbor(const w_desktop_model *m, int output, w_rect origin, enum direction dir, bool tiles_only);
 int w_layout_adjacent_output(const w_rect screens[output_limit], int output, w_rect origin, enum direction dir);

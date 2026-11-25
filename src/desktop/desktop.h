@@ -34,12 +34,17 @@ typedef struct w_output_state {
     w_rect screen, system_work, work;
     int dpi;
     w_bar_window bar;
+    HWND tabs;
+    w_tab_layout tab_layout;
 } w_output_state;
 enum float_update { float_move = 1, float_size = 2 };
 
 typedef struct w_window_state {
     HWND hwnd;
     DWORD pid;
+    wchar_t tab_title[256];
+    unsigned tab_title_revision;
+    bool tab_title_dirty;
     ULONGLONG workspace_hide_tick;
     int displaced_from;
     w_rect issued, issued_native, rejected_bounds, float_before_request, drag_start;
@@ -104,6 +109,8 @@ void w_desktop_schedule(void);
 void w_desktop_scan(bool focus_new);
 void w_desktop_event(HWND hwnd, DWORD event, DWORD event_tick);
 void w_desktop_outputs(void);
+void w_desktop_measure_output(int output);
+HWND w_desktop_tabs_update(int output, const int *slots, int count, int selected, w_rect bounds);
 int w_desktop_output_for_bounds(int current, w_rect r);
 void w_desktop_select(int slot);
 void w_desktop_move_window(int slot, int output, int workspace);

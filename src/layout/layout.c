@@ -72,7 +72,8 @@ static void w_place(w_desktop_model *m, int node, w_rect r, int gap, const int *
     w_place(m, n->second, b, gap, counts);
 }
 
-void w_layout_compute_margins(w_desktop_model *m, int output, w_rect usable, w_rect screen, int gap, int outer) {
+void w_layout_compute_margins(w_desktop_model *m, int output, w_rect usable, w_rect screen, int gap, int outer,
+                              int tab_height, w_tab_layout *tabs) {
     int counts[window_limit * 2 + 1] = {0};
     w_workspace *ws = &m->spaces[output][m->selected[output]];
     int slots[window_limit], length = 0;
@@ -82,6 +83,31 @@ void w_layout_compute_margins(w_desktop_model *m, int output, w_rect usable, w_r
     usable.y += margin;
     usable.w -= 2 * margin;
     usable.h -= 2 * margin;
+    if (tabs) {
+        tabs->count = 0;
+        tabs->selected = -1;
+        tabs->bounds = (w_rect){0};
+    }
+    if (tabs && ws->layout == layout_tabs) {
+        int recent = -1;
+        for (int j = 0; j < length; ++j) {
+            int slot = slots[j];
+            if (!w_model_visible(m, slot)) continue;
+            w_model_window *w = &m->windows[slot];
+            if (recent < 0 || w->focus_order > m->windows[recent].focus_order) recent = slot;
+            if (w->floating) continue;
+            tabs->slots[tabs->count++] = slot;
+            if (tabs->selected < 0 || w->focus_order > m->windows[tabs->selected].focus_order)
+                tabs->selected = slot;
+        }
+        if (tabs->count && !m->windows[tabs->selected].fullscreen && !m->windows[recent].fullscreen &&
+            usable.w > 0 && usable.h > 1) {
+            tabs->bounds = usable;
+            tabs->bounds.h = w_clamp_int(tab_height, 0, usable.h - 1);
+            usable.y += tabs->bounds.h;
+            usable.h -= tabs->bounds.h;
+        }
+    }
     if (ws->layout == layout_tree || ws->layout == layout_alternate)
         w_place(m, ws->root, usable, gap, counts);
     int index = 0, previous_row = -1;
@@ -164,7 +190,7 @@ void w_layout_compute_margins(w_desktop_model *m, int output, w_rect usable, w_r
 }
 
 void w_layout_compute(w_desktop_model *m, int output, w_rect usable, w_rect screen, int gap) {
-    w_layout_compute_margins(m, output, usable, screen, gap, gap);
+    w_layout_compute_margins(m, output, usable, screen, gap, gap, 0, NULL);
 }
 
 ////////////////

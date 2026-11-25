@@ -14,6 +14,7 @@ Tiling window manager for Windows x64. Runs alongside Explorer.
 ## Features
 
 - Per-monitor workspaces, tiling, floating, mouse move and resize.
+- Win+W shows tiled window titles as tabs. Click a tab to switch windows.
 - Hover to focus. Desktop gaps clear focus.
 - Configurable borders, animations, keybindings, and toolbar.
 - Win+D Menu for apps, commands, WinGet installs and updates, and elevated Chocolatey installs.

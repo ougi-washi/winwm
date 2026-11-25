@@ -21,6 +21,7 @@ src/desktop/main.c
 src/desktop/menu.c
 src/desktop/navigation.c
 src/desktop/status.c
+src/desktop/tabs.c
 src/desktop/windows.c
 src/desktop_ctl/main.c
 src/desktop_tools/capture.c

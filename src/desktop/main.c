@@ -586,6 +586,9 @@ done:
             PostMessageW(host_window,recovery_session_closing,GetCurrentProcessId(),result);
     }
     KillTimer(desk.root, animation_timer);
+    for (int o = 0; o < output_limit; ++o)
+        if (desk.outputs[o].tabs)
+            DestroyWindow(desk.outputs[o].tabs);
     for (int i = 0; i < window_limit; i++)
         w_effects_hide(i);
     for (size_t i = 0; i < count_of(desk.hooks); i++)

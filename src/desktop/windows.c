@@ -147,6 +147,10 @@ void w_desktop_outputs(void) {
         w_output_state *output = &desk.outputs[i];
         if (!output->live && output->bar.hwnd)
             ShowWindow(output->bar.hwnd, SW_HIDE);
+        if (!output->live && output->tabs) {
+            DestroyWindow(output->tabs);
+            output->tabs = NULL;
+        }
     }
     for (int i = 0; i < window_limit; i++) {
         w_model_window *w = &desk.model.windows[i];
@@ -382,6 +386,7 @@ static BOOL CALLBACK w_enumerate(HWND w, LPARAM focus_new) {
     int slot = w_discover(w, (bool *)focus_new);
     if (slot >= 0) {
         w_window_state *state = &desk.windows[slot];
+        state->tab_title_dirty = true;
         w_observe_visibility(slot);
         if (state->has_issued && !state->motion.start && state->native_move != move_dragging) {
             w_rect actual = w_os_bounds(w);
@@ -441,6 +446,8 @@ void w_desktop_event(HWND w, DWORD event, DWORD event_tick) {
     }
     w_model_window *mw = &desk.model.windows[i];
     w_window_state *state = &desk.windows[i];
+    if (event == EVENT_OBJECT_NAMECHANGE)
+        state->tab_title_dirty = true;
     if (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_HIDE ||
         event == EVENT_OBJECT_CLOAKED || event == EVENT_OBJECT_UNCLOAKED) {
         owned_visibility_dirty = true;
@@ -585,6 +592,28 @@ static void w_follow_native_activation(HWND foreground, HWND owner, bool activat
     w_model_focus(&desk.model, slot);
 }
 
+static void w_update_tab_title(w_window_state *state) {
+    if (state->tab_title[0] && !state->tab_title_dirty) return;
+    wchar_t title[count_of(state->tab_title)];
+    if (!GetWindowTextW(state->hwnd, title, count_of(title))) {
+        wchar_t path[os_path_cap];
+        DWORD length = count_of(path);
+        HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, state->pid);
+        if (process && QueryFullProcessImageNameW(process, 0, path, &length)) {
+            const wchar_t *file = wcsrchr(path, L'\\');
+            lstrcpynW(title, file ? file + 1 : path, count_of(title));
+        } else if (!GetClassNameW(state->hwnd, title, count_of(title))) {
+            wcscpy(title, L"Untitled window");
+        }
+        if (process) CloseHandle(process);
+    }
+    if (wcscmp(state->tab_title, title)) {
+        wcscpy(state->tab_title, title);
+        ++state->tab_title_revision;
+    }
+    state->tab_title_dirty = false;
+}
+
 void w_desktop_apply(void) {
     static int previous_workspace[output_limit];
     static HWND previous_foreground;
@@ -600,24 +629,17 @@ void w_desktop_apply(void) {
             int direction = ws < previous_workspace[o] ? -1 : 1;
             previous_workspace[o] = ws;
             int recent = w_model_recent(&desk.model, o, ws);
-            int tab = recent;
-            if (desk.model.spaces[o][ws].layout == layout_tabs && recent >= 0 && desk.model.windows[recent].floating) {
-                tab = -1;
-                for (int i = 0; i < window_limit; i++) {
-                    const w_model_window *w = &desk.model.windows[i];
-                    if (w->output == o && !w->floating && w_model_visible(&desk.model, i) &&
-                        (tab < 0 || w->focus_order > desk.model.windows[tab].focus_order))
-                        tab = i;
-                }
-            }
             bool hide = desk.hide_bars || (recent >= 0 && desk.model.windows[recent].fullscreen);
             if (hide != output->bar_hidden) {
                 output->work = w_bar_position(&output->bar, output->screen, output->system_work, output->dpi, hide);
                 output->bar_hidden = hide;
             }
-            w_layout_compute_margins(&desk.model, o, output->work, output->screen,
-                                   MulDiv(desk.config.gap, output->dpi, 96),
-                                   MulDiv(desk.config.outer_gap, output->dpi, 96));
+            w_desktop_measure_output(o);
+            const w_tab_layout *tabs = &output->tab_layout;
+            if (tabs->bounds.h > 0)
+                for (int j = 0; j < tabs->count; ++j)
+                    w_update_tab_title(&desk.windows[tabs->slots[j]]);
+            output->tabs = w_desktop_tabs_update(o, tabs->slots, tabs->count, tabs->selected, tabs->bounds);
             w_bar_view view = {.selected = ws, .resize_mode = desk.resize, .inhibit = desk.inhibit};
             if (recent >= 0)
                 GetWindowTextW(desk.windows[recent].hwnd, view.title, count_of(view.title));
@@ -636,7 +658,7 @@ void w_desktop_apply(void) {
                 }
                 view.occupied |= 1 << w->workspace;
                 bool visible = w_model_visible(&desk.model, i);
-                if (visible && desk.model.spaces[o][ws].layout == layout_tabs && !w->floating && i != tab)
+                if (visible && desk.model.spaces[o][ws].layout == layout_tabs && !w->floating && i != tabs->selected)
                     visible = false;
                 bool entering = !s->wants_visible;
                 if (s->wants_visible && !visible)
