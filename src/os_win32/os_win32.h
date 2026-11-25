@@ -24,6 +24,7 @@ bool w_os_data_path(wchar_t *out, int cap, const wchar_t *name, bool create);
 bool w_os_legacy_config_path(wchar_t *out, int cap);
 bool w_os_config_path(wchar_t *out, int cap);
 bool w_os_self(wchar_t *out, int cap);
+DWORD w_os_exit_shell(void);
 DWORD w_os_ensure_shell(void);
 bool w_os_provider(const char *name, wchar_t *out, int cap);
 bool w_os_task_manager(const char *name, wchar_t *out, int cap);

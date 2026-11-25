@@ -13,6 +13,7 @@ src/theme/icon_button.c
 -luser32
 -lshlwapi
 -lshell32
+-lrstrtmgr
 -ladvapi32
 -lcrypt32
 -ldwmapi

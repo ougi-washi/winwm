@@ -11,7 +11,7 @@
 //~ Desktop
 
 w_desktop_state desk;
-static bool event_overflow, preview_mode, loaded_programs;
+static bool event_overflow, logging_off, loaded_programs;
 static int pending_events;
 static UINT shell_notification, taskbar_created;
 enum { discovery_timer = 29 };
@@ -75,7 +75,7 @@ void w_desktop_schedule(void) {
 void w_desktop_bind(void) {
     w_effects_preferences();
     w_theme_colors(desk.config.background, desk.config.foreground, desk.config.accent);
-    w_input_bind(desk.root, msg_command, msg_hover, preview_mode ? 0 : msg_desktop_menu,
+    w_input_bind(desk.root, msg_command, msg_hover, desk.preview ? 0 : msg_desktop_menu,
                &desk.config, desk.registered, w_desktop_drag);
 }
 
@@ -150,7 +150,7 @@ static void w_discover_initial(void) {
 }
 
 static void w_position_desktop(void) {
-    if (preview_mode || GetShellWindow())
+    if (desk.preview)
         ShowWindow(desk.root, SW_HIDE);
     else
         SetWindowPos(desk.root, HWND_BOTTOM, GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
@@ -161,7 +161,6 @@ static void w_position_desktop(void) {
 static void w_initialize(void) {
     w_position_desktop();
     shell_notification = RegisterWindowMessageW(L"SHELLHOOK");
-    taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
     if (shell_notification)
         RegisterShellHookWindow(desk.root);
     w_desktop_outputs();
@@ -252,6 +251,7 @@ void w_desktop_request(const char *s, char *reply, size_t cap) {
 
 static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (taskbar_created && msg == taskbar_created) {
+        PostMessageW(hwnd, msg_shell_started, 0, 0);
         w_position_desktop();
         if (desk.ready) w_desktop_outputs();
         return 0;
@@ -270,7 +270,7 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_WINDOWPOSCHANGING: {
         WINDOWPOS *pos = (WINDOWPOS *)lp;
-        if (!preview_mode && !(pos->flags & SWP_NOZORDER))
+        if (!desk.preview && !(pos->flags & SWP_NOZORDER))
             pos->hwndInsertAfter = HWND_BOTTOM;
         return DefWindowProcW(hwnd, msg, wp, lp);
     }
@@ -498,8 +498,10 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     case WM_QUERYENDSESSION:
         return TRUE;
     case WM_ENDSESSION:
-        if (wp)
+        if (wp) {
+            logging_off = true;
             PostQuitMessage(0);
+        }
         return 0;
     case WM_CLOSE:
         PostQuitMessage(0);
@@ -510,7 +512,7 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
 }
 
 int w_session_run(HINSTANCE instance, bool preview) {
-    preview_mode = preview;
+    desk.preview = preview;
     DWORD host = w_os_instance_status(os_host_instance);
     if (host != ERROR_SUCCESS)
         return (int)host;
@@ -519,12 +521,13 @@ int w_session_run(HINSTANCE instance, bool preview) {
     if (error)
         return (int)error;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-    HANDLE recovery = w_recovery_attach(preview);
+    HWND host_window = NULL;
+    HANDLE recovery = w_recovery_attach(preview, &host_window);
     if (!recovery) {
         error = GetLastError();
         if (!preview && !GetShellWindow()) w_os_ensure_shell();
         w_os_instance_release(&lock);
-        MessageBoxW(NULL,L"Could not start winwm. Check that Windows Explorer can start and that winwm_recovery.exe is beside winwm.exe.",
+        MessageBoxW(NULL,L"Could not start winwm. Place the matching winwm_recovery.exe beside winwm.exe.",
                     L"winwm recovery unavailable",MB_OK|MB_ICONERROR);
         return error ? (int)error : ERROR_PROCESS_ABORTED;
     }
@@ -536,12 +539,24 @@ int w_session_run(HINSTANCE instance, bool preview) {
         .hInstance = instance, .lpszClassName = L"WinwmEvents", .lpfnWndProc = w_desktop_proc,
         .hCursor = LoadCursorW(NULL, IDC_ARROW)};
     RegisterClassW(&wc);
+    taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
     desk.root = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"winwm events", WS_POPUP, 0, 0, 0, 0,
                                 NULL, NULL, instance, NULL);
     if (!desk.root) {
         CloseHandle(recovery);
         w_os_instance_release(&lock);
         return 3;
+    }
+    bool waiting_for_shell = false;
+    if (!preview) {
+        error = w_recovery_take_desktop(recovery, host_window);
+        waiting_for_shell = error == ERROR_NOT_FOUND;
+        if (error && !waiting_for_shell) {
+            DestroyWindow(desk.root);
+            CloseHandle(recovery);
+            w_os_instance_release(&lock);
+            return (int)error;
+        }
     }
     w_desktop_bind();
     w_os_mark(L"bindings_registered");
@@ -569,6 +584,18 @@ int w_session_run(HINSTANCE instance, bool preview) {
         }
         MSG message;
         for (int i = 0; i < 64 && PeekMessageW(&message, NULL, 0, 0, PM_REMOVE); i++) {
+            if (message.hwnd == desk.root && message.message == msg_shell_started) {
+                // At sign-in Explorer may create its first taskbar after winwm starts.
+                if (waiting_for_shell && !logging_off) {
+                    error = w_recovery_take_desktop(recovery, host_window);
+                    waiting_for_shell = error == ERROR_NOT_FOUND;
+                    if (error && !waiting_for_shell) {
+                        result = (int)error;
+                        goto done;
+                    }
+                }
+                continue;
+            }
             if (message.message == WM_QUIT) {
                 result = (int)message.wParam;
                 goto done;
@@ -580,11 +607,8 @@ int w_session_run(HINSTANCE instance, bool preview) {
         }
     }
 done:
-    {
-        HWND host_window = FindWindowW(L"WinwmHost",NULL);
-        if ((DWORD)(uintptr_t)GetPropW(host_window,L"winwm.session_pid") == GetCurrentProcessId())
-            PostMessageW(host_window,recovery_session_closing,GetCurrentProcessId(),result);
-    }
+    if ((DWORD)(uintptr_t)GetPropW(host_window,L"winwm.session_pid") == GetCurrentProcessId())
+        PostMessageW(host_window,recovery_session_closing,GetCurrentProcessId(),result);
     KillTimer(desk.root, animation_timer);
     for (int o = 0; o < output_limit; ++o)
         if (desk.outputs[o].tabs)
@@ -602,6 +626,8 @@ done:
     if (desk.ipc_live)
         w_ipc_close(desk.channels);
     w_os_restore_all();
+    if (!preview && !logging_off && WaitForSingleObject(recovery, 0) == WAIT_OBJECT_0)
+        w_os_ensure_shell();
     CloseHandle(recovery);
     w_os_instance_release(&lock);
     return result;

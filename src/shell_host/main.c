@@ -16,6 +16,7 @@ static wchar_t session_exe[os_path_cap], restart_exe[os_path_cap];
 //~ Shell Host Functions
 
 static bool ending, rescue_requested, quit_requested, preview, logging_off;
+static bool owns_desktop, waiting_for_shell;
 enum { first_recovery_id = 101, exit_windows_id = 109, recovery_row = 36 };
 
 static const wchar_t *const labels[] = {
@@ -45,8 +46,7 @@ static bool w_start_managed_previous(void) {
         return false;
     const wchar_t *file_name = wcsrchr(exe, L'\\');
     if (!file_name || _wcsicmp(file_name + 1, L"winwm.exe")) return false;
-    // Earlier releases take down Explorer. Only restart a manager that can
-    // validate its own recovery companion and configuration.
+    // Validate the release's recovery companion and configuration before switching.
     wchar_t command[os_path_cap+32];
     swprintf(command,count_of(command),L"\"%ls\" ctl validate-startup",exe);
     STARTUPINFOW si = {.cb=sizeof(si)};
@@ -141,6 +141,17 @@ static LRESULT CALLBACK w_host_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     if (w_theme_message(w, msg, wp, lp, &color_result))
         return color_result;
     switch (msg) {
+    case recovery_take_desktop: {
+        if (preview || !session || quit_requested || rescue_requested || logging_off ||
+            (owns_desktop && !waiting_for_shell) || (DWORD)wp != GetProcessId(session) ||
+            WaitForSingleObject(session, 0) != WAIT_TIMEOUT)
+            return ERROR_CANCELLED + 1;
+        owns_desktop = true;
+        waiting_for_shell = false;
+        DWORD error = w_os_exit_shell();
+        waiting_for_shell = error == ERROR_NOT_FOUND;
+        return (LRESULT)error + 1;
+    }
     case recovery_session_closing:
         if (session && (DWORD)wp == GetProcessId(session)) {
             if (lp == 42) rescue_requested = true;
@@ -239,6 +250,10 @@ static int w_host_run(HINSTANCE inst, DWORD pid, uint64_t birth) {
             session = NULL;
             KillTimer(panel, 1);
             w_os_restore_all();
+            if (owns_desktop && !logging_off) {
+                error = w_os_ensure_shell();
+                owns_desktop = false;
+            }
             if (!quit_requested && (rescue_requested || code == 42))
                 w_rescue();
             else
@@ -257,7 +272,7 @@ static int w_host_run(HINSTANCE inst, DWORD pid, uint64_t birth) {
             }
         }
     }
-    if (!preview && !logging_off && !GetShellWindow()) w_os_ensure_shell();
+    if (owns_desktop && !logging_off) error = w_os_ensure_shell();
 done:
     if (session) CloseHandle(session);
     if (panel) DestroyWindow(panel);
@@ -281,24 +296,19 @@ int WINAPI wWinMain(HINSTANCE inst,HINSTANCE previous,PWSTR args,int show) {
         result = ERROR_SUCCESS;
     else if (argc == 2) {
         const wchar_t *arg = argv[1];
-        bool launch = !wcsncmp(arg,L"/start:",7);
+        bool launch = !wcsncmp(arg,L"/start2:",8);
         unsigned mode;
         unsigned long pid;
         unsigned long long birth;
         wchar_t extra;
-        if ((launch || !wcsncmp(arg,L"/watch:",7)) &&
-            swscanf(arg+7,L"%u:%lu:%llu%lc",&mode,&pid,&birth,&extra) == 3 && mode <= 1 && pid && birth) {
+        if ((launch || !wcsncmp(arg,L"/watch2:",8)) &&
+            swscanf(arg+8,L"%u:%lu:%llu%lc",&mode,&pid,&birth,&extra) == 3 && mode <= 1 && pid && birth) {
             if (launch) {
                 wchar_t self[os_path_cap], watch[96];
-                swprintf(watch,count_of(watch),L"/watch:%u:%lu:%llu",mode,pid,birth);
-                // An Explorer shell recovered here must also survive ending
-                // the manager's process tree.
-                result = mode ? 0 : (int)w_os_ensure_shell();
-                if (!result) {
-                    HANDLE monitor = w_os_self(self,count_of(self)) ? w_os_launch(self,watch) : NULL;
-                    result = monitor ? 0 : (int)GetLastError();
-                    if (monitor) CloseHandle(monitor);
-                }
+                swprintf(watch,count_of(watch),L"/watch2:%u:%lu:%llu",mode,pid,birth);
+                HANDLE monitor = w_os_self(self,count_of(self)) ? w_os_launch(self,watch) : NULL;
+                result = monitor ? 0 : (int)GetLastError();
+                if (monitor) CloseHandle(monitor);
             } else {
                 preview = mode != 0;
                 SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);

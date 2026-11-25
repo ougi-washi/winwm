@@ -75,6 +75,7 @@ src/win_platform/win_platform.c
 -loleaut32
 -limm32
 -lshell32
+-lrstrtmgr
 -lshlwapi
 -luuid
 -lpowrprof

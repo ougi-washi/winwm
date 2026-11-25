@@ -24,14 +24,14 @@ enum {
     msg_hover,
     msg_desktop_menu,
     msg_catalog,
-    msg_pointer_select, msg_drag_preview, msg_drag_limits, msg_run_result
+    msg_pointer_select, msg_drag_preview, msg_drag_limits, msg_run_result, msg_shell_started
 };
 
 typedef struct w_output_state {
     HMONITOR monitor;
     wchar_t device[32];
     bool live, bar_hidden;
-    w_rect screen, system_work, work;
+    w_rect screen, available, work;
     int dpi;
     w_bar_window bar;
     HWND tabs;
@@ -88,7 +88,7 @@ typedef struct w_desktop_state {
     w_output_state outputs[output_limit];
     w_window_state windows[window_limit];
     w_ipc_channel channels[ipc_slots];
-    bool ipc_live, resize, inhibit, hide_bars, refresh_pending, ready, first_input, loading;
+    bool preview, ipc_live, resize, inhibit, hide_bars, refresh_pending, ready, first_input, loading;
     bool registered[binding_limit];
     uint64_t revision;
     HWINEVENTHOOK hooks[7];

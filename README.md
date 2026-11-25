@@ -1,6 +1,6 @@
 # winwm
 
-Tiling window manager for Windows x64. Runs alongside Explorer.
+Tiling window manager for Windows x64. Normal startup exits Explorer. Exiting winwm restores Explorer.
 
 | Task | PowerShell |
 | --- | --- |
@@ -18,7 +18,7 @@ Tiling window manager for Windows x64. Runs alongside Explorer.
 - Hover to focus. Desktop gaps clear focus.
 - Configurable borders, animations, keybindings, and toolbar.
 - Win+D Menu for apps, commands, WinGet installs and updates, and elevated Chocolatey installs.
-- Menu → Settings opens Windows Security, Windows Settings, and Control Panel. `> ms-settings:display` opens Display. Win+I stays blocked while winwm runs.
+- Menu → Settings includes Windows Security, Windows Settings, and Control Panel. Use `--preview` for panels that require Explorer.
 - Ctrl+Enter in Menu runs the selected app, tool, or command as administrator.
 - Win+Shift+Q closes the active panel or app.
 - Audio, network, displays, power, languages, keyboards, and IMEs.

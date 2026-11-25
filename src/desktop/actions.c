@@ -94,6 +94,9 @@ static DWORD WINAPI w_launch_thread(void *ptr) {
         if (why) {
             if (j->kind == launch_window_capture)
                 w_str_copy(why,512,launched ? "Window capture copied to clipboard." : "Could not capture the selected window.");
+            else if (j->kind == launch_command && !GetShellWindow() &&
+                     (!_strnicmp(j->exe, "ms-settings:", 12) || !_strnicmp(j->exe, "windowsdefender:", 16)))
+                w_str_copy(why, 512, "Windows could not open this panel. Exit winwm and run winwm.exe --preview to use it with Explorer.");
             else snprintf(why, 512, "Could not open %.380s.", j->exe);
             if (!PostMessageW(desk.root, msg_status, 0, (LPARAM)why))
                 free(why);

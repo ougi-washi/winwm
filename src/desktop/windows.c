@@ -61,7 +61,7 @@ static bool w_module_detail(const char *name, wchar_t *text, int cap) {
 
 static void w_dock_bar(int output) {
     w_output_state *o = &desk.outputs[output];
-    o->work = w_bar_position(&o->bar, o->screen, o->system_work, o->dpi, o->bar_hidden);
+    o->work = w_bar_position(&o->bar, o->screen, o->available, o->dpi, o->bar_hidden);
     InvalidateRect(o->bar.hwnd, NULL, FALSE);
     w_desktop_schedule();
 }
@@ -91,8 +91,8 @@ static BOOL CALLBACK w_visit_monitor(HMONITOR mon, HDC dc, LPRECT bounds, LPARAM
     wcscpy(o->device, mi.szDevice);
     RECT r = mi.rcMonitor;
     o->screen = (w_rect){r.left, r.top, r.right - r.left, r.bottom - r.top};
-    r = mi.rcWork;
-    o->system_work = (w_rect){r.left, r.top, r.right - r.left, r.bottom - r.top};
+    r = desk.preview ? mi.rcWork : mi.rcMonitor;
+    o->available = (w_rect){r.left, r.top, r.right - r.left, r.bottom - r.top};
     UINT x = 96, y = 96;
     GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &x, &y);
     o->dpi = (int)x;
@@ -104,7 +104,7 @@ static BOOL CALLBACK w_visit_monitor(HMONITOR mon, HDC dc, LPRECT bounds, LPARAM
     o->bar.detail = w_module_detail;
     o->bar.dock = w_dock_bar;
     o->bar_hidden = desk.hide_bars;
-    o->work = w_bar_position(&o->bar, o->screen, o->system_work, o->dpi, desk.hide_bars);
+    o->work = w_bar_position(&o->bar, o->screen, o->available, o->dpi, desk.hide_bars);
     return TRUE;
 }
 
@@ -631,7 +631,7 @@ void w_desktop_apply(void) {
             int recent = w_model_recent(&desk.model, o, ws);
             bool hide = desk.hide_bars || (recent >= 0 && desk.model.windows[recent].fullscreen);
             if (hide != output->bar_hidden) {
-                output->work = w_bar_position(&output->bar, output->screen, output->system_work, output->dpi, hide);
+                output->work = w_bar_position(&output->bar, output->screen, output->available, output->dpi, hide);
                 output->bar_hidden = hide;
             }
             w_desktop_measure_output(o);
