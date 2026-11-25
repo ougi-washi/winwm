@@ -14,6 +14,10 @@ typedef enum bar_icon {
     icon_battery,
     icon_memory,
     icon_play,
+    icon_quiet,
+    icon_plug,
+    icon_ethernet,
+    icon_offline,
     icon_count
 } bar_icon;
 

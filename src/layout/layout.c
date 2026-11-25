@@ -85,11 +85,15 @@ void w_layout_compute_margins(w_desktop_model *m, int output, w_rect usable, w_r
     if (ws->layout == layout_tree || ws->layout == layout_alternate)
         w_place(m, ws->root, usable, gap, counts);
     int index = 0, previous_row = -1;
+    int rows = total > 1 ? total-1 : 0;
+    int row_gap = rows > 1 && usable.h > rows ? w_clamp_int(gap,0,(usable.h-rows)/(rows-1)) : 0;
+    int row_pixels = usable.h - (rows > 1 ? (rows-1)*row_gap : 0);
+    int row_top = 0;
     int64_t weights = 0, used_weight = 0;
     if (ws->layout == layout_master) {
         ws->master_slot = -1;
         ws->master_area = usable;
-        ws->master_gap = gap;
+        ws->master_gap = w_clamp_int(gap,0,usable.w > 2 ? usable.w-2 : 0);
         for (int j = 0; j < length; ++j) {
             int slot = slots[j];
             if (!w_tiled(m, slot))
@@ -124,20 +128,29 @@ void w_layout_compute_margins(w_desktop_model *m, int output, w_rect usable, w_r
         } else if (ws->layout == layout_master) {
             w_rect r = usable;
             if (total > 1) {
-                int available = w_clamp_int(usable.w - gap, 1, usable.w);
+                int available = usable.w-ws->master_gap;
                 int cut =
                     w_clamp_int((int)((int64_t)available * (ws->master_ratio ? ws->master_ratio : 500) / 1000),
                               1, available > 1 ? available - 1 : 1);
                 if (!index)
                     r.w = cut;
                 else {
-                    int pixels = w_clamp_int(usable.h - (total - 2) * gap, 1, usable.h);
-                    int top = (int)(pixels * used_weight / weights);
+                    int row = index-1;
                     used_weight += w->stack_weight;
-                    r.x += cut + gap;
+                    r.x += available > 1 ? cut + ws->master_gap : 0;
                     r.w = w_clamp_int(available - cut, 1, available);
-                    r.y += top + (index - 1) * gap;
-                    r.h = w_clamp_int((int)(pixels * used_weight / weights) - top, 1, usable.h);
+                    if (rows <= row_pixels) {
+                        // Reserve at least one pixel for each remaining row, including at extreme weights.
+                        int bottom = w_clamp_int((int)(row_pixels * used_weight / weights),
+                                                 row_top+1,row_pixels-(rows-row-1));
+                        r.y += row_top + row*row_gap;
+                        r.h = bottom-row_top;
+                        row_top = bottom;
+                    } else {
+                        // More windows than scan lines: share pixels while keeping every tile on this output.
+                        r.y += (int)((int64_t)row*usable.h/rows);
+                        r.h = 1;
+                    }
                     if (previous_row >= 0)
                         m->windows[previous_row].next_row = i;
                     previous_row = i;

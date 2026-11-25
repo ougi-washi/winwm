@@ -12,6 +12,7 @@ typedef struct w_status_sample {
     unsigned mask;
     ULONGLONG idle, total, bytes, time;
     wchar_t network[96];
+    bar_icon network_icon;
 } w_status_sample;
 enum { status_network = 1, status_cpu = 2, status_rate = 4 };
 
@@ -50,6 +51,7 @@ static DWORD WINAPI w_sample_thread(void *ptr) {
     s->time = GetTickCount64();
     if (s->mask & (status_network | status_rate)) {
         wcscpy(s->network, L"Offline");
+        s->network_icon = icon_offline;
         MIB_IF_TABLE2 *table = NULL;
         if (GetIfTable2(&table) == NO_ERROR) {
             for (ULONG i = 0; i < table->NumEntries; i++) {
@@ -57,8 +59,9 @@ static DWORD WINAPI w_sample_thread(void *ptr) {
                 if (r->OperStatus != IfOperStatusUp || r->Type == IF_TYPE_SOFTWARE_LOOPBACK ||
                     !r->InterfaceAndOperStatusFlags.HardwareInterface)
                     continue;
-                if (!wcscmp(s->network, L"Offline")) {
+                if (s->network_icon == icon_offline) {
                     wcsncpy(s->network, r->Alias, count_of(s->network) - 1);
+                    s->network_icon = r->Type == IF_TYPE_IEEE80211 ? icon_network : icon_ethernet;
                 }
                 s->bytes += r->InOctets + r->OutOctets;
             }
@@ -108,8 +111,16 @@ void w_desktop_status_done(void *ptr) {
     if (!s)
         return;
     if (s->mask == enabled_mask) {
-        if (s->mask & status_network)
+        if (s->mask & status_network) {
+            for (int i = 0; i < output_limit; i++) {
+                w_bar_window *bar = &desk.outputs[i].bar;
+                if (desk.outputs[i].live && bar->network_icon != s->network_icon) {
+                    bar->network_icon = s->network_icon;
+                    w_bar_invalidate(bar, "network");
+                }
+            }
             w_changed(s->network, network, count_of(network));
+        }
         if ((s->mask & status_cpu) && previous.total && s->total > previous.total) {
             wchar_t t[48];
             double busy = 1.0 - (double)(s->idle - previous.idle) / (double)(s->total - previous.total);

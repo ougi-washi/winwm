@@ -5,7 +5,6 @@
 ////////////////
 //~ Ipc
 
-static int subscribers;
 enum { connecting, reading, writing, subscribed };
 
 ////////////////
@@ -18,17 +17,45 @@ bool w_ipc_name(wchar_t *out, int cap) {
     return swprintf(out, cap, L"\\\\.\\pipe\\winwm.v1.%lu", sid) > 0;
 }
 
-static void w_listen_again(w_ipc_channel *c) {
-    DisconnectNamedPipe(c->pipe);
+static void w_drain_io(HANDLE pipe, OVERLAPPED *op, bool *pending) {
+    if (*pending) {
+        DWORD transferred;
+        CancelIoEx(pipe, op);
+        GetOverlappedResult(pipe, op, &transferred, TRUE);
+        *pending = false;
+    }
+}
+
+static void w_listen(w_ipc_channel *c) {
     ResetEvent(c->event);
     c->op = (OVERLAPPED){.hEvent = c->event};
     c->phase = connecting;
-    if (c->stream)
-        subscribers--;
+    c->op_pending = !ConnectNamedPipe(c->pipe, &c->op) && GetLastError() == ERROR_IO_PENDING;
+    if (!c->op_pending)
+        SetEvent(c->event);
+}
+
+void w_ipc_disconnect(w_ipc_channel *c) {
+    w_drain_io(c->pipe, &c->op, &c->op_pending);
+    w_drain_io(c->pipe, &c->peer, &c->peer_pending);
+    DisconnectNamedPipe(c->pipe);
+    ResetEvent(c->peer_event);
     c->stream = false;
     c->head = c->count = 0;
-    if (ConnectNamedPipe(c->pipe, &c->op) || GetLastError() == ERROR_PIPE_CONNECTED)
+    w_listen(c);
+}
+
+static void w_read_request(w_ipc_channel *c) {
+    DWORD n;
+    ResetEvent(c->event);
+    c->op = (OVERLAPPED){.hEvent = c->event};
+    c->phase = reading;
+    if (ReadFile(c->pipe, c->data, sizeof(c->data), &n, &c->op))
         SetEvent(c->event);
+    else if (GetLastError() == ERROR_IO_PENDING)
+        c->op_pending = true;
+    else
+        w_ipc_disconnect(c);
 }
 
 static void w_send_reply(w_ipc_channel *c) {
@@ -38,14 +65,13 @@ static void w_send_reply(w_ipc_channel *c) {
     DWORD sent;
     if (WriteFile(c->pipe, c->data, (DWORD)strlen(c->data) + 1, &sent, &c->op))
         SetEvent(c->event);
-    else if (GetLastError() != ERROR_IO_PENDING)
-        w_listen_again(c);
+    else if (GetLastError() == ERROR_IO_PENDING)
+        c->op_pending = true;
+    else
+        w_ipc_disconnect(c);
 }
 
-bool w_ipc_start(w_ipc_channel *channels) {
-    wchar_t name[96];
-    if (!w_ipc_name(name, count_of(name)))
-        return false;
+bool w_ipc_start(w_ipc_channel *channels, const wchar_t *name) {
     HANDLE token;
     if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
         return false;
@@ -69,15 +95,16 @@ bool w_ipc_start(w_ipc_channel *channels) {
     for (int i = 0; i < ipc_slots; i++) {
         w_ipc_channel *c = &channels[i];
         c->event = CreateEventW(NULL, TRUE, FALSE, NULL);
+        c->peer_event = CreateEventW(NULL, TRUE, FALSE, NULL);
         c->pipe = CreateNamedPipeW(
             name, PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | (i ? 0 : FILE_FLAG_FIRST_PIPE_INSTANCE),
             PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS, ipc_slots,
             ipc_capacity, ipc_capacity, 0, &sa);
-        if (!c->event || c->pipe == INVALID_HANDLE_VALUE) {
+        if (!c->event || !c->peer_event || c->pipe == INVALID_HANDLE_VALUE) {
             ok = false;
             break;
         }
-        w_listen_again(c);
+        w_listen(c);
     }
     LocalFree(sd);
     if (!ok)
@@ -85,39 +112,44 @@ bool w_ipc_start(w_ipc_channel *channels) {
     return ok;
 }
 
-void w_ipc_pump(w_ipc_channel *c, ipc_handler handler) {
+void w_ipc_pump(w_ipc_channel *channels, int slot, ipc_handler handler) {
+    w_ipc_channel *c = &channels[slot];
     DWORD n = 0;
     if (c->phase == subscribed)
         return;
+    c->op_pending = false;
     if (c->phase == connecting) {
-        ResetEvent(c->event);
-        c->op = (OVERLAPPED){.hEvent = c->event};
-        c->phase = reading;
-        if (ReadFile(c->pipe, c->data, sizeof(c->data), &n, &c->op))
-            SetEvent(c->event);
-        else if (GetLastError() != ERROR_IO_PENDING)
-            w_listen_again(c);
+        w_read_request(c);
         return;
     }
     if (!GetOverlappedResult(c->pipe, &c->op, &n, FALSE)) {
-        w_listen_again(c);
+        w_ipc_disconnect(c);
         return;
     }
     if (c->phase == reading) {
         if (n < 2 || c->data[n - 1] || memchr(c->data, 0, n - 1)) {
-            w_listen_again(c);
+            w_ipc_disconnect(c);
             return;
         }
         if (!strcmp(c->data, "subscribe")) {
+            int subscribers = 0;
+            for (int i = 0; i < ipc_slots; i++)
+                subscribers += channels[i].stream;
             if (subscribers >= ipc_slots - 2) {
                 strcpy(c->data, "error: subscriber limit");
                 w_send_reply(c);
                 return;
             }
-            subscribers++;
             c->stream = true;
             c->phase = subscribed;
             ResetEvent(c->event);
+            // Subscribers only receive events. A read completes when the peer
+            // leaves (or sends unexpected input), even on an idle desktop.
+            c->peer = (OVERLAPPED){.hEvent = c->peer_event};
+            if (ReadFile(c->pipe, &c->peer_byte, 1, &n, &c->peer) || GetLastError() != ERROR_IO_PENDING)
+                SetEvent(c->peer_event);
+            else
+                c->peer_pending = true;
             return;
         }
         char reply[ipc_capacity] = {0};
@@ -136,13 +168,7 @@ void w_ipc_pump(w_ipc_channel *c, ipc_handler handler) {
         }
     } else {
         // Wait for client acknowledgement (or disconnect) before discarding pipe buffers.
-        c->phase = reading;
-        ResetEvent(c->event);
-        c->op = (OVERLAPPED){.hEvent = c->event};
-        if (ReadFile(c->pipe, c->data, sizeof(c->data), &n, &c->op))
-            SetEvent(c->event);
-        else if (GetLastError() != ERROR_IO_PENDING)
-            w_listen_again(c);
+        w_read_request(c);
     }
 }
 
@@ -169,11 +195,14 @@ void w_ipc_close(w_ipc_channel *channels) {
     for (int i = 0; i < ipc_slots; i++) {
         w_ipc_channel *c = channels + i;
         if (c->pipe && c->pipe != INVALID_HANDLE_VALUE) {
-            CancelIoEx(c->pipe, NULL);
+            w_drain_io(c->pipe, &c->op, &c->op_pending);
+            w_drain_io(c->pipe, &c->peer, &c->peer_pending);
             CloseHandle(c->pipe);
         }
         if (c->event)
             CloseHandle(c->event);
-        c->pipe = c->event = NULL;
+        if (c->peer_event)
+            CloseHandle(c->peer_event);
+        *c = (w_ipc_channel){0};
     }
 }

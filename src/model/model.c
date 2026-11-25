@@ -128,9 +128,19 @@ void w_model_move(w_desktop_model *m, int slot, int output, int ws) {
         w_model_move_beside(m, slot, output, ws, m->focus, m->spaces[output][ws].next_axis, false);
 }
 
+void w_model_insert_tile(w_desktop_model *m, int slot, int anchor, enum split_axis axis, bool before) {
+    if (slot == anchor || (unsigned)slot >= window_limit || (unsigned)anchor >= window_limit ||
+        !m->windows[slot].live || !m->windows[anchor].live)
+        return;
+    w_detach(m, slot);
+    m->windows[slot].output = m->windows[anchor].output;
+    m->windows[slot].workspace = m->windows[anchor].workspace;
+    w_attach(m, slot, anchor, axis, before);
+}
+
 bool w_model_visible(const w_desktop_model *m, int slot) {
     const w_model_window *w = &m->windows[slot];
-    return w->live && !w->withdrawn && !w->minimized && w->workspace == m->selected[w->output] &&
+    return w->live && !w->withdrawn && !w->minimized && !w->cloaked && w->workspace == m->selected[w->output] &&
            (!w->scratch || w->scratch_visible);
 }
 
@@ -236,11 +246,16 @@ void w_model_resize_pixels(w_desktop_model *m, enum split_axis axis, int delta) 
 }
 
 void w_model_swap(w_desktop_model *m, int a, int b) {
-    if (a < 0 || b < 0 || a == b)
+    if ((unsigned)a >= window_limit || (unsigned)b >= window_limit || a == b)
         return;
     w_model_window *x = &m->windows[a], *y = &m->windows[b];
-    if (x->workspace != y->workspace || x->output != y->output)
+    if (!x->live || !y->live)
         return;
+    int output = x->output, workspace = x->workspace;
+    x->output = y->output;
+    x->workspace = y->workspace;
+    y->output = output;
+    y->workspace = workspace;
     int leaf = x->leaf;
     x->leaf = y->leaf;
     y->leaf = leaf;

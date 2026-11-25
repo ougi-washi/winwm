@@ -6,7 +6,7 @@
 
 /* All endpoint interfaces belong to the worker's COM apartment. RPC callbacks
    only enqueue work, so a device change cannot race a volume adjustment. */
-enum audio_event { endpoint_changed = 1, volume_changed, adjust_level, stop_worker };
+enum audio_event { endpoint_changed = 1, volume_changed, adjust_level, set_level, stop_worker };
 
 ////////////////
 //~ Audio
@@ -172,10 +172,12 @@ static DWORD WINAPI w_audio_worker(void *arg) {
         if (event == endpoint_changed) {
             w_disconnect(volume);
             volume = w_default_output(enumerator);
-        } else if (event == adjust_level) {
+        } else if (event == adjust_level || event == set_level) {
             if (!volume)
                 volume = w_default_output(enumerator);
-            HRESULT hr = w_adjust(volume, (int)(LONG)delta);
+            HRESULT hr = event == adjust_level ? w_adjust(volume, (int)(LONG)delta)
+                         : volume ? IAudioEndpointVolume_SetMasterVolumeLevelScalar(volume, delta / 100.f, NULL)
+                                  : HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
             if (FAILED(hr))
                 PostMessageW(owner, changed, (WPARAM)(DWORD)hr, 0);
         } else
@@ -216,6 +218,10 @@ bool w_audio_start(HWND w, UINT message) {
 
 bool w_audio_adjust(int delta) {
     return w_enqueue(adjust_level, delta);
+}
+
+bool w_audio_set_percent(int percent) {
+    return (unsigned)percent <= 100 && w_enqueue(set_level, percent);
 }
 
 w_audio_state w_audio_read(void) {

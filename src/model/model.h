@@ -14,7 +14,7 @@ typedef struct w_window_id {
 
 typedef struct w_model_window {
     uint32_t generation;
-    bool live, floating, fullscreen, minimized, withdrawn, scratch, scratch_visible;
+    bool live, floating, fullscreen, minimized, withdrawn, cloaked, scratch, scratch_visible;
     int output, workspace, leaf, stack_weight, next_row;
     uint64_t focus_order;
     w_rect floating_bounds, desired;
@@ -61,3 +61,4 @@ void w_model_workspace(w_desktop_model *m, int ws);
 void w_model_resize(w_desktop_model *m, int delta);
 void w_model_resize_pixels(w_desktop_model *m, enum split_axis axis, int delta);
 void w_model_swap(w_desktop_model *m, int a, int b);
+void w_model_insert_tile(w_desktop_model *m, int slot, int anchor, enum split_axis axis, bool before);

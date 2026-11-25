@@ -1,6 +1,7 @@
 #include "win_platform/win_platform.h"
 #include <stdlib.h>
 #include <stdio.h>
+#include <math.h>
 enum { cache_limit = 256 * 1024 };
 
 ////////////////
@@ -74,8 +75,50 @@ static void w_contents(w_cache_stream *s, w_desktop_config *c) {
     w_field(s, &c->background, 4);
     w_field(s, &c->foreground, 4);
     w_field(s, &c->accent, 4);
+    w_field(s, &c->border_size, sizeof(int));
+    w_field(s, &c->rounding, sizeof(int));
+    unsigned char resize = c->resize_on_border;
+    w_field(s, &resize, 1);
+    c->resize_on_border = resize != 0;
+    w_field(s, &c->drag_mods, sizeof(c->drag_mods));
+    unsigned char inverse = c->inverse_drag;
+    w_field(s, &inverse, 1);
+    c->inverse_drag = inverse != 0;
+    if (!c->drag_mods || c->drag_mods > 15)
+        s->ok = false;
+    unsigned char animations = c->animations;
+    w_field(s, &animations, 1);
+    if (animations > motion_system)
+        s->ok = false;
+    c->animations = (enum motion_preference)animations;
+    w_border_gradient *gradients[] = {&c->active_gradient, &c->inactive_gradient};
+    for (size_t i = 0; i < count_of(gradients); i++) {
+        w_border_gradient *g = gradients[i];
+        unsigned char enabled = g->enabled;
+        w_field(s, &enabled, 1);
+        g->enabled = enabled != 0;
+        w_field(s, &g->end, 4);
+        w_field(s, &g->angle, sizeof(int));
+        if (g->angle < 0 || g->angle > 360)
+            s->ok = false;
+    }
+    for (int i = 0; i < motion_count; i++) {
+        w_transition *m = &c->motion[i];
+        w_field(s, &m->ms, sizeof(int));
+        w_field(s, &m->curve, sizeof(w_curve));
+        w_field(s, &m->style, sizeof(m->style));
+        w_field(s, &m->percent, sizeof(int));
+        if ((unsigned)m->style > style_right || m->percent < -1 || m->percent > 100)
+            s->ok = false;
+        double points[] = {m->curve.x1, m->curve.y1, m->curve.x2, m->curve.y2};
+        for (size_t j = 0; j < count_of(points); j++)
+            if (!isfinite(points[j]) || points[j] < (j%2 ? -4 : 0) || points[j] > (j%2 ? 4 : 1))
+                s->ok = false;
+        if (m->ms < 0 || m->ms > 3000)
+            s->ok = false;
+    }
     if (c->bar_height < 16 || c->bar_height > 128 || c->gap < 0 || c->gap > 128 || c->outer_gap < 0 ||
-        c->outer_gap > 128) {
+        c->outer_gap > 128 || c->border_size < 0 || c->border_size > 16 || c->rounding < 0 || c->rounding > 32) {
         s->ok = false;
         return;
     }
@@ -137,7 +180,7 @@ void w_os_cache_write(w_desktop_config *cfg) {
         return;
     w_contents(&s, cfg);
     if (s.ok) {
-        w_cache_header h = {0x4e444348, 4, (uint32_t)s.pos, w_checksum(s.data, s.pos)};
+        w_cache_header h = {0x4e444348, 8, (uint32_t)s.pos, w_checksum(s.data, s.pos)};
         swprintf(tmp, count_of(tmp), L"%ls.%lu.%lu.tmp", path, GetCurrentProcessId(), GetCurrentThreadId());
         HANDLE file = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (file != INVALID_HANDLE_VALUE) {
@@ -163,7 +206,7 @@ bool w_os_cache_read(w_desktop_config *cfg) {
     DWORD n;
     w_cache_header h;
     bool ok = false;
-    if (ReadFile(f, &h, sizeof(h), &n, NULL) && n == sizeof(h) && h.magic == 0x4e444348 && h.format == 4 &&
+    if (ReadFile(f, &h, sizeof(h), &n, NULL) && n == sizeof(h) && h.magic == 0x4e444348 && h.format == 8 &&
         h.bytes > 0 && h.bytes <= cache_limit) {
         w_cache_stream s = {.data = malloc(h.bytes), .end = h.bytes, .ok = true};
         if (s.data && ReadFile(f, s.data, h.bytes, &n, NULL) && n == h.bytes &&

@@ -37,7 +37,7 @@ int w_ctl_run(int argc, wchar_t **argv) {
         if (!wcscmp(argv[1], L"prepare")) {
             wchar_t path[os_path_cap];
             if (!w_os_provider(cfg.file_browser, path, count_of(path)) ||
-                !w_os_provider(cfg.task_manager, path, count_of(path))) {
+                !w_os_task_manager(cfg.task_manager, path, count_of(path))) {
                 fputs("File browser or task manager executable unavailable.\n", stderr);
                 return 1;
             }

@@ -12,16 +12,28 @@ typedef struct w_bar_view {
 
 typedef void (*bar_action)(int output, const char *action);
 typedef bool (*bar_custom)(const char *name, wchar_t *text, int cap, char *action, size_t action_cap);
+enum { bar_fade_timer = 1, bar_modules_timer = 2 };
+typedef struct w_layer_fade {
+    uint64_t start;
+    BYTE from, value, target;
+    w_transition timing;
+} w_layer_fade;
+bool w_bar_fade(HWND hwnd, w_layer_fade *fade, BYTE target, w_transition timing, bool enabled);
+bool w_bar_fade_tick(HWND hwnd, w_layer_fade *fade, bool enabled);
 typedef struct w_bar_window {
     HWND hwnd;
     int output, dpi;
     HFONT font;
     w_icon_atlas icons;
+    bar_icon network_icon;
     HDC buffer_dc;
     HBITMAP buffer, previous_bitmap;
     SIZE buffer_size;
-    int hover, wheel_remainder, audio_percent;
+    int hover, wheel_hit, wheel_remainder, audio_percent;
     bool calendar_date, audio_muted;
+    bool motion_allowed, modules_ticking, pointer_inside;
+    POINT pointer;
+    w_layer_fade fade;
     POINT press;
     w_rect screen;
     const char *docked_edge;
@@ -34,6 +46,9 @@ typedef struct w_bar_window {
         char action[128], module[56];
         wchar_t tooltip[256];
         const w_module_style *style;
+        int workspace;
+        uint64_t start;
+        COLORREF paper, ink, from_paper, from_ink, target_paper, target_ink;
     } hits[48];
     int hit_count;
     bar_action invoke;

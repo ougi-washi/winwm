@@ -17,14 +17,10 @@ void w_desktop_focus_cancel(void) {
     pending.window.generation = 0;
 }
 
-static HWND w_root_owner(HWND window) {
-    return window ? GetAncestor(window, GA_ROOTOWNER) : NULL;
-}
-
 void w_desktop_focus_empty(void) {
     w_desktop_focus_cancel();
     HWND bar = desk.outputs[desk.model.output].bar.hwnd;
-    if (!w_palette_shown() && !w_bar_menu_active() && w_desktop_find(w_root_owner(GetForegroundWindow())) >= 0)
+    if (!w_palette_shown() && !w_bar_menu_active() && w_desktop_find(w_os_app_window(GetForegroundWindow())) >= 0)
         SetForegroundWindow(IsWindowVisible(bar) ? bar : GetDesktopWindow());
     desk.model.focus = -1;
     w_desktop_schedule();
@@ -35,16 +31,30 @@ static bool w_can_activate(HWND window) {
            !(GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_NOACTIVATE);
 }
 
+static bool w_foreground(HWND target) {
+    HWND previous = GetForegroundWindow();
+    if (previous == target || SetForegroundWindow(target))
+        return true;
+    // After typing, the current foreground app owns activation. Ask its
+    // window procedure to handle the standard "activate this HWND" command.
+    if (!previous || previous != GetForegroundWindow() || IsHungAppWindow(target))
+        return false;
+    DWORD_PTR result;
+    SendMessageTimeoutW(previous, WM_SYSCOMMAND, SC_HOTKEY, (LPARAM)target,
+                        SMTO_ABORTIFHUNG | SMTO_BLOCK, 75, &result);
+    return w_os_app_window(GetForegroundWindow()) == w_os_app_window(target);
+}
+
 static HWND w_activation_target(HWND owner, HWND hit) {
-    if (hit && w_root_owner(hit) == owner && w_can_activate(hit))
+    if (hit && w_os_app_window(hit) == owner && w_can_activate(hit))
         return hit;
     HWND popup = GetLastActivePopup(owner);
-    if (w_can_activate(popup))
+    if (w_os_app_window(popup) == owner && w_can_activate(popup))
         return popup;
     if (w_can_activate(owner))
         return owner;
     popup = GetWindow(owner, GW_ENABLEDPOPUP);
-    return w_can_activate(popup) ? popup : NULL;
+    return w_os_app_window(popup) == owner && w_can_activate(popup) ? popup : NULL;
 }
 
 static void w_select_owner(HWND owner) {
@@ -67,9 +77,76 @@ static void w_select_owner(HWND owner) {
 ////////////////
 //~ Foreground tracking
 
+typedef struct w_float_order {
+    HWND tile;
+    RECT bounds;
+    HWND windows[window_limit];
+    int count;
+    bool below_tile, fullscreen;
+} w_float_order;
+
+static BOOL CALLBACK w_collect_covered_floats(HWND hwnd, LPARAM data) {
+    w_float_order *order = (w_float_order *)data;
+    if (hwnd == order->tile)
+        order->below_tile = true;
+    else if (order->below_tile != order->fullscreen && GetPropW(hwnd, L"winwm.managed")) {
+        int slot = w_desktop_find(hwnd);
+        if (slot >= 0 && desk.model.windows[slot].floating && !desk.model.windows[slot].fullscreen &&
+            desk.windows[slot].wants_visible && w_model_visible(&desk.model, slot) && IsWindowVisible(hwnd) &&
+            !(GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST)) {
+            RECT area, overlap;
+            if (GetWindowRect(hwnd, &area) && IntersectRect(&overlap, &order->bounds, &area))
+                order->windows[order->count++] = hwnd;
+        }
+    }
+    return TRUE;
+}
+
+void w_desktop_stack_floats(int slot, bool fullscreen_changed) {
+    if ((unsigned)slot >= window_limit || slot != desk.model.focus || !w_model_visible(&desk.model,slot))
+        return;
+    const w_model_window *target = &desk.model.windows[slot];
+    HWND tile = desk.windows[slot].hwnd, foreground = GetForegroundWindow();
+    if ((target->floating && !target->fullscreen) || !IsWindowEnabled(tile) ||
+        (foreground && foreground != tile) || (GetWindowLongPtrW(tile, GWL_EXSTYLE) & WS_EX_TOPMOST))
+        return;
+    for (int i = 0; i < window_limit; i++) {
+        if (!desk.model.windows[i].floating || !w_model_visible(&desk.model, i))
+            continue;
+        w_float_order order = {.tile=tile, .fullscreen=target->fullscreen};
+        if (order.fullscreen)
+            order.bounds = w_os_to_rect(desk.outputs[target->output].screen);
+        else if (!GetWindowRect(tile, &order.bounds))
+            return;
+        if (!EnumWindows(w_collect_covered_floats, (LPARAM)&order) ||
+            !order.count || foreground != GetForegroundWindow())
+            return;
+        UINT flags = SWP_NOSIZE | SWP_NOMOVE | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS;
+        if (order.fullscreen || fullscreen_changed) {
+            // One request to the tile's input queue keeps the peers in native order
+            // even when a floating app's input queue is stalled.
+            HWND anchor = order.fullscreen ? GetWindow(order.windows[0], GW_HWNDPREV)
+                                           : order.windows[order.count-1];
+            if (anchor && (GetWindowLongPtrW(anchor,GWL_EXSTYLE) & WS_EX_TOPMOST))
+                anchor = HWND_TOP;
+            SetWindowPos(tile,anchor,0,0,0,0,flags);
+            return;
+        }
+        HWND above = GetWindow(tile, GW_HWNDPREV);
+        if (above && (GetWindowLongPtrW(above, GWL_EXSTYLE) & WS_EX_TOPMOST))
+            above = HWND_TOP;
+        for (int j = 0; j < order.count; j++) {
+            HWND hwnd = order.windows[j];
+            if (SetWindowPos(hwnd, above, 0, 0, 0, 0, flags))
+                above = hwnd;
+        }
+        break;
+    }
+}
+
 void w_desktop_focus_observe(HWND window) {
-    HWND actual = w_root_owner(GetForegroundWindow());
-    if (actual != w_root_owner(window))
+    HWND actual = w_os_app_window(GetForegroundWindow());
+    if (actual != w_os_app_window(window))
         return;
     if (w_model_valid(&desk.model, pending.window)) {
         // Hiding a workspace can briefly activate another application while
@@ -79,6 +156,7 @@ void w_desktop_focus_observe(HWND window) {
         w_desktop_focus_cancel();
     }
     w_select_owner(actual);
+    w_desktop_stack_floats(w_desktop_find(actual),false);
 }
 
 void w_desktop_activate(int slot) {
@@ -102,7 +180,7 @@ void w_desktop_activate(int slot) {
 
 bool w_desktop_close_foreground(void) {
     HWND window = GetForegroundWindow();
-    int slot = w_desktop_find(w_root_owner(window));
+    int slot = w_desktop_find(w_os_app_window(window));
     if (slot < 0 || !w_model_visible(&desk.model, slot) || !w_can_activate(window))
         return false;
     w_desktop_focus_cancel();
@@ -111,7 +189,7 @@ bool w_desktop_close_foreground(void) {
 }
 
 static BOOL CALLBACK w_await_owned_popup(HWND window, LPARAM owner) {
-    return !(w_root_owner(window) == (HWND)owner && window != (HWND)owner && IsWindowEnabled(window) &&
+    return !(w_os_app_window(window) == (HWND)owner && window != (HWND)owner && IsWindowEnabled(window) &&
              w_os_shell_hidden(window));
 }
 
@@ -122,7 +200,7 @@ void w_desktop_focus_apply(void) {
     if (!w_model_visible(&desk.model, slot) || w_palette_shown() || w_bar_menu_active() ||
         pending.pointer_presses != w_input_pointer_press_count()) {
         w_desktop_focus_cancel();
-        w_select_owner(w_root_owner(GetForegroundWindow()));
+        w_select_owner(w_os_app_window(GetForegroundWindow()));
         return;
     }
     HWND owner = desk.windows[slot].hwnd;
@@ -135,12 +213,12 @@ void w_desktop_focus_apply(void) {
         if (!EnumWindows(w_await_owned_popup, (LPARAM)owner))
             return;
         w_desktop_focus_cancel();
-        w_select_owner(w_root_owner(GetForegroundWindow()));
+        w_select_owner(w_os_app_window(GetForegroundWindow()));
         return;
     }
     w_desktop_focus_cancel();
-    if (GetForegroundWindow() != target && !SetForegroundWindow(target))
-        w_select_owner(w_root_owner(GetForegroundWindow()));
+    if (!w_foreground(target))
+        w_select_owner(w_os_app_window(GetForegroundWindow()));
 }
 
 ////////////////
@@ -156,14 +234,14 @@ static bool w_thread_owns_pointer(DWORD thread_id) {
 void w_desktop_hover(POINT point) {
     if (!desk.config.follow_mouse || w_palette_shown() || w_bar_menu_active() ||
         GetAsyncKeyState(VK_LBUTTON) < 0 || GetAsyncKeyState(VK_RBUTTON) < 0 ||
-        GetAsyncKeyState(VK_MBUTTON) < 0)
+        GetAsyncKeyState(VK_MBUTTON) < 0 || GetAsyncKeyState(VK_XBUTTON1) < 0 || GetAsyncKeyState(VK_XBUTTON2) < 0)
         return;
     HWND hit = GetAncestor(WindowFromPoint(point), GA_ROOT);
-    HWND owner = w_root_owner(hit);
+    HWND owner = w_os_app_window(hit);
     if (!owner)
         return;
     HWND foreground = GetForegroundWindow();
-    if (w_root_owner(foreground) == owner) {
+    if (w_os_app_window(foreground) == owner) {
         if (!w_model_valid(&desk.model, pending.window))
             w_select_owner(owner);
         return;
@@ -176,7 +254,7 @@ void w_desktop_hover(POINT point) {
     if (slot < 0 || !w_model_visible(&desk.model, slot))
         return;
     HWND target = w_activation_target(owner, hit);
-    if (target && SetForegroundWindow(target)) {
+    if (target && w_foreground(target)) {
         w_desktop_focus_cancel();
         w_select_owner(owner);
     }

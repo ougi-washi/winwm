@@ -48,6 +48,10 @@ bool w_command_parse(const char *s, w_command *out) {
         if (!w_str_copy(c.arg, sizeof(c.arg), s))
             return false;
         switch (i) {
+        case cmd_volume_set:
+            if (!*s || strlen(s) > 3 || s[strspn(s, "0123456789")] || atoi(s) > 100)
+                return false;
+            break;
         case cmd_move:
         case cmd_focus:
             if (w_command_direction(s) < 0)

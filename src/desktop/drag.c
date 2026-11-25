@@ -1,244 +1,261 @@
 #include "desktop/desktop.h"
 #include <limits.h>
 #include <stdlib.h>
-enum drag_kind { drag_idle, drag_tree, drag_master, drag_float };
 
-////////////////
-//~ Drag
-
-static struct w_drag_state {
+enum drag_kind { drag_idle, drag_splits, drag_float, drag_reposition };
+static struct {
     enum drag_kind kind;
-    int node, cut, start, available, workspace, output;
-    uint64_t generation;
-    bool rows, moved;
-    POINT origin;
+    w_window_id source;
+    int output, workspace;
+    bool floating, moved, left, top;
+    POINT origin, pointer, minimum, maximum;
+    UINT dpi;
     w_rect initial;
-    bool left, top;
-    int weight;
-    w_window_id first, second;
-} drag_state;
+    w_split_grab grips[2];
+} grab;
 
-////////////////
-//~ Drag Functions
+static HWND indicator;
+static bool preview_pending;
+static w_rect shown;
 
-static bool w_master_begin(w_desktop_model *m, w_workspace *ws, int slot, POINT point, int tolerance) {
-    if (ws->master_slot < 0)
+bool w_desktop_resizing(void) {
+    return grab.kind == drag_splits;
+}
+
+bool w_desktop_dragging_float(int slot) {
+    return grab.kind != drag_idle && grab.floating && grab.source.slot == slot &&
+           w_model_valid(&desk.model, grab.source);
+}
+
+static void w_queue_preview(void) {
+    if (!preview_pending)
+        preview_pending = PostMessageW(desk.root, msg_drag_preview, 0, 0) != 0;
+}
+
+static bool w_valid_grab(void) {
+    if (grab.kind == drag_idle || !desk.outputs[grab.output].live || desk.model.selected[grab.output] != grab.workspace)
         return false;
-    w_model_window *master = &m->windows[ws->master_slot];
-    w_rect area = ws->master_area;
-    if (point.x < area.x || point.x >= area.x + area.w || point.y < area.y || point.y >= area.y + area.h ||
-        master->desired.w == area.w)
+    if (grab.source.slot < 0)
+        return grab.kind == drag_splits;
+    if (!w_model_valid(&desk.model, grab.source) || !w_model_visible(&desk.model, grab.source.slot))
         return false;
-    int seam = master->desired.x + master->desired.w + ws->master_gap / 2;
-    int best = abs((int)point.x - seam), row = -1;
-    if (point.x > seam) {
-        for (int i = 0; i < window_limit; ++i) {
-            w_model_window *w = &m->windows[i];
-            if (!w->live || w->floating || w->fullscreen || !w_model_visible(m, i) ||
-                w->output != master->output || i == ws->master_slot || w->next_row < 0 ||
-                (slot >= 0 && slot != i && slot != w->next_row))
-                continue;
-            int d = abs((int)point.y - (w->desired.y + w->desired.h + ws->master_gap / 2));
-            if (d < best) {
-                row = i;
-                best = d;
-            }
+    const w_model_window *w = &desk.model.windows[grab.source.slot];
+    return w->output == grab.output && w->workspace == grab.workspace && w->floating == grab.floating &&
+           !w->fullscreen && desk.windows[grab.source.slot].wants_visible;
+}
+
+static LRESULT CALLBACK w_indicator_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_NCHITTEST)
+        return HTTRANSPARENT;
+    if (msg == WM_MOUSEACTIVATE)
+        return MA_NOACTIVATE;
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        uint32_t color = desk.config.accent;
+        SetDCBrushColor(dc, RGB(color >> 16, color >> 8, color));
+        FillRect(dc, &ps.rcPaint, GetStockObject(DC_BRUSH));
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+void w_desktop_drag_preview(void) {
+    preview_pending = false;
+    if (grab.kind != drag_idle && !w_valid_grab())
+        w_desktop_cancel_drag();
+    w_rect next;
+    if (grab.kind != drag_reposition || grab.floating || !grab.moved || !w_valid_grab() ||
+        !w_desktop_tile_drop(grab.source.slot, grab.pointer, &next, false)) {
+        if (indicator && IsWindowVisible(indicator))
+            ShowWindow(indicator, SW_HIDE);
+        return;
+    }
+    if (!indicator) {
+        HINSTANCE instance = GetModuleHandleW(NULL);
+        WNDCLASSW wc = {.lpfnWndProc=w_indicator_proc, .hInstance=instance, .lpszClassName=L"WinwmDropPreview"};
+        RegisterClassW(&wc);
+        indicator = CreateWindowExW(WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_LAYERED | WS_EX_TRANSPARENT,
+                                    wc.lpszClassName, NULL, WS_POPUP, 0,0,0,0, NULL,NULL,instance,NULL);
+        if (!indicator)
+            return;
+        SetLayeredWindowAttributes(indicator, 0, 82, LWA_ALPHA);
+    }
+    if (!w_rect_equal(next, shown) || !IsWindowVisible(indicator)) {
+        shown = next;
+        SetWindowPos(indicator, HWND_TOPMOST, next.x, next.y, next.w, next.h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    }
+}
+
+void w_desktop_cancel_drag(void) {
+    grab.kind = drag_idle;
+    if (indicator && IsWindowVisible(indicator))
+        ShowWindow(indicator, SW_HIDE);
+}
+
+static void w_default_limits(UINT dpi) {
+    grab.dpi = dpi ? dpi : 96;
+    grab.minimum = (POINT){max(1, GetSystemMetricsForDpi(SM_CXMINTRACK, grab.dpi)),
+                           max(1, GetSystemMetricsForDpi(SM_CYMINTRACK, grab.dpi))};
+    grab.maximum = (POINT){max(grab.minimum.x, GetSystemMetricsForDpi(SM_CXMAXTRACK, grab.dpi)),
+                           max(grab.minimum.y, GetSystemMetricsForDpi(SM_CYMAXTRACK, grab.dpi))};
+}
+
+// Query the client on the message loop, outside the low-level mouse callback.
+void w_desktop_drag_limits(w_window_id id) {
+    if (grab.kind != drag_float || id.slot != grab.source.slot || id.generation != grab.source.generation ||
+        !w_valid_grab())
+        return;
+    HWND hwnd = desk.windows[id.slot].hwnd;
+    MINMAXINFO limits = {.ptMinTrackSize=grab.minimum, .ptMaxTrackSize=grab.maximum};
+    DWORD_PTR ignored;
+    if (SendMessageTimeoutW(hwnd, WM_GETMINMAXINFO, 0, (LPARAM)&limits, SMTO_ABORTIFHUNG | SMTO_BLOCK, 35, &ignored)) {
+        grab.minimum.x = max(1, limits.ptMinTrackSize.x);
+        grab.minimum.y = max(1, limits.ptMinTrackSize.y);
+        grab.maximum.x = max(grab.minimum.x, limits.ptMaxTrackSize.x);
+        grab.maximum.y = max(grab.minimum.y, limits.ptMaxTrackSize.y);
+    }
+}
+
+static void w_drag_float_to(w_rect bounds) {
+    int slot = grab.source.slot;
+    w_model_window *w = &desk.model.windows[slot];
+    int output = w_desktop_output_for_bounds(grab.output, bounds);
+    if (output != grab.output) {
+        // These are already destination coordinates, including negative monitor origins.
+        w_model_move(&desk.model, slot, output, desk.model.selected[output]);
+        grab.output = output;
+        grab.workspace = w->workspace;
+        desk.windows[slot].displaced_from = 0;
+        if (desk.model.focus == slot)
+            w_model_focus(&desk.model, slot);
+    }
+    w_desktop_place_floating(slot, bounds);
+}
+
+static void w_update(POINT p, bool release) {
+    int dx = p.x - grab.origin.x, dy = p.y - grab.origin.y;
+    if (!grab.moved) {
+        if (!dx && !dy)
+            return;
+        if (grab.kind == drag_reposition && !grab.floating &&
+            abs(dx) < GetSystemMetricsForDpi(SM_CXDRAG, grab.dpi) &&
+            abs(dy) < GetSystemMetricsForDpi(SM_CYDRAG, grab.dpi))
+            return;
+        grab.moved = true;
+    }
+    if (grab.kind == drag_splits) {
+        bool changed = false;
+        if (p.x != grab.pointer.x)
+            changed = w_layout_drag_split(&desk.model, grab.output, grab.workspace, &grab.grips[0], dx);
+        if (p.y != grab.pointer.y)
+            changed |= w_layout_drag_split(&desk.model, grab.output, grab.workspace, &grab.grips[1], dy);
+        grab.pointer = p;
+        if (changed)
+            w_desktop_schedule();
+        return;
+    }
+    if (!grab.floating) {
+        grab.pointer = p;
+        if (release)
+            w_desktop_drop_tile(grab.source.slot, p);
+        else
+            w_queue_preview();
+        return;
+    }
+    w_rect r = grab.initial;
+    grab.pointer = p;
+    HWND hwnd = desk.windows[grab.source.slot].hwnd;
+    if (grab.kind == drag_float) {
+        UINT dpi = GetDpiForWindow(hwnd);
+        if (dpi && dpi != grab.dpi) {
+            w_default_limits(dpi);
+            PostMessageW(desk.root, msg_drag_limits, grab.source.slot, grab.source.generation);
         }
-    }
-    if (best > tolerance)
-        return false;
-    drag_state.kind = drag_master;
-    drag_state.rows = row >= 0;
-    drag_state.moved = false;
-    drag_state.start = row >= 0 ? point.y : point.x;
-    drag_state.output = master->output;
-    drag_state.workspace = master->workspace;
-    if (row >= 0) {
-        w_model_window *a = &m->windows[row], *b = &m->windows[a->next_row];
-        drag_state.first = (w_window_id){row, a->generation};
-        drag_state.second = (w_window_id){a->next_row, b->generation};
-        drag_state.weight = a->stack_weight + b->stack_weight;
-        drag_state.cut = a->desired.h;
-        drag_state.available = a->desired.h + b->desired.h;
+        r = w_layout_drag_corner(r, dx, dy, grab.left, grab.top, grab.minimum.x, grab.minimum.y,
+                                 grab.maximum.x, grab.maximum.y);
     } else {
-        drag_state.first = (w_window_id){ws->master_slot, master->generation};
-        drag_state.cut = master->desired.w;
-        drag_state.available = area.w - ws->master_gap;
+        r = w_layout_drag_position(r, w_os_bounds(hwnd), grab.origin.x-r.x, grab.origin.y-r.y, p.x, p.y);
     }
-    return drag_state.available > 1;
+    w_drag_float_to(r);
+    if (release)
+        desk.windows[grab.source.slot].native_move = move_released;
 }
 
-static void w_master_update(w_desktop_model *m, POINT point) {
-    w_workspace *ws = &m->spaces[drag_state.output][drag_state.workspace];
-    w_window_id first = drag_state.first, second = drag_state.second;
-    if (ws->layout != layout_master || m->selected[drag_state.output] != drag_state.workspace ||
-        !w_model_valid(m, first) || !w_model_visible(m, first.slot))
+void w_desktop_drag_client_resized(int slot) {
+    if (grab.kind != drag_reposition || !grab.moved || !w_desktop_dragging_float(slot) || !w_valid_grab())
         return;
-    int shift = (drag_state.rows ? point.y : point.x) - drag_state.start;
-    if (!shift && !drag_state.moved)
-        return;
-    drag_state.moved = true;
-    int pixels = w_clamp_int(drag_state.cut + shift, 1, drag_state.available - 1);
-    if (drag_state.rows) {
-        w_model_window *a = &m->windows[first.slot];
-        if (!w_model_valid(m, second) || !w_model_visible(m, second.slot) || a->next_row != second.slot)
-            return;
-        int weight = w_clamp_int((int)((int64_t)pixels * drag_state.weight / drag_state.available), 1,
-                               drag_state.weight - 1);
-        if (weight == a->stack_weight)
-            return;
-        a->stack_weight = weight;
-        m->windows[second.slot].stack_weight = drag_state.weight - weight;
-    } else {
-        if (ws->master_slot != first.slot)
-            return;
-        int ratio = w_clamp_int((int)((int64_t)pixels * 1000 / drag_state.available), 10, 990);
-        if (ws->master_ratio == ratio)
-            return;
-        ws->master_ratio = ratio;
-    }
-    w_desktop_schedule();
-}
-
-////////////////
-//~ Floating window drag
-
-static void w_float_begin(int slot, POINT point) {
-    const w_model_window *w = &desk.model.windows[slot];
-    drag_state.kind = drag_float;
-    drag_state.first = (w_window_id){slot, w->generation};
-    drag_state.output = w->output;
-    drag_state.workspace = w->workspace;
-    drag_state.origin = point;
-    drag_state.initial = w_os_bounds(desk.windows[slot].hwnd);
-    const w_rect r = drag_state.initial;
-    drag_state.left = point.x < r.x + r.w / 2;
-    drag_state.top = point.y < r.y + r.h / 2;
-}
-
-// Anchor the opposite corner for the entire gesture, including when the pointer crosses it.
-static void w_float_update(POINT point) {
-    w_window_id id = drag_state.first;
-    if (!w_model_valid(&desk.model, id))
-        return;
-    w_model_window *w = &desk.model.windows[id.slot];
-    if (!w_model_visible(&desk.model, id.slot) || !w->floating || w->fullscreen ||
-        w->output != drag_state.output || w->workspace != drag_state.workspace)
-        return;
-    w_rect area = desk.outputs[w->output].work;
-    w_rect start = drag_state.initial;
-    int left = start.x, top = start.y, right = left + start.w, bottom = top + start.h;
-    int dx = point.x - drag_state.origin.x, dy = point.y - drag_state.origin.y;
-    if (drag_state.left)
-        left = w_clamp_int(left + dx, min(area.x, left), right - 1);
-    else
-        right = w_clamp_int(right + dx, left + 1, max(area.x + area.w, right));
-    if (drag_state.top)
-        top = w_clamp_int(top + dy, min(area.y, top), bottom - 1);
-    else
-        bottom = w_clamp_int(bottom + dy, top + 1, max(area.y + area.h, bottom));
-    w_rect next = {left, top, right - left, bottom - top};
-    w_desktop_place_floating(id.slot, next);
+    w_rect actual = w_os_bounds(desk.windows[slot].hwnd);
+    w_rect requested = desk.model.windows[slot].floating_bounds;
+    if (actual.w != requested.w || actual.h != requested.h)
+        w_update(grab.pointer, false);
 }
 
 bool w_desktop_drag(enum input_drag_event event, POINT point) {
-    w_desktop_model *m = &desk.model;
+    if (event == input_drag_cancel) {
+        w_desktop_cancel_drag();
+        return false;
+    }
     if (event == input_drag_move || event == input_drag_end) {
-        if (drag_state.kind == drag_idle)
+        if (!w_valid_grab()) {
+            w_desktop_cancel_drag();
             return false;
-        if (drag_state.kind != drag_tree) {
-            if (drag_state.kind == drag_float)
-                w_float_update(point);
-            else
-                w_master_update(m, point);
-            if (event == input_drag_end)
-                drag_state.kind = drag_idle;
-            return true;
         }
-        w_tile_node *n = &m->nodes[drag_state.node];
-        w_workspace *ws = &m->spaces[drag_state.output][drag_state.workspace];
-        if (drag_state.node && n->live && n->generation == drag_state.generation &&
-            n->available == drag_state.available && m->selected[drag_state.output] == drag_state.workspace &&
-            (ws->layout == layout_tree || ws->layout == layout_alternate)) {
-            int delta = (n->axis == split_x ? point.x : point.y) - drag_state.start;
-            if (delta || n->manual) {
-                int ratio =
-                    w_clamp_int((int)((int64_t)(drag_state.cut + delta) * 1000 / n->available), 10, 990);
-                if (ratio != n->ratio) {
-                    n->manual = true;
-                    n->ratio = ratio;
-                    w_desktop_schedule();
-                }
-            }
-        } else
-            drag_state.kind = drag_idle;
+        w_update(point, event == input_drag_end);
         if (event == input_drag_end)
-            drag_state.kind = drag_idle;
+            w_desktop_cancel_drag();
         return true;
     }
-    drag_state.kind = drag_idle;
+    w_desktop_cancel_drag();
+    if (event == input_drag_edge && !desk.config.resize_on_border)
+        return false;
     HWND hit = GetAncestor(WindowFromPoint(point), GA_ROOT);
     int slot = w_desktop_find(hit), output = -1;
     if (slot >= 0) {
-        w_model_window *w = &m->windows[slot];
-        if (!w_model_visible(m, slot) || w->fullscreen)
+        if (!desk.windows[slot].wants_visible || !w_model_visible(&desk.model, slot) ||
+            desk.model.windows[slot].fullscreen || IsZoomed(hit) || !IsWindowEnabled(hit))
             return false;
-        if (w->floating) {
-            if (event != input_drag_inside || IsZoomed(hit) ||
-                !(GetWindowLongPtrW(hit, GWL_STYLE) & WS_THICKFRAME))
-                return false;
-            w_float_begin(slot, point);
-            return true;
-        }
-        output = w->output;
+        output = desk.model.windows[slot].output;
     } else if (event == input_drag_edge && w_os_desktop_surface(hit)) {
         HMONITOR monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONULL);
-        for (int i = 0; i < output_limit; ++i) {
-            w_output_state *o = &desk.outputs[i];
-            if (o->live && o->monitor == monitor) {
-                output = i;
-                break;
-            }
-        }
+        for (int o=0; o<output_limit; o++)
+            if (desk.outputs[o].live && desk.outputs[o].monitor == monitor)
+                output = o;
     }
     if (output < 0)
         return false;
-    w_workspace *ws = &m->spaces[output][m->selected[output]];
-    int tolerance = MulDiv(4 + desk.config.gap / 2, desk.outputs[output].dpi, 96);
-    if (ws->layout == layout_master)
-        return w_master_begin(m, ws, slot, point, event == input_drag_inside ? INT_MAX : tolerance);
-    if (ws->layout != layout_tree && ws->layout != layout_alternate)
-        return false;
-    int best = 0, distance = INT_MAX;
-    int node = slot >= 0 ? m->nodes[m->windows[slot].leaf].parent : 1;
-    while (node > 0 && node < (int)count_of(m->nodes)) {
-        w_tile_node *n = &m->nodes[node];
-        w_rect r = n->bounds;
-        if (n->live && n->available > 1 && point.x >= r.x && point.x < r.x + r.w && point.y >= r.y &&
-            point.y < r.y + r.h) {
-            int d = abs((int)(n->axis == split_x ? point.x : point.y) - n->divider);
-            if (d < distance && (event == input_drag_inside || d <= tolerance)) {
-                int root = node;
-                while (m->nodes[root].parent)
-                    root = m->nodes[root].parent;
-                if (root == ws->root) {
-                    distance = d;
-                    best = node;
-                }
-            }
+    grab.output = output;
+    grab.workspace = desk.model.selected[output];
+    grab.source = (w_window_id){slot, slot >= 0 ? desk.model.windows[slot].generation : 0};
+    grab.origin = grab.pointer = point;
+    grab.moved = false;
+    grab.floating = slot >= 0 && desk.model.windows[slot].floating;
+    grab.dpi = desk.outputs[output].dpi;
+
+    if (event == input_drag_reposition || grab.floating) {
+        if (grab.floating && event != input_drag_reposition &&
+            (event != input_drag_inside || !(GetWindowLongPtrW(hit, GWL_STYLE) & WS_THICKFRAME)))
+            return false;
+        grab.initial = w_os_bounds(hit);
+        if (grab.initial.w < 1 || grab.initial.h < 1)
+            return false;
+        grab.kind = event == input_drag_reposition ? drag_reposition : drag_float;
+        grab.left = point.x < grab.initial.x + grab.initial.w/2;
+        grab.top = point.y < grab.initial.y + grab.initial.h/2;
+        if (grab.kind == drag_float) {
+            w_default_limits(GetDpiForWindow(hit));
+            PostMessageW(desk.root, msg_drag_limits, slot, grab.source.generation);
         }
-        node = slot >= 0 ? n->parent : node + 1;
+    } else {
+        int edge = desk.borders_hidden ? 0 : desk.config.border_size;
+        int tolerance = MulDiv(max(4, edge) + desk.config.gap/2, grab.dpi, 96);
+        if (!w_layout_grab_splits(&desk.model, output, slot, point.x, point.y, tolerance,
+                                  event == input_drag_inside, grab.grips))
+            return false;
+        grab.kind = drag_splits;
     }
-    if (!best)
-        return false;
-    w_tile_node *n = &m->nodes[best];
-    drag_state.kind = drag_tree;
-    drag_state.node = best;
-    drag_state.generation = n->generation;
-    drag_state.start = n->axis == split_x ? point.x : point.y;
-    drag_state.cut = n->cut;
-    drag_state.available = n->available;
-    drag_state.output = output;
-    drag_state.workspace = m->selected[output];
+    if (slot >= 0)
+        PostMessageW(desk.root, msg_pointer_select, slot, grab.source.generation);
     return true;
 }

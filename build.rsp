@@ -4,6 +4,7 @@ src/app/main.c
 src/bar/bar.c
 src/bar/icons.c
 src/bar/menu.c
+src/bar/motion.c
 src/base/json.c
 src/catalog/catalog.c
 src/command/command.c
@@ -11,6 +12,7 @@ src/config/config.c
 src/config/language.c
 src/desktop/actions.c
 src/desktop/drag.c
+src/desktop/effects.c
 src/desktop/focus.c
 src/desktop/main.c
 src/desktop/navigation.c
@@ -19,10 +21,12 @@ src/desktop/windows.c
 src/desktop_ctl/main.c
 src/desktop_tools/capture.c
 src/desktop_tools/main.c
+src/desktop_tools/languages.c
 src/desktop_tools/settings.c
 src/input/input.c
 src/ipc/ipc.c
 src/layout/layout.c
+src/layout/gesture.c
 src/model/model.c
 src/os_win32/explorer.c
 src/os_win32/modifier_map.c
@@ -40,10 +44,14 @@ src/win_platform/win_platform.c
 -ldwmapi
 -lshcore
 -lgdi32
+-lmsimg32
+-luxtheme
 -lcomctl32
 -liphlpapi
+-lws2_32
 -lole32
 -lshell32
+-lshlwapi
 -luuid
 -lpowrprof
 -lmfuuid

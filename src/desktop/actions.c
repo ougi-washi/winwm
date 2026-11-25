@@ -7,9 +7,10 @@
 ////////////////
 //~ Actions
 
+enum launch_kind { launch_executable, launch_terminal, launch_command, launch_task_manager };
 typedef struct w_launch_job {
     char exe[1024], arg[4096];
-    bool terminal, command_line;
+    enum launch_kind kind;
 } w_launch_job;
 
 ////////////////
@@ -17,9 +18,27 @@ typedef struct w_launch_job {
 
 static DWORD WINAPI w_launch_thread(void *ptr) {
     w_launch_job *j = ptr;
-    if (!(j->command_line ? w_os_launch_line(j->exe)
-          : j->terminal   ? w_os_launch_terminal(j->exe)
-                          : w_os_launch_provider(j->exe, j->arg))) {
+    bool launched;
+    switch (j->kind) {
+    case launch_command:
+        launched = w_os_launch_line(j->exe);
+        break;
+    case launch_terminal:
+        launched = w_os_launch_terminal(j->exe);
+        break;
+    case launch_task_manager: {
+        wchar_t path[os_path_cap];
+        HANDLE child = w_os_task_manager(j->exe,path,count_of(path)) ? w_os_launch(path,NULL) : NULL;
+        launched = child != NULL;
+        if (child)
+            CloseHandle(child);
+        break;
+    }
+    default:
+        launched = w_os_launch_provider(j->exe,j->arg);
+        break;
+    }
+    if (!launched) {
         char *why = malloc(512);
         if (why) {
             snprintf(why, 512, "Could not start %.380s. Check its configured executable path.", j->exe);
@@ -31,12 +50,11 @@ static DWORD WINAPI w_launch_thread(void *ptr) {
     return 0;
 }
 
-static bool w_queue_launch(const char *exe, const char *arg, bool command_line) {
+static bool w_queue_launch(const char *exe, const char *arg, enum launch_kind kind) {
     w_launch_job *j = calloc(1, sizeof(*j));
     if (!j)
         return false;
-    j->terminal = arg == NULL;
-    j->command_line = command_line;
+    j->kind = kind;
     if (!w_str_copy(j->exe, sizeof(j->exe), exe) || !w_str_copy(j->arg, sizeof(j->arg), arg ? arg : "") ||
         !QueueUserWorkItem(w_launch_thread, j, WT_EXECUTEDEFAULT)) {
         free(j);
@@ -78,7 +96,7 @@ void w_desktop_start_programs(bool first_load) {
 }
 
 static bool w_launch(const char *exe, const char *arg) {
-    return w_queue_launch(exe, arg, false);
+    return w_queue_launch(exe, arg, launch_executable);
 }
 
 ////////////////
@@ -165,28 +183,32 @@ bool w_desktop_run_on(const w_command *c, int output) {
     }
     switch (c->kind) {
     case cmd_terminal:
-        ok = w_launch(desk.config.terminal, NULL);
+        ok = w_queue_launch(desk.config.terminal, NULL, launch_terminal);
         break;
     case cmd_open_tasks:
-        ok = w_launch(desk.config.task_manager, "");
+        ok = w_queue_launch(desk.config.task_manager, NULL, launch_task_manager);
         break;
     case cmd_open_folder:
     case cmd_reveal_file:
         ok = w_open_files(c);
         break;
-    case cmd_launch:
-        ok = false;
+    case cmd_launch: {
+        const char *configured = NULL;
         for (int j = 0; j < desk.config.app_count; j++)
             if (!strcmp(c->arg, desk.config.apps[j].name)) {
-                ok = w_launch(desk.config.apps[j].path, "");
+                configured = desk.config.apps[j].path;
                 break;
             }
-        if (!ok && !strcmp(c->arg, "brave"))
-            ok = w_launch("brave.exe", "");
-        else if (!ok)
-            ok = w_catalog_launch(c->arg);
+        ok = configured ? w_launch(configured,"") : w_catalog_launch(c->arg) || w_launch(c->arg,"");
         break;
+    }
     case cmd_audio:
+    case cmd_languages:
+    case cmd_keyboard_settings:
+    case cmd_volume_mixer:
+    case cmd_power_settings:
+    case cmd_date_time:
+    case cmd_network_settings:
     case cmd_wifi:
     case cmd_bluetooth:
     case cmd_display:
@@ -239,7 +261,7 @@ bool w_desktop_run_on(const w_command *c, int output) {
         break;
     }
     case cmd_program:
-        ok = w_queue_launch(c->arg, "", true);
+        ok = w_queue_launch(c->arg, "", launch_command);
         break;
     case cmd_resize_mode:
         desk.resize = !desk.resize;
@@ -380,9 +402,10 @@ bool w_desktop_run_on(const w_command *c, int output) {
         ok = ExitWindowsEx(EWX_LOGOFF, 0) != 0;
         break;
     case cmd_idle_inhibit:
-        desk.inhibit = !desk.inhibit;
         ok = SetThreadExecutionState(ES_CONTINUOUS |
-                                     (desk.inhibit ? ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED : 0)) != 0;
+                                     (desk.inhibit ? 0 : ES_DISPLAY_REQUIRED | ES_SYSTEM_REQUIRED)) != 0;
+        if (ok)
+            desk.inhibit = !desk.inhibit;
         break;
     case cmd_clipboard_clear:
         SecureZeroMemory(desk.clips, sizeof(desk.clips));
@@ -400,6 +423,9 @@ bool w_desktop_run_on(const w_command *c, int output) {
     case cmd_mute:
         ok = w_audio_start(desk.root, msg_audio) && w_audio_adjust(c->kind == cmd_mute ? 0 : c->kind == cmd_volume_up ? 5 : -5);
         break;
+    case cmd_volume_set:
+        ok = w_audio_start(desk.root, msg_audio) && w_audio_set_percent(atoi(c->arg));
+        break;
     case cmd_media_play: {
         UINT key = VK_MEDIA_PLAY_PAUSE;
         INPUT keys[2] = {0};
@@ -416,6 +442,19 @@ bool w_desktop_run_on(const w_command *c, int output) {
         desk.hide_bars = !desk.hide_bars;
         w_desktop_status_configure();
         w_desktop_timer();
+        break;
+    case cmd_animations_toggle:
+        desk.config.animations = desk.motion_allowed ? motion_off : motion_on;
+        w_effects_preferences();
+        break;
+    case cmd_animations_system:
+        desk.config.animations = motion_system;
+        w_effects_preferences();
+        break;
+    case cmd_borders_toggle:
+        desk.borders_hidden = !desk.borders_hidden;
+        for (int i = 0; i < window_limit; i++)
+            desk.windows[i].has_issued = false;
         break;
     case cmd_rescue:
         PostQuitMessage(42);
@@ -527,20 +566,32 @@ void w_desktop_palette(enum command_kind kind, int output) {
         for (int j = 0; j < desk.clip_count; j++)
             w_add_row(desk.clips[j], NULL, (w_window_id){-1, 0});
     } else if (kind == cmd_settings) {
-        title = L"winwm settings";
+        title = L"Settings";
         for (int o = 0; o < output_limit; o++)
             if (desk.outputs[o].live) {
                 w_output_state *d = &desk.outputs[o];
                 wchar_t s[160];
-                swprintf(s, count_of(s), L"%ls   %d × %d   %d%%", d->device, d->screen.w, d->screen.h,
+                const wchar_t *number = !wcsncmp(d->device, L"\\\\.\\DISPLAY", 11) ? d->device + 11 : d->device;
+                swprintf(s, count_of(s), L"Display %ls   ·   %d × %d   ·   %d%%", number, d->screen.w, d->screen.h,
                          MulDiv(d->dpi, 100, 96));
-                w_add_row(s, NULL, (w_window_id){-1, 0});
+                w_add_row(s, "display", (w_window_id){-1, 0});
             }
-        const char *items[] = {"audio",       "wifi",         "bluetooth",  "display",        "wallpaper",
-                               "edit_config", "reload",       "shortcuts",  "volume_up",      "volume_down",
-                               "mute",        "idle_inhibit", "bar_toggle", "clipboard_clear"};
+        static const struct { const char *label, *action; } items[] = {
+            {"Sound devices", "audio"}, {"Volume mixer", "volume_mixer"}, {"Wi-Fi and networks", "wifi"},
+            {"Bluetooth devices", "bluetooth"}, {"Add languages and keyboards", "languages"},
+            {"Set up keyboard layouts", "keyboard_settings"}, {"Power and sleep", "power_settings"},
+            {"Date and time", "date_time"}, {"Change wallpaper", "wallpaper"}, {"Edit configuration", "edit_config"},
+            {"Reload configuration", "reload"}, {"Keyboard shortcuts", "shortcuts"}, {"Volume up", "volume_up"},
+            {"Volume down", "volume_down"}, {"Mute or unmute", "mute"}, {"Toggle toolbar", "bar_toggle"},
+            {"Clear clipboard history", "clipboard_clear"}
+        };
         for (size_t i = 0; i < count_of(items); i++)
-            w_action_row(items[i], items[i]);
+            w_action_row(items[i].label, items[i].action);
+        w_action_row(desk.inhibit ? "Resume automatic sleep" : "Keep awake", "idle_inhibit");
+        w_action_row(desk.motion_allowed ? "Disable animations" : "Enable animations", "animations_toggle");
+        if (desk.config.animations != motion_system)
+            w_action_row("Follow Windows animation preference", "animations_system");
+        w_action_row(desk.borders_hidden ? "Show window borders" : "Hide window borders", "borders_toggle");
     } else {
         for (int j = 0; j < desk.config.app_count; j++) {
             char a[160];

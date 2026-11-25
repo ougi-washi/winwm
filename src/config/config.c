@@ -7,6 +7,28 @@
 ////////////////
 //~ Config
 
+static double w_cubic(double t, double a, double b) {
+    double u = 1-t;
+    return 3*u*u*t*a + 3*u*t*t*b + t*t*t;
+}
+
+double w_motion_progress(w_transition timing, uint64_t elapsed) {
+    if (timing.ms <= 0 || elapsed >= (unsigned)timing.ms)
+        return 1;
+    if (!elapsed)
+        return 0;
+    double time = (double)elapsed / timing.ms;
+    double lo = 0, hi = 1;
+    for (int i = 0; i < 14; i++) {
+        double t = (lo+hi)/2;
+        if (w_cubic(t, timing.curve.x1, timing.curve.x2) < time)
+            lo = t;
+        else
+            hi = t;
+    }
+    return w_cubic((lo+hi)/2, timing.curve.y1, timing.curve.y2);
+}
+
 bool w_config_chord(const char *text, unsigned *mods, unsigned *key) {
     char chord[64];
     if (!w_str_copy(chord, sizeof(chord), text))
@@ -133,6 +155,14 @@ void w_config_defaults(w_desktop_config *c) {
     memset(c, 0, sizeof(*c));
     c->gap = 6;
     c->outer_gap = 6;
+    c->border_size = 2;
+    c->resize_on_border = true;
+    c->drag_mods = 8; // Super
+    c->rounding = 8;
+    c->animations = motion_system;
+    const int ms[motion_count] = {160, 190, 180, 140, 140, 160, 120, 160, 140};
+    for (int i = 0; i < motion_count; i++)
+        c->motion[i] = (w_transition){ms[i], {.22, 1, .36, 1}, style_default, -1};
     c->inactive_alpha = 250;
     c->inactive_border = 0x292b33;
     c->follow_mouse = true;
@@ -344,6 +374,7 @@ static bool w_parse_object(w_desktop_config *c, w_json_token *t, int root, char 
             c->outer_gap = c->gap;
         } else if (!strcmp(k, "workspace_names")) {
             ok = a->type == json_array;
+            memset(c->workspace_names, 0, sizeof(c->workspace_names));
             int which = 0;
             for (int j = v + 1; ok && j < a->after; j = t[j].after) {
                 ok = which < workspace_limit &&
@@ -365,6 +396,20 @@ static bool w_parse_object(w_desktop_config *c, w_json_token *t, int root, char 
             ok = w_color(a, &c->foreground);
         else if (!strcmp(k, "accent"))
             ok = w_color(a, &c->accent);
+        else if (!strcmp(k, "inactive_border"))
+            ok = w_color(a, &c->inactive_border);
+        else if (!strcmp(k, "border_size"))
+            ok = w_token_int(a, 0, 16, &c->border_size);
+        else if (!strcmp(k, "rounding"))
+            ok = w_token_int(a, 0, 32, &c->rounding);
+        else if (!strcmp(k, "resize_on_border"))
+            ok = w_token_bool(a, &c->resize_on_border);
+        else if (!strcmp(k, "animations")) {
+            bool on;
+            ok = w_token_bool(a, &on);
+            if (ok)
+                c->animations = on ? motion_on : motion_off;
+        }
         else if (!strcmp(k, "edge"))
             ok = w_json_read(a, c->edge, sizeof(c->edge)) &&
                  (!strcmp(c->edge, "top") || !strcmp(c->edge, "bottom") || !strcmp(c->edge, "left") ||
@@ -393,12 +438,18 @@ static bool w_parse_object(w_desktop_config *c, w_json_token *t, int root, char 
                     break;
                 if (!strcmp(k, "bindings"))
                     ok = w_config_bind(c, name, value);
-                else if (c->app_count < app_limit) {
-                    w_app_entry *app = &c->apps[c->app_count++];
-                    strcpy(app->name, name);
-                    strcpy(app->path, value);
-                } else
-                    ok = false;
+                else {
+                    int n = 0;
+                    while (n < c->app_count && strcmp(c->apps[n].name, name))
+                        n++;
+                    ok = n < app_limit;
+                    if (ok) {
+                        if (n == c->app_count)
+                            c->app_count++;
+                        strcpy(c->apps[n].name, name);
+                        strcpy(c->apps[n].path, value);
+                    }
+                }
                 if (!ok) {
                     snprintf(err, cap, "line %d: invalid %s entry '%s'", t[j].line, k, name);
                     return false;
@@ -407,12 +458,22 @@ static bool w_parse_object(w_desktop_config *c, w_json_token *t, int root, char 
         } else if (!strcmp(k, "modules")) {
             ok = a->type == json_object;
             for (int j = v + 1; ok && j < a->after; j = t[j + 1].after) {
-                if (c->style_count >= 48 || t[j + 1].type != json_object) {
+                char name[sizeof(c->styles[0].name)];
+                if (t[j + 1].type != json_object || !w_json_read(&t[j], name, sizeof(name))) {
                     ok = false;
                     break;
                 }
-                w_module_style *style = &c->styles[c->style_count++];
-                ok = w_json_read(&t[j], style->name, sizeof(style->name));
+                int n = 0;
+                while (n < c->style_count && strcmp(c->styles[n].name, name))
+                    n++;
+                if (n >= (int)count_of(c->styles)) {
+                    ok = false;
+                    break;
+                }
+                if (n == c->style_count)
+                    c->style_count++;
+                w_module_style *style = &c->styles[n];
+                strcpy(style->name, name);
                 for (int z = j + 2; ok && z < t[j + 1].after; z = t[z + 1].after) {
                     char field[32];
                     w_json_token *val = &t[z + 1];
@@ -440,13 +501,24 @@ static bool w_parse_object(w_desktop_config *c, w_json_token *t, int root, char 
         } else if (!strcmp(k, "providers")) {
             ok = a->type == json_object;
             for (int j = v + 1; ok && j < a->after; j = t[j + 1].after) {
-                if (c->provider_count >= provider_limit || t[j + 1].type != json_object) {
+                char provider[sizeof(c->providers[0].name)];
+                if (t[j + 1].type != json_object || !w_json_read(&t[j], provider, sizeof(provider)) || !*provider) {
                     ok = false;
                     break;
                 }
-                w_provider_config *p = &c->providers[c->provider_count++];
-                p->timeout = 10;
-                ok = w_json_read(&t[j], p->name, sizeof(p->name)) && *p->name;
+                int n = 0;
+                while (n < c->provider_count && strcmp(c->providers[n].name, provider))
+                    n++;
+                if (n >= provider_limit) {
+                    ok = false;
+                    break;
+                }
+                w_provider_config *p = &c->providers[n];
+                if (n == c->provider_count) {
+                    c->provider_count++;
+                    p->timeout = 10;
+                    strcpy(p->name, provider);
+                }
                 for (const char *q = p->name; ok && *q; q++)
                     ok = isalnum((unsigned char)*q) || *q == '_' || *q == '-';
                 for (int z = j + 2; ok && z < t[j + 1].after; z = t[z + 1].after) {
@@ -536,6 +608,12 @@ static bool w_parse_object(w_desktop_config *c, w_json_token *t, int root, char 
         }
         i = a->after;
     }
+    if (!version)
+        snprintf(err, cap, "configuration requires version 1");
+    return version;
+}
+
+bool w_config_validate_providers(const w_desktop_config *c, char *err, size_t cap) {
     const char *groups[] = {c->bar_left, c->bar_center, c->bar_right};
     for (size_t g = 0; g < count_of(groups); g++) {
         const char *p = groups[g];
@@ -559,21 +637,22 @@ static bool w_parse_object(w_desktop_config *c, w_json_token *t, int root, char 
             p += n;
         }
     }
-    if (!version)
-        snprintf(err, cap, "configuration requires version 1");
-    return version;
+    return true;
 }
 
-bool w_config_parse(w_desktop_config *out, const char *s, char *err, size_t cap) {
+static bool w_parse_json(w_desktop_config *out, const char *s, char *err, size_t cap, bool merge) {
     w_json_token *tokens = calloc(4096, sizeof(*tokens));
     w_desktop_config *next = malloc(sizeof(*next));
     w_json_doc d;
     snprintf(err, cap, "invalid configuration");
     bool ok = false;
     if (tokens && next) {
-        w_config_defaults(next);
+        if (merge)
+            *next = *out;
+        else
+            w_config_defaults(next);
         if (w_json_parse(&d, s, tokens, 4096))
-            ok = w_parse_object(next, tokens, 0, err, cap);
+            ok = w_parse_object(next, tokens, 0, err, cap) && (merge || w_config_validate_providers(next, err, cap));
         else
             snprintf(err, cap, "%s", d.error);
         if (ok) {
@@ -585,4 +664,12 @@ bool w_config_parse(w_desktop_config *out, const char *s, char *err, size_t cap)
     free(next);
     free(tokens);
     return ok;
+}
+
+bool w_config_parse(w_desktop_config *out, const char *s, char *err, size_t cap) {
+    return w_parse_json(out, s, err, cap, false);
+}
+
+bool w_config_merge(w_desktop_config *out, const char *s, char *err, size_t cap) {
+    return w_parse_json(out, s, err, cap, true);
 }

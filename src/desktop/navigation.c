@@ -89,11 +89,82 @@ void w_desktop_move_window(int slot, int output, int ws) {
     w_move_to(slot, output, ws, m->focus, m->spaces[output][ws].next_axis, false);
 }
 
+bool w_desktop_tile_drop(int slot, POINT point, w_rect *preview, bool commit) {
+    w_desktop_model *m = &desk.model;
+    w_model_window *source = &m->windows[slot];
+    HMONITOR monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONULL);
+    HWND hit = GetAncestor(WindowFromPoint(point), GA_ROOT);
+    int under = w_desktop_find(hit);
+    // During a native caption move Windows puts the source above its destination.
+    // During a modifier drag it stays in place, so dropping onto itself is a no-op.
+    if (under == slot && desk.windows[slot].native_move != move_dragging)
+        return false;
+    if (under >= 0 && (m->windows[under].floating || m->windows[under].fullscreen))
+        return false;
+    if (under < 0 && hit && !w_os_desktop_surface(hit))
+        return false;
+    for (int o = 0; o < output_limit; o++) {
+        if (!desk.outputs[o].live || desk.outputs[o].monitor != monitor)
+            continue;
+        RECT work = w_os_to_rect(desk.outputs[o].work);
+        if (!PtInRect(&work, point))
+            return false;
+        int ws = m->selected[o], target = -1;
+        bool occupied = false;
+        for (int i = 0; i < window_limit; i++) {
+            w_model_window *w = &m->windows[i];
+            if (i == slot || w->output != o || !w_model_visible(m, i) || w->floating || w->fullscreen ||
+                !desk.windows[i].wants_visible)
+                continue;
+            occupied = true;
+            RECT r = w_os_to_rect(w->desired);
+            if (i == under) {
+                target = i;
+                break;
+            }
+            if (PtInRect(&r, point) && (target < 0 || w->focus_order > m->windows[target].focus_order))
+                target = i;
+        }
+        if (target < 0 && (o == source->output || occupied))
+            return false;
+        int edge = -1;
+        if (target < 0)
+            *preview = desk.outputs[o].work;
+        else {
+            w_rect r = m->windows[target].desired;
+            edge = w_layout_drop_edge(r, w_clamp_int(point.x,r.x,r.x+r.w-1),
+                                      w_clamp_int(point.y,r.y,r.y+r.h-1), preview);
+        }
+        if (!commit)
+            return true;
+        desk.windows[slot].displaced_from = 0;
+        if (target < 0)
+            w_move_to(slot, o, ws, -1, m->spaces[o][ws].next_axis, false);
+        else if (edge < 0) {
+            desk.windows[target].displaced_from = 0;
+            w_model_swap(m, slot, target);
+        } else
+            w_model_insert_tile(m, slot, target, edge == dir_left || edge == dir_right ? split_x : split_y,
+                                edge == dir_left || edge == dir_up);
+        if (m->focus >= 0 && (m->focus == slot || m->focus == target))
+            w_model_focus(m, m->focus);
+        w_desktop_schedule();
+        return true;
+    }
+    return false;
+}
+
+void w_desktop_drop_tile(int slot, POINT point) {
+    w_rect preview;
+    w_desktop_tile_drop(slot, point, &preview, true);
+}
+
 void w_desktop_toggle_fullscreen(int slot) {
     w_model_window *w = &desk.model.windows[slot];
     bool enable = !w->fullscreen;
     w_clear_fullscreen(w->output, w->workspace);
     w->fullscreen = enable;
+    w_desktop_stack_floats(slot,true);
 }
 
 static void w_transfer(int slot, int output, int anchor, enum direction dir) {

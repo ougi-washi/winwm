@@ -19,7 +19,7 @@ static int w_format_module(w_bar_window *b, const char *key, wchar_t *s, int cap
         wcscpy(s, L"Run");
         strcpy(action, "launcher");
     } else if (!strcmp(key, "bluetooth")) {
-        wcscpy(s, L"Bluetooth");
+        wcscpy(s, L"Bluetooth devices");
         strcpy(action, "bluetooth");
     } else if (!strcmp(key, "audio")) {
         if (b->audio_percent < 0)
@@ -31,7 +31,7 @@ static int w_format_module(w_bar_window *b, const char *key, wchar_t *s, int cap
         strcpy(action, "switcher");
     } else if (!strcmp(key, "mode")) {
         wcscpy(s, b->view.resize_mode ? L"RESIZE" : b->view.inhibit ? L"AWAKE" : L"");
-        strcpy(action, "resize_mode");
+        strcpy(action, b->view.resize_mode ? "resize_mode" : "idle_inhibit");
     } else if (!strcmp(key, "clock")) {
         SYSTEMTIME t;
         GetLocalTime(&t);
@@ -43,15 +43,17 @@ static int w_format_module(w_bar_window *b, const char *key, wchar_t *s, int cap
     } else if (!strcmp(key, "battery")) {
         SYSTEM_POWER_STATUS p;
         if (GetSystemPowerStatus(&p) && p.BatteryFlag != 128 && p.BatteryLifePercent <= 100)
-            swprintf(s, cap, L"%u%% %ls", p.BatteryLifePercent, p.ACLineStatus == 1 ? L"AC" : L"BAT");
-        strcpy(action, "settings");
+            swprintf(s, cap, L"%u%%  %ls", p.BatteryLifePercent, p.ACLineStatus == 1 ? L"Plugged in" : L"On battery");
+        else
+            wcscpy(s, L"Power");
+        strcpy(action, "power_settings");
     } else if (!strcmp(key, "keyboard")) {
-        HKL lang = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), NULL));
+        HKL lang = GetKeyboardLayout(GetWindowThreadProcessId(w_bar_input_target(), NULL));
         if (GetLocaleInfoW(LOWORD((uintptr_t)lang), LOCALE_SISO639LANGNAME, s, cap))
             CharUpperBuffW(s, (DWORD)wcslen(s));
         else
             wcscpy(s, L"KB");
-        strcpy(action, "shortcuts");
+        strcpy(action, "languages");
     } else if (!strcmp(key, "memory")) {
         MEMORYSTATUSEX ms = {.dwLength = sizeof(ms)};
         if (GlobalMemoryStatusEx(&ms))
@@ -66,7 +68,7 @@ typedef struct w_bar_cell {
     wchar_t text[256], tooltip[256];
     const w_module_style *style;
     char action[128], key[56];
-    int width;
+    int width, workspace;
     bar_icon icon;
     bool active, empty;
 } w_bar_cell;
@@ -102,6 +104,7 @@ static void w_measure(w_bar_window *b, HDC dc, const char *spec, bool vertical, 
             w_bar_cell *cell = &cells[used];
             *cell = (w_bar_cell){0};
             if (spaces) {
+                cell->workspace = j+1;
                 if (j >= 5 && j != b->view.selected && !(b->view.occupied & (1 << j)))
                     continue;
                 if (!b->config->workspace_names[j][0] ||
@@ -115,7 +118,7 @@ static void w_measure(w_bar_window *b, HDC dc, const char *spec, bool vertical, 
             cell->style = style;
             wcscpy(cell->tooltip, cell->text);
             if (!strcmp(base, "keyboard")) {
-                HKL layout = GetKeyboardLayout(GetWindowThreadProcessId(GetForegroundWindow(), NULL));
+                HKL layout = GetKeyboardLayout(GetWindowThreadProcessId(w_bar_input_target(), NULL));
                 GetLocaleInfoW(LOWORD((uintptr_t)layout), LOCALE_SLOCALIZEDDISPLAYNAME, cell->tooltip,
                                count_of(cell->tooltip));
             } else if (!strcmp(base, "clock")) {
@@ -162,6 +165,12 @@ static void w_measure(w_bar_window *b, HDC dc, const char *spec, bool vertical, 
                         cell->icon = icons[k].icon;
                         if (cell->icon == icon_audio && (b->audio_muted || b->audio_percent < 0))
                             cell->icon = icon_muted;
+                        else if (cell->icon == icon_audio && b->audio_percent < 50)
+                            cell->icon = icon_quiet;
+                        if (cell->icon == icon_battery && !wcscmp(cell->text, L"Power"))
+                            cell->icon = icon_plug;
+                        if (cell->icon == icon_network)
+                            cell->icon = b->network_icon ? b->network_icon : icon_network;
                         break;
                     }
             }
@@ -188,7 +197,40 @@ static COLORREF w_mix(uint32_t base, uint32_t overlay, int percent) {
                ((base & 255) * a + (overlay & 255) * percent) / 100);
 }
 
+static COLORREF w_blend(COLORREF a, COLORREF b, double t) {
+    return RGB(GetRValue(a)+(int)((GetRValue(b)-GetRValue(a))*t),
+               GetGValue(a)+(int)((GetGValue(b)-GetGValue(a))*t),
+               GetBValue(a)+(int)((GetBValue(b)-GetBValue(a))*t));
+}
+
+static void w_cell_colors(w_bar_window *b, struct w_bar_hit *hit, const w_bar_cell *cell,
+                          COLORREF paper, COLORREF ink, uint64_t now) {
+    w_transition timing = b->config->motion[motion_modules];
+    bool animate = b->motion_allowed && timing.ms && !strcmp(hit->module,cell->key) &&
+                   hit->workspace == cell->workspace && hit->style == cell->style;
+    if (animate && (paper != hit->target_paper || ink != hit->target_ink)) {
+        hit->from_paper = hit->paper;
+        hit->from_ink = hit->ink;
+        if (!b->modules_ticking)
+            b->modules_ticking = SetTimer(b->hwnd,bar_modules_timer,16,NULL) != 0;
+        hit->start = b->modules_ticking ? now : 0;
+    }
+    hit->target_paper = paper;
+    hit->target_ink = ink;
+    if (animate && hit->start && now-hit->start < (unsigned)timing.ms) {
+        double t = w_motion_progress(timing, now-hit->start);
+        t = t < 0 ? 0 : t > 1 ? 1 : t;
+        hit->paper = w_blend(hit->from_paper,paper,t);
+        hit->ink = w_blend(hit->from_ink,ink,t);
+    } else {
+        hit->start = 0;
+        hit->paper = paper;
+        hit->ink = ink;
+    }
+}
+
 static void w_draw_group(w_bar_window *b, HDC dc, RECT r, const w_bar_group *g, bool vertical, int pos, int end) {
+    uint64_t now = GetTickCount64();
     for (int i = 0; i < g->count && pos < end; i++) {
         const w_bar_cell *cell = &g->cells[i];
         RECT box = r;
@@ -199,10 +241,16 @@ static void w_draw_group(w_bar_window *b, HDC dc, RECT r, const w_bar_group *g, 
             box.left = pos;
             box.right = min(end, pos + cell->width);
         }
-        COLORREF paper = w_rgb_value(b->config->background);
-        if (cell->active || b->hover == b->hit_count) {
-            paper = cell->active ? w_rgb_value(b->config->accent)
-                                 : w_mix(b->config->background, b->config->foreground, 12);
+        struct w_bar_hit *hit = &b->hits[b->hit_count];
+        COLORREF background = w_rgb_value(b->config->background);
+        bool hovered = b->pointer_inside && PtInRect(&box,b->pointer);
+        COLORREF paper = cell->active ? w_rgb_value(b->config->accent)
+                         : hovered ? w_mix(b->config->background,b->config->foreground,12) : background;
+        uint32_t ink = cell->active ? b->config->background :
+                       cell->style && cell->style->colored ? cell->style->color : b->config->foreground;
+        w_cell_colors(b,hit,cell,paper,cell->empty ? w_mix(b->config->background,ink,55) : w_rgb_value(ink),now);
+        paper = hit->paper;
+        if (paper != background) {
             SetDCBrushColor(dc, paper);
             RECT pill = box;
             InflateRect(&pill, -2, -MulDiv(5, b->dpi, 96));
@@ -212,10 +260,7 @@ static void w_draw_group(w_bar_window *b, HDC dc, RECT r, const w_bar_group *g, 
             SelectObject(dc, brush);
             SelectObject(dc, pen);
         }
-        uint32_t ink = cell->active                          ? b->config->background
-                       : cell->style && cell->style->colored ? cell->style->color
-                                                             : b->config->foreground;
-        SetTextColor(dc, cell->empty ? w_mix(b->config->background, ink, 55) : w_rgb_value(ink));
+        SetTextColor(dc, hit->ink);
         SelectObject(dc, b->font);
         UINT flags = DT_CENTER | DT_NOPREFIX;
         if (!wcschr(cell->text, L'\n'))
@@ -225,6 +270,7 @@ static void w_draw_group(w_bar_window *b, HDC dc, RECT r, const w_bar_group *g, 
         else
             DrawTextW(dc, cell->text, -1, &box, flags);
         if (b->hit_count < (int)count_of(b->hits)) {
+            hit->workspace = cell->workspace;
             strcpy(b->hits[b->hit_count].module, cell->key);
             b->hits[b->hit_count].style = cell->style;
             wcscpy(b->hits[b->hit_count].tooltip, cell->tooltip);
@@ -332,16 +378,45 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return DefWindowProcW(w, msg, wp, lp);
     if (msg == WM_PAINT)
         return w_paint_bar(b, w);
-    if (msg == WM_SHOWWINDOW && !wp)
+    if (msg == WM_TIMER && wp == bar_modules_timer) {
+        bool active = false;
+        for (int i = 0; i < b->hit_count; i++)
+            if (b->hits[i].start) {
+                active = true;
+                InvalidateRect(w,&b->hits[i].box,FALSE);
+            }
+        if (!active) {
+            KillTimer(w,bar_modules_timer);
+            b->modules_ticking = false;
+        }
+        return 0;
+    }
+    if (msg == WM_TIMER && wp == bar_fade_timer) {
+        if (b->fade.start && !w_bar_fade_tick(w,&b->fade,b->motion_allowed) && !b->fade.target)
+            ShowWindow(w,SW_HIDE);
+        return 0;
+    }
+    if (msg == WM_SHOWWINDOW && !wp) {
+        KillTimer(w,bar_modules_timer);
+        KillTimer(w,bar_fade_timer);
+        b->modules_ticking = b->pointer_inside = false;
+        b->fade = (w_layer_fade){0};
+        b->hover = -1;
+        b->hit_count = 0;
+        memset(b->hits,0,sizeof(b->hits));
         w_bar_menu_close(b, true);
+    }
     if (msg == WM_MOUSEMOVE && !b->pressed) {
         POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        b->pointer = p;
+        b->pointer_inside = true;
         TRACKMOUSEEVENT track = {sizeof(track), TME_LEAVE, w, 0};
         TrackMouseEvent(&track);
         w_hover(b, w_hit_at(b, p));
         return 0;
     }
     if (msg == WM_MOUSELEAVE) {
+        b->pointer_inside = false;
         w_hover(b, -1);
         return 0;
     }
@@ -397,6 +472,10 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         ScreenToClient(w, &p);
         int hit = w_hit_at(b, p);
+        POINT start = b->press;
+        ScreenToClient(w, &start);
+        if (hit != w_hit_at(b, start))
+            return 0;
         bool custom_action = hit >= 0 && b->hits[hit].style && *b->hits[hit].style->action;
         if (hit >= 0 && !custom_action && w_bar_menu_open(b, hit))
             return 0;
@@ -413,10 +492,22 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     }
     if (msg == WM_MBUTTONUP || msg == WM_RBUTTONUP) {
         int hit = w_hit_at(b, (POINT){GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
-        if (hit >= 0 && !strcmp(b->hits[hit].module, "audio"))
-            b->invoke(b->output, "mute");
-        else if (hit >= 0 && msg == WM_RBUTTONUP && !strcmp(b->hits[hit].module, "menu"))
-            b->invoke(b->output, "settings");
+        if (hit < 0)
+            return 0;
+        const char *key = b->hits[hit].module, *action = NULL;
+        if (!strcmp(key, "audio"))
+            action = "mute";
+        else if (msg == WM_RBUTTONUP) {
+            if (!strcmp(key, "keyboard")) action = "languages";
+            else if (!strcmp(key, "menu")) action = "settings";
+            else if (!strcmp(key, "clock")) action = "date_time";
+            else if (!strcmp(key, "battery")) action = "power_settings";
+            else if (!strcmp(key, "network") || !strcmp(key, "throughput")) action = "network_settings";
+        }
+        if (action) {
+            w_bar_menu_close(NULL, true);
+            b->invoke(b->output, action);
+        }
         return 0;
     }
     if (msg == WM_MOUSEWHEEL) {
@@ -426,6 +517,10 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (hit < 0)
             return 0;
         int delta = GET_WHEEL_DELTA_WPARAM(wp);
+        if (b->wheel_hit != hit) {
+            b->wheel_remainder = 0;
+            b->wheel_hit = hit;
+        }
         b->wheel_remainder += delta;
         int steps = b->wheel_remainder / WHEEL_DELTA;
         b->wheel_remainder %= WHEEL_DELTA;
@@ -444,6 +539,8 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             snprintf(select, sizeof(select), "workspace_select %d",
                      (ws + workspace_limit) % workspace_limit + 1);
             b->invoke(b->output, select);
+        } else if (!strcmp(b->hits[hit].module, "keyboard")) {
+            w_bar_cycle_layout(-steps);
         }
         return 0;
     }
@@ -467,7 +564,7 @@ bool w_bar_create(w_bar_window *b, int output, const w_desktop_config *cfg, bar_
     b->config = cfg;
     b->output = output;
     b->invoke = invoke;
-    b->hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, wc.lpszClassName,
+    b->hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, wc.lpszClassName,
                               L"winwm bar", WS_POPUP, 0, 0, 1, 1, NULL, NULL, wc.hInstance, b);
     if (b->hwnd) {
         INITCOMMONCONTROLSEX controls = {sizeof(controls), ICC_WIN95_CLASSES};
@@ -487,6 +584,8 @@ bool w_bar_create(w_bar_window *b, int output, const w_desktop_config *cfg, bar_
 
 w_rect w_bar_position(w_bar_window *b, w_rect screen, int dpi, bool hidden) {
     w_rect work = screen, area = screen;
+    if (!b->hwnd)
+        return work;
     b->screen = screen;
     if (dpi != b->dpi) {
         w_icons_resize(&b->icons, dpi);
@@ -499,7 +598,14 @@ w_rect w_bar_position(w_bar_window *b, w_rect screen, int dpi, bool hidden) {
     }
     int n = MulDiv(b->config->bar_height, dpi, 96);
     if (hidden) {
-        ShowWindow(b->hwnd, SW_HIDE);
+        if (IsWindowVisible(b->hwnd) && b->fade.target) {
+            w_bar_menu_close(b,true);
+            if (GetCapture() == b->hwnd)
+                ReleaseCapture();
+            SetWindowLongPtrW(b->hwnd,GWL_EXSTYLE,GetWindowLongPtrW(b->hwnd,GWL_EXSTYLE)|WS_EX_TRANSPARENT);
+            if (!w_bar_fade(b->hwnd,&b->fade,0,b->config->motion[motion_layers_out],b->motion_allowed))
+                ShowWindow(b->hwnd,SW_HIDE);
+        }
         return work;
     }
     const char *edge = b->docked_edge ? b->docked_edge : b->config->edge;
@@ -518,14 +624,19 @@ w_rect w_bar_position(w_bar_window *b, w_rect screen, int dpi, bool hidden) {
         else
             area.y += work.h;
     }
+    if (!IsWindowVisible(b->hwnd) || !b->fade.target) {
+        SetWindowLongPtrW(b->hwnd,GWL_EXSTYLE,GetWindowLongPtrW(b->hwnd,GWL_EXSTYLE)&~(LONG_PTR)WS_EX_TRANSPARENT);
+        w_bar_fade(b->hwnd,&b->fade,255,b->config->motion[motion_layers_in],b->motion_allowed);
+    }
     SetWindowPos(b->hwnd, HWND_TOPMOST, area.x, area.y, area.w, area.h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     return work;
 }
 
 void w_bar_invalidate(w_bar_window *b, const char *module) {
-    for (int i = 0; i < b->hit_count; i++)
-        if (!strcmp(module, b->hits[i].module))
-            InvalidateRect(b->hwnd, &b->hits[i].box, FALSE);
+    // A content change can resize the cell and move its neighbours, even
+    // when the module was clipped out of the previous layout.
+    if (b->hwnd && w_config_has_module(b->config,module))
+        InvalidateRect(b->hwnd, NULL, FALSE);
 }
 
 void w_bar_update(w_bar_window *b, const w_bar_view *v) {

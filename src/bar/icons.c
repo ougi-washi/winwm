@@ -29,6 +29,12 @@ static const w_vertex chip[] = {{6, 6},   {18, 6},  {18, 18}, {6, 18},  {6, 6}, 
                               {15, 18}, {15, 21}, {-1, 0},  {3, 9},   {6, 9},  {-1, 0},  {3, 15},
                               {6, 15},  {-1, 0},  {18, 9},  {21, 9},  {-1, 0}, {18, 15}, {21, 15}};
 static const w_vertex play[] = {{7, 4}, {20, 12}, {7, 20}, {7, 4}};
+static const w_vertex plug[] = {{8, 3}, {8, 8}, {-1,0}, {16, 3}, {16, 8}, {-1,0}, {5, 8}, {19, 8},
+                                {18, 14}, {15, 17}, {9, 17}, {6, 14}, {5, 8}, {-1,0}, {12,17}, {12,22}};
+static const w_vertex ethernet[] = {{3,5},{21,5},{21,16},{17,16},{17,20},{7,20},{7,16},{3,16},{3,5},
+                                    {-1,0},{8,6},{8,10},{-1,0},{12,6},{12,10},{-1,0},{16,6},{16,10}};
+static const w_vertex offline[] = {{3,8},{7,6},{12,5},{17,6},{21,8},{-1,0},{6,12},{10,10},{14,10},
+                                   {-1,0},{10,17},{12,19},{-1,0},{3,3},{21,21}};
 
 ////////////////
 //~ Icons Functions
@@ -89,7 +95,11 @@ void w_icons_resize(w_icon_atlas *atlas, int dpi) {
                       [icon_muted] = {speaker, count_of(speaker)},
                       [icon_battery] = {battery, count_of(battery)},
                       [icon_memory] = {chip, count_of(chip)},
-                      [icon_play] = {play, count_of(play)}};
+                      [icon_play] = {play, count_of(play)},
+                      [icon_plug] = {plug, count_of(plug)},
+                      [icon_quiet] = {speaker, count_of(speaker)},
+                      [icon_ethernet] = {ethernet, count_of(ethernet)},
+                      [icon_offline] = {offline, count_of(offline)}};
         for (int i = 1; i < icon_count; ++i) {
             PatBlt(dc, 0, 0, width, width, BLACKNESS);
             w_stroke(dc, shapes[i].path, shapes[i].count, width);

@@ -46,9 +46,13 @@ class Importer:
                     if len(fields) == 3:
                         chord = fields[1].lower().replace("$mod+", "super+").replace("+return", "+enter")
                         actions = {"exec $term": "terminal", "kill": "close", "exec $menu": "launcher",
-                                   "exec brave": "launch brave", "focus right": "focus right", "lock": "lock"}
-                        if fields[2] in actions and re.fullmatch(r"(?:super|ctrl|alt|shift)(?:[+](?:super|ctrl|alt|shift))*[+](?:[a-z0-9]|enter|left|right|up|down)", chord):
-                            self.config.setdefault("bindings", {})[chord] = actions[fields[2]]
+                                   "focus right": "focus right", "lock": "lock"}
+                        action = actions.get(fields[2])
+                        executable = re.fullmatch(r"exec\s+([\w.-]+)", fields[2])
+                        if executable:
+                            action = "launch " + executable[1]
+                        if action and re.fullmatch(r"(?:super|ctrl|alt|shift)(?:[+](?:super|ctrl|alt|shift))*[+](?:[a-z0-9]|enter|left|right|up|down)", chord):
+                            self.config.setdefault("bindings", {})[chord] = action
                             continue
                     self.report(path, n, "unmapped bindsym")
                     continue
@@ -113,6 +117,8 @@ class Importer:
             action = ("focus " if dispatch == "movefocus" else "move ") + directions[arg]
         if dispatch == "exec":
             action = {"terminal": "terminal", "file_manager": "open_folder", "launcher": "launcher"}.get(arg)
+            if action is None and re.fullmatch(r"[\w.-]+",arg):
+                action = "launch " + arg
         if not action:
             self.report(path, line, f"map {dispatch} {arg} to a Windows action")
             return

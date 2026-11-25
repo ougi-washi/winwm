@@ -42,6 +42,17 @@ typedef struct w_startup_entry {
     bool once;
 } w_startup_entry;
 
+enum motion_kind {
+    motion_open, motion_move, motion_workspace, motion_border, motion_modules, motion_layers_in,
+    motion_layers_out, motion_fade_in, motion_fade_switch, motion_count
+};
+enum motion_preference { motion_off, motion_on, motion_system };
+typedef struct w_curve { double x1, y1, x2, y2; } w_curve;
+enum motion_style { style_default, style_popin, style_slide, style_slidevert, style_top, style_bottom, style_left, style_right };
+typedef struct w_transition { int ms; w_curve curve; enum motion_style style; int percent; } w_transition;
+double w_motion_progress(w_transition timing, uint64_t elapsed);
+typedef struct w_border_gradient { uint32_t end; int angle; bool enabled; } w_border_gradient;
+
 typedef struct w_desktop_config {
     w_startup_entry startup[32];
     int startup_count;
@@ -59,9 +70,15 @@ typedef struct w_desktop_config {
     char bar_left[128], bar_center[128], bar_right[128], edge[12];
     char workspace_names[workspace_limit][40];
     int gap, outer_gap, bar_height;
+    int border_size, rounding;
+    enum motion_preference animations;
+    w_transition motion[motion_count];
+    w_border_gradient active_gradient, inactive_gradient;
     unsigned char inactive_alpha;
     uint32_t inactive_border;
-    bool follow_mouse, master_default;
+    bool follow_mouse, master_default, resize_on_border;
+    unsigned drag_mods;
+    bool inverse_drag;
     uint32_t background, foreground, accent;
 } w_desktop_config;
 
@@ -74,3 +91,5 @@ bool w_config_bind(w_desktop_config *cfg, const char *chord, const char *action)
 void w_config_defaults(w_desktop_config *cfg);
 bool w_config_chord(const char *text, unsigned *mods, unsigned *key);
 bool w_config_parse(w_desktop_config *out, const char *source, char *error, size_t cap);
+bool w_config_merge(w_desktop_config *out, const char *source, char *error, size_t cap);
+bool w_config_validate_providers(const w_desktop_config *c, char *error, size_t cap);

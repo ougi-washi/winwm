@@ -323,7 +323,7 @@ static bool w_parse_file(w_config_language *lang, const wchar_t *path, char *err
         wcscpy(stack->paths[stack->depth++], path);
         const wchar_t *extension = wcsrchr(name, L'.');
         if (extension && (!_wcsicmp(extension, L".jsonc") || !_wcsicmp(extension, L".json")))
-            ok = w_config_parse(lang->config, body, err, cap);
+            ok = w_config_merge(lang->config, body, err, cap);
         else
             ok = w_config_language_parse(lang, body, err, cap);
         stack->depth--;
@@ -354,7 +354,7 @@ bool w_os_config_load(w_desktop_config *out, char *err, size_t cap) {
         lang->config = next;
         lang->source = w_include_file;
         lang->files = stack;
-        ok = w_parse_file(lang, path, err, cap);
+        ok = w_parse_file(lang, path, err, cap) && w_config_validate_providers(next, err, cap);
         if (ok) {
             *out = *next;
             if (cap)

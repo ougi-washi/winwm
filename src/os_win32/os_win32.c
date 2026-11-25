@@ -1,6 +1,7 @@
 #include "os_win32/os_win32.h"
 #include <dwmapi.h>
 #include <shellapi.h>
+#include <shlwapi.h>
 #include <evntprov.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -118,6 +119,40 @@ static bool w_launchable(const wchar_t *path) {
            !_wcsicmp(ext, L".exe") && _wcsicmp(base, L"explorer.exe");
 }
 
+static bool w_absolute_executable(const wchar_t *path, wchar_t *out, int cap) {
+    if (!(path[0] && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/')) && wcsncmp(path, L"\\\\", 2))
+        return false;
+    DWORD n = GetFullPathNameW(path, cap, out, NULL);
+    return n && n < (DWORD)cap && w_launchable(out);
+}
+
+static bool w_registered_executable(const wchar_t *name, wchar_t *out, int cap) {
+    const wchar_t *ext = wcsrchr(name,L'.');
+    if (ext && _wcsicmp(ext,L".exe"))
+        return false;
+    wchar_t key[320];
+    int len = swprintf(key,count_of(key),L"Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\%ls%ls",
+                       name,ext ? L"" : L".exe");
+    if (len < 0 || (size_t)len >= count_of(key))
+        return false;
+    const HKEY roots[] = {HKEY_CURRENT_USER,HKEY_LOCAL_MACHINE};
+    for (size_t i=0; i<count_of(roots); i++) {
+        wchar_t path[os_path_cap];
+        DWORD bytes = sizeof(path);
+        if (RegGetValueW(roots[i],key,NULL,RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ,NULL,path,&bytes) != ERROR_SUCCESS)
+            continue;
+        wchar_t *target = path;
+        size_t n = wcslen(target);
+        if (n >= 2 && target[0] == L'"' && target[n-1] == L'"') {
+            target[n-1] = 0;
+            target++;
+        }
+        if (w_absolute_executable(target,out,cap))
+            return true;
+    }
+    return false;
+}
+
 bool w_os_provider(const char *name, wchar_t *out, int cap) {
     wchar_t raw[os_path_cap], path[os_path_cap];
     if (!w_os_wide(name, raw, count_of(raw)))
@@ -125,39 +160,24 @@ bool w_os_provider(const char *name, wchar_t *out, int cap) {
     DWORD n = ExpandEnvironmentStringsW(raw, path, count_of(path));
     if (!n || n > count_of(path))
         return false;
-    if (!_wcsicmp(path, L"brave.exe")) {
-        const HKEY roots[] = {HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE};
-        for (size_t i = 0; i < count_of(roots); ++i) {
-            DWORD bytes = cap * sizeof(*out);
-            if (RegGetValueW(roots[i], L"Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\brave.exe",
-                             NULL, RRF_RT_REG_SZ, NULL, out, &bytes) == ERROR_SUCCESS &&
-                wcsrchr(out, L'\\') && !_wcsicmp(wcsrchr(out, L'\\') + 1, L"brave.exe") && w_launchable(out))
-                return true;
-        }
-        const wchar_t *locations[] = {L"%LOCALAPPDATA%", L"%ProgramFiles%", L"%ProgramFiles(x86)%"};
-        for (size_t i = 0; i < count_of(locations); ++i) {
-            const wchar_t *suffix = L"\\BraveSoftware\\Brave-Browser\\Application\\brave.exe";
-            DWORD length = ExpandEnvironmentStringsW(locations[i], out, cap);
-            if (length && length + wcslen(suffix) <= (size_t)cap && w_launchable(wcscat(out, suffix)))
-                return true;
-        }
-    }
-    if (wcschr(path, L'\\') || wcschr(path, L'/')) {
-        if (!(path[0] && path[1] == L':' && (path[2] == L'\\' || path[2] == L'/')) &&
-            wcsncmp(path, L"\\\\", 2))
-            return false;
-        n = GetFullPathNameW(path, cap, out, NULL);
-    } else {
-        wchar_t *env = calloc(32768, sizeof(wchar_t));
-        if (!env)
-            return false;
+    if (wcspbrk(path,L"\\/:"))
+        return w_absolute_executable(path,out,cap);
+    if (!*path || !_wcsicmp(path,L"explorer") || !_wcsicmp(path,L"explorer.exe"))
+        return false;
+    wchar_t *env = calloc(32768, sizeof(wchar_t));
+    if (env) {
         DWORD len = GetEnvironmentVariableW(L"PATH", env, 32768);
         n = len && len < 32768 ? SearchPathW(env, path, L".exe", cap, out, NULL) : 0;
         free(env);
+        if (n && n < (DWORD)cap && w_launchable(out))
+            return true;
     }
-    if (!n || n >= (DWORD)cap)
-        return false;
-    return w_launchable(out);
+    return w_registered_executable(path,out,cap);
+}
+
+bool w_os_task_manager(const char *name, wchar_t *out, int cap) {
+    return w_os_provider(name,out,cap) || (!_stricmp(name,"TaskSlinger.exe") &&
+           w_os_provider("%SystemRoot%\\System32\\Taskmgr.exe",out,cap));
 }
 
 // Encode a single Windows argv field, including its terminal run of backslashes.
@@ -275,6 +295,17 @@ void w_os_mark(const wchar_t *stage) {
 ////////////////
 //~ Window discovery
 
+bool w_os_keyboard_name(HKEY layouts, const wchar_t *key, wchar_t *name, DWORD count) {
+    wchar_t indirect[256];
+    DWORD bytes = sizeof(indirect);
+    if (RegGetValueW(layouts, key, L"Layout Display Name", RRF_RT_REG_SZ, NULL, indirect, &bytes) == ERROR_SUCCESS &&
+        SUCCEEDED(SHLoadIndirectString(indirect, name, count, NULL)) && *name)
+        return true;
+    bytes = count * sizeof(*name);
+    return RegGetValueW(layouts, key, L"Layout Text", RRF_RT_REG_SZ | RRF_ZEROONFAILURE,
+                        NULL, name, &bytes) == ERROR_SUCCESS && *name;
+}
+
 bool w_os_same_process(HWND w) {
     DWORD pid = 0;
     GetWindowThreadProcessId(w, &pid);
@@ -299,9 +330,27 @@ bool w_os_desktop_surface(HWND window) {
            (!wcscmp(name, L"WorkerW") || !wcscmp(name, L"Progman"));
 }
 
+// An explicitly taskbar-visible owned window is an independent app window.
+// Its dialogs stop at that window, even if its own owner is a hidden helper.
+HWND w_os_app_window(HWND w) {
+    w = GetAncestor(w, GA_ROOT);
+    while (w && !(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_APPWINDOW)) {
+        HWND owner = GetWindow(w, GW_OWNER);
+        if (!owner)
+            break;
+        w = owner;
+    }
+    return w;
+}
+
+bool w_os_cloaked(HWND w) {
+    DWORD cloaked = 0;
+    return SUCCEEDED(DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked;
+}
+
 bool w_os_candidate(HWND w) {
     if (!w || !IsWindowVisible(w) || w_os_same_process(w) || GetAncestor(w, GA_ROOT) != w ||
-        GetWindow(w, GW_OWNER) || GetPropW(w, L"winwm.ignore"))
+        w_os_app_window(w) != w || GetPropW(w, L"winwm.ignore"))
         return false;
     LONG_PTR ex = GetWindowLongPtrW(w, GWL_EXSTYLE), style = GetWindowLongPtrW(w, GWL_STYLE);
     if ((ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) || (style & WS_CHILD))
@@ -315,9 +364,7 @@ bool w_os_candidate(HWND w) {
     for (size_t i = 0; i < count_of(skip); i++)
         if (!_wcsicmp(cls, skip[i]))
             return false;
-    DWORD cloaked = 0;
-    DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
-    return !cloaked;
+    return !w_os_cloaked(w);
 }
 
 // Properties are owned by the HWND lifetime. A reused handle never inherits recovery data.
@@ -418,41 +465,54 @@ static void w_remove_dim(HWND w) {
         SetWindowLongPtrW(w, GWL_EXSTYLE, GetWindowLongPtrW(w, GWL_EXSTYLE) & ~WS_EX_LAYERED);
 }
 
-void w_os_window_appearance(HWND w, bool focused, DWORD color, BYTE alpha) {
+void w_os_window_appearance(HWND w, DWORD color, DWORD corner) {
     DWORD previous;
+    if (GetPropW(w, L"winwm.corner") ||
+        (SUCCEEDED(DwmGetWindowAttribute(w, 33, &previous, sizeof(previous))) &&
+         SetPropW(w, L"winwm.corner", (HANDLE)(uintptr_t)(previous + 1))))
+        DwmSetWindowAttribute(w, 33, &corner, sizeof(corner));
     if (GetPropW(w, L"winwm.border") ||
         (SUCCEEDED(DwmGetWindowAttribute(w, 34, &previous, sizeof(previous))) &&
          SetPropW(w, L"winwm.border", (HANDLE)(uintptr_t)((uint64_t)previous + 1))))
         DwmSetWindowAttribute(w, 34, &color, sizeof(color));
-    if (alpha == 255) {
+}
+
+bool w_os_window_opacity(HWND w, BYTE alpha, bool retain_layer) {
+    if (alpha == 255 && !retain_layer) {
         w_remove_dim(w);
-        return;
+        return true;
     }
     if (GetPropW(w, dim_prop)) {
         // Changing the extended style on every focus transition rebuilds the window's
         // redirection surface. Keep our layer and change only its opacity.
-        SetLayeredWindowAttributes(w, 0, focused ? 255 : alpha, LWA_ALPHA);
-        return;
+        return SetLayeredWindowAttributes(w, 0, alpha, LWA_ALPHA) != 0;
     }
-    if (focused)
-        return;
+    if (alpha == 255)
+        return true;
     LONG_PTR ex = GetWindowLongPtrW(w, GWL_EXSTYLE);
     if ((ex & (WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP)) ||
         (GetClassLongPtrW(w, GCL_STYLE) & (CS_OWNDC | CS_CLASSDC)))
-        return;
+        return false;
     if (SetPropW(w, dim_prop, (HANDLE)1)) {
         SetWindowLongPtrW(w, GWL_EXSTYLE, ex | WS_EX_LAYERED);
-        if (!SetLayeredWindowAttributes(w, 0, alpha, LWA_ALPHA))
-            w_remove_dim(w);
+        if (SetLayeredWindowAttributes(w, 0, alpha, LWA_ALPHA))
+            return true;
+        w_remove_dim(w);
     }
+    return false;
 }
 
 void w_os_restore(HWND w) {
-    if (!RemovePropW(w, L"winwm.managed")) {
+    if (!GetPropW(w, L"winwm.managed")) {
         w_release_visibility(w);
         return;
     }
     w_remove_dim(w);
+    HANDLE corner = RemovePropW(w, L"winwm.corner");
+    if (corner) {
+        DWORD preference = (DWORD)((uintptr_t)corner - 1);
+        DwmSetWindowAttribute(w, 33, &preference, sizeof(preference));
+    }
     HANDLE border = RemovePropW(w, L"winwm.border");
     if (border) {
         DWORD color = (DWORD)((uintptr_t)border - 1);
@@ -460,12 +520,37 @@ void w_os_restore(HWND w) {
     }
     int v[4];
     for (int i = 0; i < 4; i++)
-        v[i] = (int)((uintptr_t)RemovePropW(w, coords[i]) - 1);
-    if (!IsIconic(w) && !IsZoomed(w))
-        SetWindowPos(w, NULL, v[0], v[1], v[2], v[3], SWP_ASYNCWINDOWPOS | SWP_NOZORDER | SWP_NOACTIVATE);
+        v[i] = (int)((uintptr_t)GetPropW(w, coords[i]) - 1);
+    bool zoomed = GetPropW(w, L"winwm.zoomed") != NULL;
+    bool iconic = IsIconic(w) != 0;
+    bool visible = IsWindowVisible(w) || w_os_shell_hidden(w);
+    bool restored;
+    if (iconic || IsZoomed(w) || (visible && zoomed)) {
+        WINDOWPLACEMENT placement = {.length = sizeof(placement)};
+        RECT normal = {v[0], v[1], v[0]+v[2], v[1]+v[3]};
+        MONITORINFO mon = {.cbSize = sizeof(mon)};
+        restored = GetWindowPlacement(w, &placement) &&
+                   GetMonitorInfoW(MonitorFromRect(&normal, MONITOR_DEFAULTTONEAREST), &mon);
+        if (restored) {
+            // WINDOWPLACEMENT uses workspace coordinates for managed top-level windows.
+            OffsetRect(&normal, mon.rcMonitor.left-mon.rcWork.left, mon.rcMonitor.top-mon.rcWork.top);
+            placement.rcNormalPosition = normal;
+            placement.flags |= WPF_ASYNCWINDOWPLACEMENT;
+            placement.showCmd = !visible ? SW_HIDE : iconic ? SW_SHOWMINNOACTIVE : SW_SHOWMAXIMIZED;
+            if (iconic && zoomed)
+                placement.flags |= WPF_RESTORETOMAXIMIZED;
+            restored = SetWindowPlacement(w, &placement) != 0;
+        }
+    } else
+        restored = SetWindowPos(w, NULL, v[0], v[1], v[2], v[3],
+                                SWP_ASYNCWINDOWPOS | SWP_NOZORDER | SWP_NOACTIVATE) != 0;
     w_release_visibility(w);
-    if (RemovePropW(w, L"winwm.zoomed"))
-        ShowWindowAsync(w, SW_SHOWMAXIMIZED);
+    if (restored) {
+        for (int i = 0; i < 4; i++)
+            RemovePropW(w, coords[i]);
+        RemovePropW(w, L"winwm.zoomed");
+        RemovePropW(w, L"winwm.managed");
+    }
 }
 
 static BOOL CALLBACK w_restore_one(HWND w, LPARAM arg) {

@@ -15,20 +15,34 @@ static COLORREF w_color(uint32_t rgb) {
     return RGB(rgb >> 16, rgb >> 8, rgb);
 }
 
+static COLORREF w_tint(COLORREF a, COLORREF b, int percent) {
+    return RGB((GetRValue(a)*(100-percent) + GetRValue(b)*percent)/100,
+               (GetGValue(a)*(100-percent) + GetGValue(b)*percent)/100,
+               (GetBValue(a)*(100-percent) + GetBValue(b)*percent)/100);
+}
+
 HBRUSH w_theme_brush(void) {
     if (!brush)
         brush = CreateSolidBrush(surface);
     return brush;
 }
 
+COLORREF w_theme_separator(void) {
+    return w_tint(surface, active, 55);
+}
+
 void w_theme_colors(uint32_t background, uint32_t foreground, uint32_t accent) {
-    if (w_color(background) != surface && brush) {
+    HIGHCONTRASTW hc = {.cbSize = sizeof(hc)};
+    SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(hc), &hc, 0);
+    bool contrast = (hc.dwFlags & HCF_HIGHCONTRASTON) != 0;
+    COLORREF next = contrast ? GetSysColor(COLOR_WINDOW) : w_color(background);
+    if (next != surface && brush) {
         DeleteObject(brush);
         brush = NULL;
     }
-    surface = w_color(background);
-    ink = w_color(foreground);
-    active = w_color(accent);
+    surface = next;
+    ink = contrast ? GetSysColor(COLOR_WINDOWTEXT) : w_color(foreground);
+    active = contrast ? GetSysColor(COLOR_HIGHLIGHT) : w_color(accent);
 }
 
 void w_theme_rich_edit(HWND edit) {
@@ -42,6 +56,13 @@ bool w_theme_message(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT *result) {
     if (msg == WM_CREATE) {
         BOOL enabled = TRUE;
         DwmSetWindowAttribute(w, 20, &enabled, sizeof(enabled));
+    } else if (msg == WM_ACTIVATE) {
+        COLORREF edge = LOWORD(wp) == WA_INACTIVE ? w_tint(surface, ink, 24) : active;
+        DwmSetWindowAttribute(w, 34, &edge, sizeof(edge));
+    } else if (msg == WM_MEASUREITEM && ((MEASUREITEMSTRUCT *)lp)->CtlType == ODT_LISTBOX) {
+        ((MEASUREITEMSTRUCT *)lp)->itemHeight = MulDiv(30, GetDpiForWindow(w), 96);
+        *result = TRUE;
+        return true;
     } else if (msg == WM_ERASEBKGND) {
         RECT r;
         GetClientRect(w, &r);
@@ -55,16 +76,49 @@ bool w_theme_message(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT *result) {
         return true;
     } else if (msg == WM_DRAWITEM) {
         DRAWITEMSTRUCT *item = (DRAWITEMSTRUCT *)lp;
+        if (item->CtlType == ODT_LISTBOX) {
+            RECT row = item->rcItem;
+            bool selected = (item->itemState & ODS_SELECTED) != 0;
+            HDC dc = item->hDC;
+            SetDCBrushColor(dc, selected ? w_tint(surface, active, 24) : surface);
+            FillRect(dc, &row, GetStockObject(DC_BRUSH));
+            if (selected) {
+                RECT mark = row;
+                mark.right = mark.left + MulDiv(3, GetDpiForWindow(w), 96);
+                SetDCBrushColor(dc, active);
+                FillRect(dc, &mark, GetStockObject(DC_BRUSH));
+            }
+            wchar_t label[2048];
+            LRESULT n = SendMessageW(item->hwndItem, LB_GETTEXTLEN, item->itemID, 0);
+            if (n >= 0 && n < (LRESULT)count_of(label) &&
+                SendMessageW(item->hwndItem, LB_GETTEXT, item->itemID, (LPARAM)label) != LB_ERR) {
+                InflateRect(&row, -MulDiv(12, GetDpiForWindow(w), 96), 0);
+                SetBkMode(dc, TRANSPARENT);
+                SetTextColor(dc, ink);
+                DrawTextW(dc, label, -1, &row, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+            }
+            *result = TRUE;
+            return true;
+        }
         if (item->CtlType != ODT_BUTTON)
             return false;
         wchar_t text[96];
         GetWindowTextW(item->hwndItem, text, count_of(text));
-        bool selected = (item->itemState & (ODS_SELECTED | ODS_FOCUS)) != 0;
-        SetDCBrushColor(item->hDC, selected ? active : RGB(41, 46, 66));
-        FillRect(item->hDC, &item->rcItem, (HBRUSH)GetStockObject(DC_BRUSH));
+        bool pressed = (item->itemState & ODS_SELECTED) != 0;
+        bool focused = (item->itemState & ODS_FOCUS) != 0;
+        RECT box = item->rcItem;
+        FillRect(item->hDC, &box, w_theme_brush());
+        int saved = SaveDC(item->hDC);
+        SelectObject(item->hDC, GetStockObject(DC_BRUSH));
+        SelectObject(item->hDC, GetStockObject(DC_PEN));
+        SetDCBrushColor(item->hDC, pressed ? active : w_tint(surface, focused ? active : ink, 11));
+        SetDCPenColor(item->hDC, pressed || focused ? active : w_tint(surface, ink, 28));
+        int curve = MulDiv(9, GetDpiForWindow(w), 96);
+        RoundRect(item->hDC, box.left, box.top, box.right, box.bottom, curve, curve);
         SetBkMode(item->hDC, TRANSPARENT);
-        SetTextColor(item->hDC, selected ? surface : ink);
+        SetTextColor(item->hDC, (item->itemState & ODS_DISABLED) ? GetSysColor(COLOR_GRAYTEXT) : pressed ? surface : ink);
         DrawTextW(item->hDC, text, -1, &item->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+        RestoreDC(item->hDC, saved);
         *result = TRUE;
         return true;
     }

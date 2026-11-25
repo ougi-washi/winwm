@@ -13,6 +13,7 @@ w_desktop_state desk;
 static bool event_overflow, preview_mode, loaded_programs;
 static int pending_events;
 static UINT shell_notification;
+enum { discovery_timer = 29 };
 
 ////////////////
 //~ Desktop Functions
@@ -65,6 +66,7 @@ void w_desktop_schedule(void) {
 }
 
 void w_desktop_bind(void) {
+    w_effects_preferences();
     w_theme_colors(desk.config.background, desk.config.foreground, desk.config.accent);
     w_input_bind(desk.root, msg_command, msg_hover, preview_mode ? 0 : msg_desktop_menu,
                &desk.config, desk.registered, w_desktop_drag);
@@ -77,13 +79,14 @@ static void CALLBACK w_observe(HWINEVENTHOOK hook, DWORD event, HWND w, LONG obj
     (void)time;
     if (event == EVENT_SYSTEM_DESKTOPSWITCH) {
         w_input_reset();
+        PostMessageW(desk.root, msg_window, event, 0);
         return;
     }
     if (!w || obj != OBJID_WINDOW || child != CHILDID_SELF)
         return;
     if (event >= EVENT_OBJECT_CREATE && event != EVENT_OBJECT_CREATE && event != EVENT_OBJECT_DESTROY &&
         event != EVENT_OBJECT_SHOW && event != EVENT_OBJECT_HIDE && event != EVENT_OBJECT_LOCATIONCHANGE &&
-        event != EVENT_OBJECT_NAMECHANGE)
+        event != EVENT_OBJECT_NAMECHANGE && event != EVENT_OBJECT_CLOAKED && event != EVENT_OBJECT_UNCLOAKED)
         return;
     if (pending_events >= 512) {
         event_overflow = true;
@@ -114,12 +117,16 @@ static void w_discover_initial(void) {
                         {EVENT_SYSTEM_DESKTOPSWITCH, EVENT_SYSTEM_DESKTOPSWITCH},
                         {EVENT_SYSTEM_MINIMIZESTART, EVENT_SYSTEM_MINIMIZEEND},
                         {EVENT_OBJECT_CREATE, EVENT_OBJECT_HIDE},
-                        {EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE}};
+                        {EVENT_OBJECT_LOCATIONCHANGE, EVENT_OBJECT_NAMECHANGE},
+                        {EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED}};
+    _Static_assert(count_of(range) == count_of(desk.hooks), "window hook storage");
     for (size_t i = 0; i < count_of(range); i++) {
         desk.hooks[i] = SetWinEventHook(range[i][0], range[i][1], NULL, w_observe, 0, 0,
                                         WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
-        if (!desk.hooks[i])
+        if (!desk.hooks[i]) {
             w_desktop_notice("Window event hook unavailable");
+            SetTimer(desk.root, discovery_timer, 2000, NULL);
+        }
     }
     w_os_restore_all();
     w_desktop_scan();
@@ -143,7 +150,8 @@ static void w_initialize(void) {
     w_desktop_outputs();
     if (!preview_mode && !QueueUserWorkItem(w_handoff_explorer, desk.root, WT_EXECUTEDEFAULT))
         explorer_status = GetLastError();
-    desk.ipc_live = w_ipc_start(desk.channels);
+    wchar_t pipe_name[96];
+    desk.ipc_live = w_ipc_name(pipe_name, count_of(pipe_name)) && w_ipc_start(desk.channels, pipe_name);
     if (!desk.ipc_live)
         w_desktop_notice("Control pipe unavailable");
     w_desktop_load();
@@ -185,9 +193,12 @@ void w_desktop_request(const char *s, char *reply, size_t cap) {
     } else if (!strcmp(s, "doctor")) {
         int n = snprintf(
             reply, cap,
-            "desktop protocol 1\nwindow events: %s\nfile browser: %s\ntask manager: %s\nlast message: %s\n",
+            "desktop protocol 1\nwindow events: %s\nfile browser: %s\ntask manager: %s\nlast message: %s\n"
+            "animations: %s (%s)\nborder width: %d DIP\n",
             desk.ready ? "initialized" : "starting", desk.config.file_browser, desk.config.task_manager,
-            desk.status);
+            desk.status, desk.motion_allowed ? "on" : "off",
+            desk.config.animations == motion_system ? "follow Windows" : "winwm preference",
+            desk.borders_hidden ? 0 : desk.config.border_size);
         wchar_t policy[os_path_cap];
         DWORD bytes = sizeof(policy);
         LSTATUS policy_status =
@@ -232,9 +243,14 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     if (shell_notification && msg == shell_notification) {
         if (wp == HSHELL_LANGUAGE)
             w_invalidate_language();
+        else if (desk.ready && wp == HSHELL_WINDOWCREATED)
+            w_desktop_event((HWND)lp, EVENT_OBJECT_SHOW);
         return 0;
     }
     switch (msg) {
+    case WM_INPUT:
+        w_input_mouse_motion();
+        return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_INPUTLANGCHANGE:
         w_invalidate_language();
         return DefWindowProcW(hwnd, msg, wp, lp);
@@ -254,6 +270,21 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         w_desktop_hover(p);
         return 0;
     }
+    case msg_pointer_select: {
+        w_window_id id = {(int)wp, (uint32_t)lp};
+        if (w_model_valid(&desk.model, id) && w_model_visible(&desk.model, id.slot))
+            w_desktop_activate(id.slot);
+        return 0;
+    }
+    case msg_drag_preview:
+        w_desktop_drag_preview();
+        return 0;
+    case WM_CANCELMODE:
+        w_input_cancel_pointer();
+        return 0;
+    case msg_drag_limits:
+        w_desktop_drag_limits((w_window_id){(int)wp, (uint32_t)lp});
+        return 0;
     case msg_command:
         if ((DWORD)(uintptr_t)GetPropW(hwnd, L"winwm.binding_generation") == (DWORD)lp &&
             wp < (WPARAM)desk.config.binding_count)
@@ -334,6 +365,10 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         free((void *)lp);
         return 0;
     case msg_window:
+        if (wp == EVENT_SYSTEM_DESKTOPSWITCH) {
+            w_desktop_scan();
+            return 0;
+        }
         pending_events--;
         w_desktop_event((HWND)lp, (DWORD)wp);
         if (wp == EVENT_SYSTEM_FOREGROUND)
@@ -351,7 +386,20 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         if (desk.ready)
             w_desktop_outputs();
         return 0;
+    case WM_SETTINGCHANGE:
+        w_effects_preferences();
+        w_theme_colors(desk.config.background, desk.config.foreground, desk.config.accent);
+        w_desktop_schedule();
+        return 0;
     case WM_TIMER:
+        if (wp == animation_timer) {
+            w_effects_tick();
+            return 0;
+        }
+        if (wp == discovery_timer) {
+            w_desktop_scan();
+            return 0;
+        }
         if (wp == 28) {
             w_desktop_status_sample();
             return 0;
@@ -424,17 +472,23 @@ int w_session_run(HINSTANCE instance, bool preview) {
     PostMessageW(desk.root, msg_init, 0, 0);
     int result = 0;
     for (;;) {
-        HANDLE handles[ipc_slots];
-        DWORD count = desk.ipc_live ? ipc_slots : 0;
-        for (DWORD i = 0; i < count; i++)
-            handles[i] = desk.channels[i].event;
+        HANDLE handles[2*ipc_slots];
+        DWORD count = desk.ipc_live ? count_of(handles) : 0;
+        for (DWORD i = 0; i < count / 2; i++) {
+            handles[2*i] = desk.channels[i].peer_event;
+            handles[2*i+1] = desk.channels[i].event;
+        }
         DWORD wait = MsgWaitForMultipleObjectsEx(count, handles, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         if (wait == WAIT_FAILED) {
             result = 4;
             break;
         }
-        if (wait < count)
-            w_ipc_pump(&desk.channels[wait], w_desktop_request);
+        if (wait < count) {
+            if (wait % 2)
+                w_ipc_pump(desk.channels, (int)(wait/2), w_desktop_request);
+            else
+                w_ipc_disconnect(&desk.channels[wait/2]);
+        }
         MSG message;
         for (int i = 0; i < 64 && PeekMessageW(&message, NULL, 0, 0, PM_REMOVE); i++) {
             if (message.message == WM_QUIT) {
@@ -448,6 +502,9 @@ int w_session_run(HINSTANCE instance, bool preview) {
         }
     }
 done:
+    KillTimer(desk.root, animation_timer);
+    for (int i = 0; i < window_limit; i++)
+        w_effects_hide(i);
     for (size_t i = 0; i < count_of(desk.hooks); i++)
         if (desk.hooks[i])
             UnhookWinEvent(desk.hooks[i]);

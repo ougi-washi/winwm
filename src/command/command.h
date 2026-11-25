@@ -10,7 +10,9 @@
                             x(rescue) x(edit_config) x(audio) x(wifi) x(bluetooth) x(display) x(wallpaper)   \
                                 x(sleep) x(restart) x(capture_window) x(capture_region) x(record)            \
                                     x(confirm_sign_out) x(focus_mode_toggle) x(set_mode) x(resize_by)        \
-                                        x(program) x(workspace_follow)
+                                        x(program) x(workspace_follow) x(volume_set) x(volume_mixer)        \
+                                            x(languages) x(keyboard_settings) x(power_settings) x(date_time) \
+                                                x(network_settings) x(animations_toggle) x(borders_toggle) x(animations_system)
 #define command_enum(name) cmd_##name,
 enum command_kind { cmd_invalid, command_list(command_enum) cmd_count };
 

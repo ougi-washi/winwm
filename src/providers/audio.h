@@ -15,4 +15,5 @@ typedef struct w_audio_state {
 bool w_audio_start(HWND owner, UINT changed);
 w_audio_state w_audio_read(void);
 bool w_audio_adjust(int delta); /* Zero toggles mute. */
+bool w_audio_set_percent(int percent);
 void w_audio_stop(void);

@@ -1,18 +1,56 @@
 #include "theme/theme.h"
 #include "palette/palette.h"
 #include <richedit.h>
+#include <commctrl.h>
+#include <windowsx.h>
 #include <usp10.h>
+#include <shellscalingapi.h>
+#include <uxtheme.h>
 #include <wctype.h>
 enum { check_deactivation = WM_APP + 1, restore_foreground };
 
 ////////////////
 //~ Palette
 
-static HWND panel, edit, list, return_to, pending_restore;
+static HWND panel, search_label, edit, list, return_to, pending_restore;
 static HMODULE edit_library;
+static HFONT text_font;
+static UINT palette_dpi;
 static w_palette_entry rows[palette_limit];
 static int row_count;
+static int pressed_result = -1;
 static palette_callback select_entry;
+
+static void w_palette_size(void) {
+    if (!edit || !list)
+        return;
+    UINT dpi = GetDpiForWindow(panel);
+    if (!dpi)
+        dpi = 96;
+    if (dpi != palette_dpi) {
+        HFONT font = CreateFontW(-MulDiv(15, dpi, 96), 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                 DEFAULT_CHARSET, 0, 0, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+        if (font) {
+            SendMessageW(edit, WM_SETFONT, (WPARAM)font, TRUE);
+            SendMessageW(list, WM_SETFONT, (WPARAM)font, TRUE);
+            SendMessageW(search_label, WM_SETFONT, (WPARAM)font, TRUE);
+            DeleteObject(text_font);
+            text_font = font;
+            palette_dpi = dpi;
+        }
+        SendMessageW(list, LB_SETITEMHEIGHT, 0, MulDiv(30, dpi, 96));
+    }
+    RECT r;
+    GetClientRect(panel, &r);
+    int pad = MulDiv(10, dpi, 96), field = MulDiv(28, dpi, 96), top = 2*pad + field;
+    int width = max(1, r.right - 2*pad);
+    int label_width = MulDiv(56, dpi, 96);
+    MoveWindow(search_label, 2*pad, pad, label_width, field, TRUE);
+    MoveWindow(edit, 2*pad + label_width, pad + MulDiv(5, dpi, 96), max(1, width - label_width - 2*pad),
+               field - MulDiv(6, dpi, 96), TRUE);
+    MoveWindow(list, pad, top, width, max(1, r.bottom - top - pad), TRUE);
+    InvalidateRect(panel, NULL, TRUE);
+}
 
 ////////////////
 //~ Window matching
@@ -27,6 +65,7 @@ static bool w_matches(const wchar_t *s, const wchar_t *q) {
 }
 
 static void w_filter(void) {
+    pressed_result = -1;
     wchar_t q[palette_text_capacity];
     GetWindowTextW(edit, q, count_of(q));
     SendMessageW(list, WM_SETREDRAW, FALSE, 0);
@@ -88,6 +127,33 @@ static void w_accept(void) {
         cb(id);
 }
 
+static LRESULT CALLBACK w_results_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR subclass, DWORD_PTR data) {
+    (void)subclass;
+    (void)data;
+    if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP) {
+        POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        LRESULT hit = SendMessageW(w, LB_ITEMFROMPOINT, 0, lp);
+        int index = LOWORD(hit), id = -1;
+        RECT item;
+        if (!HIWORD(hit) && SendMessageW(w, LB_GETITEMRECT, index, (LPARAM)&item) != LB_ERR && PtInRect(&item, p))
+            id = (int)SendMessageW(w, LB_GETITEMDATA, index, 0);
+        if (msg == WM_LBUTTONDOWN)
+            pressed_result = id;
+        else {
+            bool pick = id >= 0 && pressed_result == id;
+            LRESULT result = DefSubclassProc(w, msg, wp, lp);
+            pressed_result = -1;
+            if (pick && w_palette_shown()) {
+                SendMessageW(w, LB_SETCURSEL, index, 0);
+                w_accept();
+            }
+            return result;
+        }
+    } else if (msg == WM_CANCELMODE || msg == WM_CAPTURECHANGED)
+        pressed_result = -1;
+    return DefSubclassProc(w, msg, wp, lp);
+}
+
 ////////////////
 //~ Palette window
 
@@ -95,6 +161,19 @@ static LRESULT CALLBACK w_palette_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     LRESULT color_result;
     if (w_theme_message(w, msg, wp, lp, &color_result))
         return color_result;
+    if (msg == WM_PAINT && list) {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(w, &ps);
+        RECT r;
+        GetWindowRect(list, &r);
+        MapWindowPoints(HWND_DESKTOP, w, (POINT *)&r, 2);
+        r.top -= MulDiv(5, palette_dpi, 96);
+        r.bottom = r.top + 1;
+        SetDCBrushColor(dc, w_theme_separator());
+        FillRect(dc, &r, GetStockObject(DC_BRUSH));
+        EndPaint(w, &ps);
+        return 0;
+    }
     if (msg == WM_SETFOCUS) {
         if (edit)
             SetFocus(edit);
@@ -105,15 +184,16 @@ static LRESULT CALLBACK w_palette_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             w_filter();
         if ((HWND)lp == list && HIWORD(wp) == LBN_SELCHANGE)
             SetFocus(edit);
-        if ((HWND)lp == list && HIWORD(wp) == LBN_DBLCLK)
-            w_accept();
         return 0;
     }
     if (msg == WM_SIZE) {
-        RECT r;
-        GetClientRect(w, &r);
-        MoveWindow(edit, 8, 8, r.right - 16, 26, TRUE);
-        MoveWindow(list, 8, 42, r.right - 16, r.bottom - 50, TRUE);
+        w_palette_size();
+        return 0;
+    }
+    if (msg == WM_DPICHANGED) {
+        RECT *r = (RECT *)lp;
+        SetWindowPos(w, NULL, r->left, r->top, r->right-r->left, r->bottom-r->top, SWP_NOACTIVATE | SWP_NOZORDER);
+        w_palette_size();
         return 0;
     }
     if (msg == restore_foreground) {
@@ -158,34 +238,39 @@ void w_palette_open(HMONITOR monitor, const wchar_t *title, const w_palette_entr
                         .hbrBackground = NULL};
         RegisterClassW(&wc);
         panel = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, wc.lpszClassName, title,
-                                WS_CAPTION | WS_SYSMENU | WS_THICKFRAME, CW_USEDEFAULT, 0, 520, 380, NULL,
+                                WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_CLIPCHILDREN, CW_USEDEFAULT, 0, 520, 380, NULL,
                                 NULL, instance, NULL);
         if (!panel)
             return;
-        edit = CreateWindowExW(WS_EX_CLIENTEDGE, MSFTEDIT_CLASS, L"",
+        search_label = CreateWindowW(L"STATIC", L"Search", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE,
+                                     0, 0, 0, 0, panel, NULL, instance, NULL);
+        edit = CreateWindowExW(0, MSFTEDIT_CLASS, L"",
                                WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_NOOLEDRAGDROP, 8, 8, 480, 26,
                                panel, NULL, instance, NULL);
-        list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
-                               WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL, 8, 42, 480, 280, panel, NULL,
+        list = CreateWindowExW(0, L"LISTBOX", L"",
+                               WS_CHILD | WS_VISIBLE | LBS_NOTIFY | WS_VSCROLL | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS,
+                               8, 42, 480, 280, panel, NULL,
                                instance, NULL);
-        if (!edit || !list) {
+        if (!edit || !list || !search_label || !SetWindowSubclass(list, w_results_proc, 1, 0)) {
             DestroyWindow(panel);
-            panel = edit = list = NULL;
+            panel = edit = list = search_label = NULL;
             return;
         }
+        SetWindowTheme(list, L"DarkMode_Explorer", NULL);
         SendMessageW(edit, EM_SETTEXTMODE, TM_PLAINTEXT, 0);
         SendMessageW(edit, EM_EXLIMITTEXT, 0, palette_text_capacity - 1);
         SendMessageW(edit, EM_SETEVENTMASK, 0, SendMessageW(edit, EM_GETEVENTMASK, 0, 0) | ENM_CHANGE);
-        SendMessageW(edit, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
-        SendMessageW(list, WM_SETFONT, (WPARAM)GetStockObject(DEFAULT_GUI_FONT), TRUE);
+        w_palette_size();
     }
     w_theme_rich_edit(edit);
     row_count = w_clamp_int(count, 0, palette_limit);
     memcpy(rows, entries, row_count * sizeof(*rows));
     select_entry = cb;
     MONITORINFO mi = {.cbSize = sizeof(mi)};
-    if (!monitor || !GetMonitorInfoW(monitor, &mi))
-        GetMonitorInfoW(MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY), &mi);
+    if (!monitor || !GetMonitorInfoW(monitor, &mi)) {
+        monitor = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
+        GetMonitorInfoW(monitor, &mi);
+    }
     SetWindowTextW(panel, title);
     if (!preserve)
         SetWindowTextW(edit, L"");
@@ -201,8 +286,12 @@ void w_palette_open(HMONITOR monitor, const wchar_t *title, const w_palette_entr
     }
     if (!w_palette_shown())
         return_to = GetForegroundWindow();
-    SetWindowPos(panel, HWND_TOPMOST, (mi.rcWork.left + mi.rcWork.right - 520) / 2,
-                 (mi.rcWork.top + mi.rcWork.bottom - 380) / 2, 520, 380, SWP_SHOWWINDOW | SWP_NOACTIVATE);
+    UINT dpi = 96, vertical = 96;
+    GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpi, &vertical);
+    int width = min(mi.rcWork.right-mi.rcWork.left, MulDiv(520, dpi, 96));
+    int height = min(mi.rcWork.bottom-mi.rcWork.top, MulDiv(380, dpi, 96));
+    SetWindowPos(panel, HWND_TOPMOST, (mi.rcWork.left + mi.rcWork.right - width) / 2,
+                 (mi.rcWork.top + mi.rcWork.bottom - height) / 2, width, height, SWP_SHOWWINDOW | SWP_NOACTIVATE);
     w_palette_focus();
 }
 

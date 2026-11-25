@@ -64,6 +64,38 @@ static void w_launcher_hotkey(bool enable) {
 
 static input_drag_callback drag;
 static UINT drag_button;
+static UINT secondary_button;
+static LONG next_drag, active_drag, canceled_drag;
+static POINT drag_point;
+static unsigned drag_mods;
+static bool inverse_drag;
+
+static void w_queue_hover(POINT point) {
+    bool moved = !hover_known || hover_point.x != point.x || hover_point.y != point.y;
+    hover_point = point;
+    hover_known = true;
+    if (hover_msg && moved && !drag_button && !hover_pending)
+        hover_pending = PostMessageW(target, hover_msg, 0, 0) != 0;
+}
+
+void w_input_mouse_motion(void) {
+    POINT point;
+    if ((hover_msg || drag_button) && GetCursorPos(&point)) {
+        w_queue_hover(point);
+        if (drag_button && (point.x != drag_point.x || point.y != drag_point.y)) {
+            drag_point = point;
+            drag(input_drag_move, point);
+        }
+    }
+}
+
+void w_input_cancel_pointer(void) {
+    LONG canceled = InterlockedExchange(&canceled_drag, 0);
+    if (canceled && canceled == InterlockedCompareExchange(&active_drag,0,0)) {
+        drag(input_drag_cancel, drag_point);
+        InterlockedExchange(&active_drag,0);
+    }
+}
 
 static unsigned w_modifiers(void) {
     unsigned mods = 0;
@@ -117,9 +149,19 @@ static int w_match(unsigned vk, unsigned scan, unsigned mods, DWORD time, bool r
 
 static bool w_consume_key(WPARAM event, const KBDLLHOOKSTRUCT *key) {
     unsigned vk = key->vkCode;
-    if (vk >= 256 || (key->flags & LLKHF_INJECTED))
+    if (vk >= 256 || ((key->flags & LLKHF_INJECTED) &&
+        !(vk == VK_ESCAPE && (held[vk] || InterlockedCompareExchange(&active_drag,0,0)))))
         return false;
     bool up = event == WM_KEYUP || event == WM_SYSKEYUP;
+    if (!up && vk == VK_ESCAPE) {
+        LONG id = InterlockedCompareExchange(&active_drag,0,0);
+        if (id) {
+            InterlockedExchange(&canceled_drag,id);
+            PostMessageW(target, WM_CANCELMODE, 0, 0);
+            held[vk] = true;
+            return true;
+        }
+    }
     if (vk == VK_LWIN || vk == VK_RWIN || (mapped_super[0] && vk == VK_F13) ||
         (mapped_super[1] && vk == VK_F14)) {
         super_down[vk == VK_RWIN || vk == VK_F14] = !up;
@@ -225,6 +267,15 @@ static bool w_super_pressed(void) {
     return down;
 }
 
+static bool w_drag_modifier(void) {
+    AcquireSRWLockShared(&matcher_lock);
+    unsigned mods = w_modifiers();
+    ReleaseSRWLockShared(&matcher_lock);
+    if ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000)
+        mods |= MOD_WIN;
+    return (mods & drag_mods) == drag_mods;
+}
+
 static bool mouse_held[2];
 
 ////////////////
@@ -234,33 +285,46 @@ static LRESULT CALLBACK w_mouse_proc(int code, WPARAM event, LPARAM data) {
     if (code != HC_ACTION || !target)
         return CallNextHookEx(NULL, code, event, data);
     const MSLLHOOKSTRUCT *m = (const MSLLHOOKSTRUCT *)data;
+    w_input_cancel_pointer();
     if (event == WM_LBUTTONDOWN || event == WM_RBUTTONDOWN || event == WM_MBUTTONDOWN ||
         event == WM_XBUTTONDOWN)
         pointer_presses++;
-    if (event == WM_MOUSEMOVE) {
-        bool moved = !hover_known || hover_point.x != m->pt.x || hover_point.y != m->pt.y;
-        hover_point = m->pt;
-        hover_known = true;
-        // Repositioning a window can generate mouse motion at the same screen
-        // point. Only a change of pointer coordinates is new hover intent.
-        if (hover_msg && moved && !drag_button && !hover_pending)
-            hover_pending = PostMessageW(target, hover_msg, 0, 0) != 0;
+    if (event == WM_MOUSEMOVE)
+        w_queue_hover(m->pt);
+    if ((secondary_button == WM_LBUTTONDOWN && event == WM_LBUTTONUP) ||
+        (secondary_button == WM_RBUTTONDOWN && event == WM_RBUTTONUP)) {
+        secondary_button = 0;
+        return 1;
     }
     if (drag_button) {
-        if (event == WM_MOUSEMOVE)
+        if (event == WM_MOUSEMOVE && (drag_point.x != m->pt.x || drag_point.y != m->pt.y)) {
+            drag_point = m->pt;
             drag(input_drag_move, m->pt);
+        }
+        if (event == WM_LBUTTONDOWN || event == WM_RBUTTONDOWN) {
+            if (event != drag_button)
+                secondary_button = (UINT)event;
+            return 1;
+        }
         if ((drag_button == WM_RBUTTONDOWN && event == WM_RBUTTONUP) ||
             (drag_button == WM_LBUTTONDOWN && event == WM_LBUTTONUP)) {
             drag(input_drag_end, m->pt);
             drag_button = 0;
+            InterlockedExchange(&active_drag,0);
             return 1;
         }
-    } else if (drag && (event == WM_LBUTTONDOWN || (event == WM_RBUTTONDOWN && w_super_pressed())) &&
-               drag(event == WM_RBUTTONDOWN ? input_drag_inside : input_drag_edge, m->pt)) {
-        drag_button = (UINT)event;
-        return 1;
+    } else if (drag && (event == WM_LBUTTONDOWN || event == WM_RBUTTONDOWN)) {
+        bool modified = w_drag_modifier();
+        bool move = (event == WM_LBUTTONDOWN) != inverse_drag;
+        enum input_drag_event gesture = !modified ? input_drag_edge : move ? input_drag_reposition : input_drag_inside;
+        if ((modified || event == WM_LBUTTONDOWN) && drag(gesture, m->pt)) {
+            drag_button = (UINT)event;
+            drag_point = m->pt;
+            InterlockedExchange(&active_drag,InterlockedIncrement(&next_drag));
+            return 1;
+        }
     }
-    if (event == WM_RBUTTONDOWN && context_msg && !w_super_pressed() &&
+    if (event == WM_RBUTTONDOWN && !drag_button && context_msg && !w_super_pressed() && !w_drag_modifier() &&
         w_os_desktop_surface(GetAncestor(WindowFromPoint(m->pt), GA_ROOT))) {
         desktop_context_press = true;
         return 1;
@@ -317,8 +381,14 @@ void w_input_stop(void) {
 }
 
 void w_input_reset(void) {
+    if (drag_button && drag)
+        drag(input_drag_cancel, (POINT){0});
     AcquireSRWLockExclusive(&matcher_lock);
     drag_button = 0;
+    secondary_button = 0;
+    InterlockedExchange(&active_drag,0);
+    InterlockedExchange(&canceled_drag,0);
+    hover_known = false;
     desktop_context_press = false;
     if (key_thread)
         PostThreadMessageW(key_thread_id, WM_APP, 0, 0);
@@ -352,6 +422,8 @@ void w_input_bind(HWND w, UINT message, UINT hover_message, UINT context_message
             launcher_binding = i;
     }
     drag = resize_drag;
+    drag_mods = c->drag_mods;
+    inverse_drag = c->inverse_drag;
     generation++;
     if (key_thread && registered_launcher >= 0)
         PostThreadMessageW(key_thread_id, WM_APP, 0, 0);
@@ -363,6 +435,11 @@ void w_input_bind(HWND w, UINT message, UINT hover_message, UINT context_message
         w_start_keyboard();
     if (!mouse)
         mouse = SetWindowsHookExW(WH_MOUSE_LL, w_mouse_proc, GetModuleHandleW(NULL), 0);
+    // Raw mouse input remains available if Windows times out the gesture hook.
+    RAWINPUTDEVICE device = {.usUsagePage = 1, .usUsage = 2,
+                             .dwFlags = c->follow_mouse ? RIDEV_INPUTSINK : RIDEV_REMOVE,
+                             .hwndTarget = c->follow_mouse ? w : NULL};
+    RegisterRawInputDevices(&device, 1, sizeof(device));
     for (int i = 0; i < c->binding_count; i++) {
         unsigned key = c->bindings[i].key;
         status[i] = key >= 0x201 && key <= 0x204 ? mouse != NULL : keyboard != NULL;

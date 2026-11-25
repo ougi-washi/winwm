@@ -104,6 +104,133 @@ static bool w_color(const char *s, uint32_t *out) {
     return true;
 }
 
+static bool w_decimal(const char *s, double lo, double hi, double *out) {
+    char *end;
+    double v = strtod(s, &end);
+    if (end == s || *end || !isfinite(v) || v < lo || v > hi)
+        return false;
+    *out = v;
+    return true;
+}
+
+static bool w_gradient(char *value, uint32_t *start, w_border_gradient *gradient) {
+    char *next = value + strcspn(value, " \t");
+    if (!*next) {
+        *gradient = (w_border_gradient){0};
+        return w_color(value, start);
+    }
+    *next++ = 0;
+    next = w_trim(next);
+    char *direction = next + strcspn(next, " \t");
+    int angle = 0;
+    if (*direction) {
+        *direction++ = 0;
+        direction = w_trim(direction);
+        size_t n = strlen(direction);
+        if (n < 4 || strcmp(direction+n-3, "deg"))
+            return false;
+        direction[n-3] = 0;
+        if (!w_number(direction, 0, 360, &angle))
+            return false;
+    }
+    gradient->enabled = true;
+    gradient->angle = angle;
+    return w_color(value, start) && w_color(next, &gradient->end);
+}
+
+static bool w_bezier(w_config_language *l, char *value) {
+    char *name = w_comma_field(&value);
+    double points[4];
+    if (!*name || strlen(name) >= sizeof(l->curves[0].name) ||
+        !strcmp(name, "linear") || !strcmp(name, "default"))
+        return false;
+    for (int i = 0; i < 4; i++) {
+        if ((i == 3 && strchr(value, ',')) || !w_decimal(w_comma_field(&value), i%2 ? -4 : 0, i%2 ? 4 : 1, &points[i]))
+            return false;
+    }
+    int i = 0;
+    while (i < l->curve_count && strcmp(l->curves[i].name, name))
+        i++;
+    if (i == (int)count_of(l->curves))
+        return false;
+    if (i == l->curve_count)
+        l->curve_count++;
+    strcpy(l->curves[i].name, name);
+    l->curves[i].curve = (w_curve){points[0], points[1], points[2], points[3]};
+    return true;
+}
+
+static bool w_animation_style(int kind, char *value, w_transition *t) {
+    if (!*value)
+        return true;
+    char *arg = value + strcspn(value, " \t");
+    if (*arg) {
+        *arg++ = 0;
+        arg = w_trim(arg);
+    }
+    if (kind == motion_open && !strcmp(value,"popin"))
+        t->style = style_popin;
+    else if ((kind == motion_open || kind == motion_workspace) && !strcmp(value,"slide"))
+        t->style = style_slide;
+    else if (kind == motion_workspace && !strcmp(value,"slidevert"))
+        t->style = style_slidevert;
+    else
+        return (kind == motion_layers_in || kind == motion_layers_out) && !strcmp(value,"fade") && !*arg;
+    if (!*arg)
+        return true;
+    if (kind == motion_open && t->style == style_slide) {
+        const char *edges[] = {"top","bottom","left","right"};
+        for (int i = 0; i < 4; i++)
+            if (!strcmp(arg,edges[i])) {
+                t->style = style_top + i;
+                return true;
+            }
+        return false;
+    }
+    size_t len = strlen(arg);
+    if (arg[len-1] != '%')
+        return false;
+    arg[len-1] = 0;
+    return w_number(arg, 0, 100, &t->percent);
+}
+
+static bool w_animation(w_config_language *l, char *value) {
+    const char *const leaves[motion_count] = {"windowsIn", "windowsMove", "workspaces", "border", "barModules",
+                                             "layersIn", "layersOut", "fadeIn", "fadeSwitch"};
+    char *name = w_comma_field(&value);
+    int kind = 0, on;
+    while (kind < motion_count && strcmp(name, leaves[kind]))
+        kind++;
+    if (kind == motion_count || !w_number(w_comma_field(&value), 0, 1, &on))
+        return false;
+    w_transition *transition = &l->config->motion[kind];
+    if (!on && !*value) {
+        transition->ms = 0;
+        return true;
+    }
+    double speed;
+    if (!w_decimal(w_comma_field(&value), .01, 30, &speed))
+        return false;
+    char *curve = w_comma_field(&value);
+    w_curve easing = {.22, 1, .36, 1};
+    if (!strcmp(curve, "linear"))
+        easing = (w_curve){0, 0, 1, 1};
+    else if (strcmp(curve, "default")) {
+        int i = 0;
+        while (i < l->curve_count && strcmp(curve, l->curves[i].name))
+            i++;
+        if (i == l->curve_count)
+            return false;
+        easing = l->curves[i].curve;
+    }
+    value = w_trim(value);
+    w_transition t = {on ? (int)(speed*100 + .5) : 0, easing, style_default, -1};
+    if (!w_animation_style(kind, value, &t))
+        return false;
+    *transition = t;
+    return true;
+}
+
 static bool w_make_chord(char *mods, char *key, char *out, size_t cap) {
     for (char *p = mods; *p; p++)
         *p = (char)tolower((unsigned char)*p);
@@ -151,9 +278,6 @@ static bool w_dispatcher(w_desktop_config *c, const char *name, const char *arg,
         } else if (!strcmp(arg, "Run")) {
             action = "launcher";
             param = "";
-        } else if (!strcmp(arg, "brave") || !strcmp(arg, "brave.exe")) {
-            action = "launch";
-            param = "brave";
         } else
             action = "program";
     } else if (!strcmp(name, "winwm"))
@@ -284,6 +408,22 @@ static bool w_parse_window_rule(w_desktop_config *c, char *value) {
 
 static bool w_option(w_config_language *l, const char *key, char *v) {
     w_desktop_config *c = l->config;
+    if (!strcmp(key, "input:floating_modifier") || !strcmp(key, "floating_modifier")) {
+        char *mode = v + strcspn(v, " \t");
+        if (*mode)
+            *mode++ = 0;
+        mode = w_trim(mode);
+        if (*mode && strcmp(mode,"normal") && strcmp(mode,"inverse"))
+            return false;
+        char chord[64];
+        unsigned keycode, mods;
+        int n = snprintf(chord, sizeof(chord), "%s+a", v);
+        if (n < 0 || (size_t)n >= sizeof(chord) || !w_config_chord(chord, &mods, &keycode) || !mods)
+            return false;
+        c->drag_mods = mods;
+        c->inverse_drag = !strcmp(mode,"inverse");
+        return true;
+    }
     if (!strcmp(key, "exec") || !strcmp(key, "exec-once")) {
         if (!*v || c->startup_count >= (int)count_of(c->startup))
             return false;
@@ -307,9 +447,28 @@ static bool w_option(w_config_language *l, const char *key, char *v) {
     if (!strcmp(key, "general:gaps_out"))
         return w_number(v, 0, 128, &c->outer_gap);
     if (!strcmp(key, "general:col.active_border"))
-        return w_color(v, &c->accent);
+        return w_gradient(v, &c->accent, &c->active_gradient);
     if (!strcmp(key, "general:col.inactive_border"))
-        return w_color(v, &c->inactive_border);
+        return w_gradient(v, &c->inactive_border, &c->inactive_gradient);
+    if (!strcmp(key, "general:border_size"))
+        return w_number(v, 0, 16, &c->border_size);
+    if (!strcmp(key, "decoration:rounding"))
+        return w_number(v, 0, 32, &c->rounding);
+    if (!strcmp(key, "animations:enabled")) {
+        if (!strcmp(v, "auto")) {
+            c->animations = motion_system;
+            return true;
+        }
+        int on;
+        if (!w_number(v, 0, 1, &on))
+            return false;
+        c->animations = on ? motion_on : motion_off;
+        return true;
+    }
+    if (!strcmp(key, "animations:bezier"))
+        return w_bezier(l, v);
+    if (!strcmp(key, "animations:animation"))
+        return w_animation(l, v);
     if (!strcmp(key, "decoration:inactive_opacity")) {
         char *end;
         double f = strtod(v, &end);
@@ -318,11 +477,14 @@ static bool w_option(w_config_language *l, const char *key, char *v) {
         c->inactive_alpha = (unsigned char)(255 * f + .5);
         return true;
     }
-    if (!strcmp(key, "input:follow_mouse")) {
+    if (!strcmp(key, "input:follow_mouse") || !strcmp(key, "general:resize_on_border")) {
         int on;
         if (!w_number(v, 0, 1, &on))
             return false;
-        c->follow_mouse = on != 0;
+        if (!strcmp(key, "input:follow_mouse"))
+            c->follow_mouse = on != 0;
+        else
+            c->resize_on_border = on != 0;
         return true;
     }
     if (!strcmp(key, "bar:height"))

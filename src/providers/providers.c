@@ -83,7 +83,7 @@ static DWORD WINAPI w_run_worker(void *ptr) {
     wchar_t exe[os_path_cap], line[os_path_cap + 4];
     PROCESS_INFORMATION pi = {0};
     STARTUPINFOEXW si = {0};
-    bool attributes = false;
+    bool attributes = false, started = false;
     SECURITY_ATTRIBUTES sa = {sizeof(sa), NULL, TRUE};
     if (!w_os_provider(r->spec.executable, exe, count_of(exe)) || !CreatePipe(&rd, &wr, &sa, 4096))
         goto done;
@@ -113,12 +113,13 @@ static DWORD WINAPI w_run_worker(void *ptr) {
                        CREATE_SUSPENDED | CREATE_NO_WINDOW | EXTENDED_STARTUPINFO_PRESENT, NULL, NULL,
                        &si.StartupInfo, &pi)) {
         AcquireSRWLockExclusive(&r->lock);
-        if (r->cancelled || !AssignProcessToJobObject(r->job, pi.hProcess) ||
-            ResumeThread(pi.hThread) == (DWORD)-1)
+        started = !r->cancelled && AssignProcessToJobObject(r->job, pi.hProcess) &&
+                  ResumeThread(pi.hThread) != (DWORD)-1;
+        if (!started)
             TerminateProcess(pi.hProcess, 1);
         ReleaseSRWLockExclusive(&r->lock);
     }
-    if (!pi.hProcess)
+    if (!started)
         goto done;
     CloseHandle(wr);
     wr = NULL;
@@ -148,7 +149,7 @@ static DWORD WINAPI w_run_worker(void *ptr) {
         w_publish(r, record);
     }
 done:
-    if (!pi.hProcess)
+    if (!started)
         w_publish(r, "unavailable");
     if (pi.hProcess)
         CloseHandle(pi.hProcess);
@@ -183,13 +184,14 @@ static void w_stop_slot(w_provider_slot *s) {
     w_release(r);
 }
 
-static void w_start_slot(w_provider_slot *s, ULONGLONG now) {
-    s->due = 0;
+static bool w_start_slot(w_provider_slot *s, ULONGLONG now) {
     w_run_state *r = calloc(1, sizeof(*r));
     if (!r)
-        return;
+        return false;
     r->refs = 2;
     r->spec = s->spec;
+    // A tick from another provider can arrive before the first record of this run.
+    r->value = s->value;
     r->owner = owner;
     r->message = changed;
     r->job = CreateJobObjectW(NULL, NULL);
@@ -200,10 +202,11 @@ static void w_start_slot(w_provider_slot *s, ULONGLONG now) {
         !QueueUserWorkItem(w_run_worker, r, WT_EXECUTELONGFUNCTION)) {
         r->refs = 1;
         w_release(r);
-        return;
+        return false;
     }
     s->run = r;
     s->deadline = r->spec.stream ? 0 : now + (ULONGLONG)r->spec.timeout * 1000;
+    return true;
 }
 
 ////////////////
@@ -223,14 +226,20 @@ void w_providers_tick(void) {
             ReleaseSRWLockExclusive(&r->lock);
             if (done || (s->deadline && now >= s->deadline)) {
                 if (!done)
-                    wcscpy(s->value.text, L"timed out");
+                    s->value = (w_provider_value){.text=L"timed out", .percent=-1};
                 w_stop_slot(s);
                 s->deadline = 0;
                 s->due = s->spec.interval ? now + 1000ull * s->spec.interval : 0;
             }
         }
-        if (!s->run && s->due && s->due <= now)
-            w_start_slot(s, now);
+        if (!s->run && s->due && s->due <= now) {
+            s->due = 0;
+            if (!w_start_slot(s, now)) {
+                s->value = (w_provider_value){.text=L"unavailable", .percent=-1};
+                if (s->spec.interval)
+                    s->due = now + 1000ull * s->spec.interval;
+            }
+        }
         ULONGLONG when = s->run ? s->deadline : s->due;
         if (when && (!next || when < next))
             next = when;
@@ -256,7 +265,7 @@ void w_providers_configure(HWND w, UINT message, const w_desktop_config *cfg) {
         snprintf(token, sizeof(token), "custom/%s", cfg->providers[i].name);
         if (!w_config_has_module(cfg, token))
             continue;
-        slots[slot_count++] = (w_provider_slot){.spec = cfg->providers[i], .due = 1};
+        slots[slot_count++] = (w_provider_slot){.spec = cfg->providers[i], .due = 1, .value.percent = -1};
     }
     w_providers_tick();
 }

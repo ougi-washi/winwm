@@ -24,7 +24,8 @@ enum {
     msg_hover,
     msg_desktop_menu,
     msg_catalog,
-    msg_shell_exit
+    msg_shell_exit,
+    msg_pointer_select, msg_drag_preview, msg_drag_limits
 };
 
 typedef struct w_output_state {
@@ -41,13 +42,36 @@ typedef struct w_window_state {
     HWND hwnd;
     DWORD pid;
     int displaced_from;
-    w_rect issued, float_before_request;
+    w_rect issued, issued_native, rejected_bounds, float_before_request, drag_start;
+    RECT frame_margins;
+    LONG_PTR frame_style, frame_exstyle;
+    UINT frame_dpi;
     unsigned floating_update;
     bool float_request_sent;
     enum { move_idle, move_dragging, move_released } native_move;
     bool has_issued, restoring, wants_visible, decorated, active, custom_border;
-    BYTE alpha;
+    BYTE alpha, corner;
+    struct {
+        ULONGLONG start;
+        BYTE from, value, target;
+        w_transition timing;
+    } opacity;
     DWORD border, applied_border;
+    struct {
+        ULONGLONG start;
+        w_transition timing;
+        w_rect from, target, last;
+    } motion;
+    struct {
+        HWND hwnd;
+        w_rect bounds;
+        int width, radius, angle;
+        uint32_t color[2], from[2], target[2];
+        w_transition timing;
+        ULONGLONG start;
+        bool initialized;
+    } outline;
+    bool presented;
 } w_window_state;
 
 typedef struct w_desktop_state {
@@ -60,12 +84,13 @@ typedef struct w_desktop_state {
     bool ipc_live, resize, inhibit, hide_bars, refresh_pending, ready, first_input, loading;
     bool registered[binding_limit];
     uint64_t revision;
-    HWINEVENTHOOK hooks[6];
+    HWINEVENTHOOK hooks[7];
     char status[512];
     wchar_t notices[32][256], clips[24][512];
     int notice_count, clip_count;
     DWORD clipboard_seq;
     bool clipboard_enabled;
+    bool motion_allowed, high_contrast, borders_hidden;
 } w_desktop_state;
 
 extern w_desktop_state desk;
@@ -77,8 +102,11 @@ void w_desktop_schedule(void);
 void w_desktop_scan(void);
 void w_desktop_event(HWND hwnd, DWORD event);
 void w_desktop_outputs(void);
+int w_desktop_output_for_bounds(int current, w_rect r);
 void w_desktop_select(int slot);
 void w_desktop_move_window(int slot, int output, int workspace);
+void w_desktop_drop_tile(int slot, POINT point);
+bool w_desktop_tile_drop(int slot, POINT point, w_rect *preview, bool commit);
 void w_desktop_toggle_fullscreen(int slot);
 void w_desktop_cycle_output(bool carry);
 void w_desktop_navigate(enum direction dir, bool move);
@@ -86,6 +114,15 @@ void w_desktop_resize_axis(enum split_axis axis, int delta);
 void w_desktop_resize_direction(int direction);
 void w_desktop_place_floating(int slot, w_rect bounds);
 void w_desktop_apply(void);
+enum { animation_timer = 30 };
+void w_effects_preferences(void);
+void w_effects_tick(void);
+void w_effects_opacity(int slot, bool focused, bool entering);
+bool w_effects_move(int slot, w_rect target, enum motion_kind kind, int direction);
+bool w_outline_sync(int slot, bool focused);
+void w_outline_position(int slot);
+void w_outline_hide(int slot);
+void w_effects_hide(int slot);
 void w_desktop_bind(void);
 bool w_desktop_defer(const w_command *cmd, int output);
 bool w_desktop_run_on(const w_command *cmd, int output);
@@ -105,6 +142,7 @@ void w_desktop_focus_empty(void);
 bool w_desktop_close_foreground(void);
 void w_desktop_focus_apply(void);
 void w_desktop_focus_observe(HWND window);
+void w_desktop_stack_floats(int slot, bool fullscreen_changed);
 void w_desktop_request(const char *s, char *reply, size_t cap);
 void w_desktop_timer(void);
 void w_desktop_status_sample(void);
@@ -114,3 +152,9 @@ void w_desktop_status_done(void *result);
 void w_desktop_status_configure(void);
 bool w_desktop_status_text(const char *key, wchar_t *s, int cap, char *action, size_t acap);
 bool w_desktop_drag(enum input_drag_event event, POINT point);
+bool w_desktop_resizing(void);
+bool w_desktop_dragging_float(int slot);
+void w_desktop_drag_client_resized(int slot);
+void w_desktop_drag_limits(w_window_id id);
+void w_desktop_cancel_drag(void);
+void w_desktop_drag_preview(void);
