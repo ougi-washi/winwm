@@ -1,4 +1,5 @@
 #include "bar/menu.h"
+#include "win_platform/percent_slider.h"
 #include <stdio.h>
 #include <commctrl.h>
 #include <windowsx.h>
@@ -11,18 +12,20 @@ typedef struct w_menu_row {
     wchar_t label[192];
     const char *action;
     HKL layout;
-    bool checked, disabled;
+    wchar_t glyph;
+    bool checked, disabled, opens_panel;
 } w_menu_row;
 
 typedef struct w_flyout {
     w_bar_window *bar;
     HWND window, list, slider, previous, language_target;
-    HFONT heading;
+    HFONT heading, symbols;
+    COLORREF surface, ink, accent, border, selected, selected_ink;
     DWORD language_thread;
-    int count, pressed_row;
+    int count, pressed_row, anchor_hit;
     bool closing, owns_memory;
     w_layer_fade fade;
-    char module[56];
+    char module[56], instance[56];
     w_menu_row rows[];
 } w_flyout;
 
@@ -37,6 +40,21 @@ static COLORREF w_color(uint32_t rgb) {
 
 static int w_scale(const w_bar_window *bar, int pixels) {
     return MulDiv(pixels, bar->dpi, 96);
+}
+
+static void w_menu_colors(w_flyout *menu) {
+    const w_desktop_config *cfg = menu->bar->config;
+    HIGHCONTRASTW hc = {.cbSize = sizeof(hc)};
+    bool contrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(hc),&hc,0) && (hc.dwFlags & HCF_HIGHCONTRASTON);
+    menu->surface = contrast ? GetSysColor(COLOR_WINDOW) : w_color(cfg->background);
+    menu->ink = contrast ? GetSysColor(COLOR_WINDOWTEXT) : w_color(cfg->foreground);
+    menu->accent = contrast ? menu->ink : w_color(cfg->accent);
+    menu->border = contrast ? menu->ink : w_color(cfg->inactive_border);
+    menu->selected = contrast ? GetSysColor(COLOR_HIGHLIGHT) :
+        RGB((3*GetRValue(menu->surface)+GetRValue(menu->accent))/4,
+            (3*GetGValue(menu->surface)+GetGValue(menu->accent))/4,
+            (3*GetBValue(menu->surface)+GetBValue(menu->accent))/4);
+    menu->selected_ink = contrast ? GetSysColor(COLOR_HIGHLIGHTTEXT) : menu->ink;
 }
 
 bool w_bar_menu_active(void) {
@@ -133,6 +151,13 @@ static void w_fill(HDC dc, RECT r, COLORREF value) {
     FillRect(dc, &r, GetStockObject(DC_BRUSH));
 }
 
+// Owner drawing supplies the glyphs. Keep their meaning in the native list's
+// accessible text as well, including when the keyboard focus is on another row.
+static void w_row_name(const w_menu_row *row, wchar_t text[256]) {
+    swprintf(text,256,L"%ls%ls%ls",row->label,row->checked ? (row->layout ? L" (current layout)" : L" (on)") : L"",
+             row->disabled ? L" (unavailable)" : L"");
+}
+
 static void w_volume_header(w_flyout *menu, int percent) {
     wchar_t *label = menu->rows[0].label;
     if (percent < 0)
@@ -162,51 +187,7 @@ static LRESULT CALLBACK w_slider_proc(HWND slider, UINT msg, WPARAM wp, LPARAM l
         SetFocus(menu->list);
         return 0;
     }
-    if (msg == WM_LBUTTONDOWN || ((msg == WM_MOUSEMOVE || msg == WM_LBUTTONUP) && GetCapture() == slider)) {
-        if (msg == WM_LBUTTONDOWN) {
-            SetFocus(slider);
-            SetCapture(slider);
-        }
-        RECT r;
-        GetClientRect(slider, &r);
-        int pad = w_scale(menu->bar, 10);
-        int next = w_clamp_int(MulDiv(GET_X_LPARAM(lp) - pad, 100, max(1, r.right - 2 * pad)), 0, 100);
-        if (next != (int)SendMessageW(slider, TBM_GETPOS, 0, 0)) {
-            SendMessageW(slider, TBM_SETPOS, TRUE, next);
-            w_request_volume(menu, next);
-        }
-        if (msg == WM_LBUTTONUP)
-            ReleaseCapture();
-        return 0;
-    }
     return DefSubclassProc(slider, msg, wp, lp);
-}
-
-static LRESULT w_draw_slider(w_flyout *menu, NMCUSTOMDRAW *draw) {
-    if (draw->dwDrawStage != CDDS_PREPAINT)
-        return CDRF_DODEFAULT;
-    const w_desktop_config *cfg = menu->bar->config;
-    RECT r;
-    GetClientRect(menu->slider, &r);
-    w_fill(draw->hdc, r, w_color(cfg->background));
-    int pad = w_scale(menu->bar, 10), middle = r.bottom / 2, half = max(1, w_scale(menu->bar, 2));
-    RECT track = {pad, middle - half, r.right - pad, middle + half};
-    w_fill(draw->hdc, track, w_color(cfg->inactive_border));
-    if (IsWindowEnabled(menu->slider)) {
-        int percent = (int)SendMessageW(menu->slider, TBM_GETPOS, 0, 0);
-        track.right = pad + MulDiv(track.right - pad, percent, 100);
-        w_fill(draw->hdc, track, w_color(cfg->accent));
-        int radius = w_scale(menu->bar, 6);
-        HGDIOBJ pen = SelectObject(draw->hdc, GetStockObject(NULL_PEN));
-        HGDIOBJ brush = SelectObject(draw->hdc, GetStockObject(DC_BRUSH));
-        SetDCBrushColor(draw->hdc, w_color(cfg->foreground));
-        Ellipse(draw->hdc, track.right-radius, middle-radius, track.right+radius+1, middle+radius+1);
-        SelectObject(draw->hdc, brush);
-        SelectObject(draw->hdc, pen);
-        if (GetFocus() == menu->slider && !(SendMessageW(menu->slider, WM_QUERYUISTATE, 0, 0) & UISF_HIDEFOCUS))
-            DrawFocusRect(draw->hdc, &r);
-    }
-    return CDRF_SKIPDEFAULT;
 }
 
 ////////////////
@@ -223,8 +204,12 @@ static LRESULT CALLBACK w_flyout_proc(HWND w, UINT message, WPARAM wp, LPARAM lp
     if (!menu)
         return DefWindowProcW(w, message, wp, lp);
     w_bar_window *bar = menu->bar;
-    const w_desktop_config *cfg = bar->config;
     switch (message) {
+    case WM_SYSCOLORCHANGE:
+    case WM_SETTINGCHANGE:
+        w_menu_colors(menu);
+        RedrawWindow(w,NULL,NULL,RDW_INVALIDATE|RDW_ALLCHILDREN);
+        break;
     case WM_TIMER:
         if (wp == bar_fade_timer && menu->fade.start &&
             !w_bar_fade_tick(w,&menu->fade,bar->motion_allowed) && menu->closing)
@@ -239,44 +224,45 @@ static LRESULT CALLBACK w_flyout_proc(HWND w, UINT message, WPARAM wp, LPARAM lp
         return 0;
     case WM_NOTIFY:
         if (((NMHDR *)lp)->hwndFrom == menu->slider && ((NMHDR *)lp)->code == NM_CUSTOMDRAW)
-            return w_draw_slider(menu, (NMCUSTOMDRAW *)lp);
+            return w_percent_slider_draw(menu->slider,(NMCUSTOMDRAW *)lp,menu->surface,menu->border,menu->accent,menu->ink);
         break;
     case WM_ACTIVATE:
         if (LOWORD(wp) == WA_INACTIVE)
             w_dismiss(menu, false);
         return 0;
     case WM_CTLCOLORLISTBOX:
-        SetDCBrushColor((HDC)wp, w_color(cfg->background));
+        SetDCBrushColor((HDC)wp, menu->surface);
         return (LRESULT)GetStockObject(DC_BRUSH);
     case WM_ERASEBKGND:
         return TRUE;
-    case WM_PAINT: {
+    case WM_PAINT:
+    case WM_PRINTCLIENT: {
         PAINTSTRUCT ps;
-        HDC dc = BeginPaint(w, &ps);
+        HDC dc = message == WM_PAINT ? BeginPaint(w,&ps) : (HDC)wp;
         RECT r;
         GetClientRect(w, &r);
-        w_fill(dc, r, w_color(cfg->inactive_border));
+        w_fill(dc, r, menu->border);
         InflateRect(&r, -1, -1);
-        w_fill(dc, r, w_color(cfg->background));
+        w_fill(dc, r, menu->surface);
         r.left += w_scale(bar, 16);
         r.right -= w_scale(bar, 16);
         r.bottom = w_scale(bar, 38);
         HGDIOBJ old = SelectObject(dc, menu->heading ? menu->heading : bar->font);
-        SetTextColor(dc, w_color(cfg->foreground));
+        SetTextColor(dc, menu->ink);
         SetBkMode(dc, TRANSPARENT);
         const wchar_t *heading = menu->rows[0].label;
         if (menu->slider && bar->audio_percent >= 0 && wcschr(heading, L'%')) {
             wchar_t percentage[12];
             swprintf(percentage, count_of(percentage), L"%d%%", (int)SendMessageW(menu->slider, TBM_GETPOS, 0, 0));
-            SetTextColor(dc, w_color(cfg->accent));
+            SetTextColor(dc, menu->accent);
             DrawTextW(dc, percentage, -1, &r, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
-            SetTextColor(dc, w_color(cfg->foreground));
+            SetTextColor(dc, menu->ink);
             r.right -= w_scale(bar, 52);
             heading = bar->audio_muted ? L"Output muted" : L"Output volume";
         }
         DrawTextW(dc, heading, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
         SelectObject(dc, old);
-        EndPaint(w, &ps);
+        if (message == WM_PAINT) EndPaint(w,&ps);
         return 0;
     }
     case WM_DRAWITEM: {
@@ -286,21 +272,28 @@ static LRESULT CALLBACK w_flyout_proc(HWND w, UINT message, WPARAM wp, LPARAM lp
         w_menu_row *row = &menu->rows[item->itemID + 1];
         RECT r = item->rcItem;
         bool selected = !!(item->itemState & ODS_SELECTED);
-        w_fill(item->hDC, r, w_color(cfg->background));
+        w_fill(item->hDC, r, menu->surface);
         if (selected) {
             InflateRect(&r, -w_scale(bar, 2), -w_scale(bar, 2));
-            w_fill(item->hDC, r, w_color(cfg->inactive_border));
+            w_fill(item->hDC, r, menu->selected);
         }
         SetBkMode(item->hDC, TRANSPARENT);
-        SetTextColor(item->hDC, row->disabled ? GetSysColor(COLOR_GRAYTEXT) :
-                     w_color(row->checked ? cfg->accent : cfg->foreground));
-        HGDIOBJ old = SelectObject(item->hDC, bar->font);
-        r.left += w_scale(bar, 10);
-        if (row->checked)
-            DrawTextW(item->hDC, L"\x2713", -1, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX);
-        r.left += w_scale(bar, 16);
-        r.right -= w_scale(bar, 6);
+        COLORREF ink = row->disabled ? GetSysColor(COLOR_GRAYTEXT) : selected ? menu->selected_ink : menu->ink;
+        SetTextColor(item->hDC, selected || row->disabled ? ink : menu->accent);
+        HGDIOBJ old = SelectObject(item->hDC, menu->symbols ? menu->symbols : bar->font);
+        r.left = item->rcItem.left + w_scale(bar,12);
+        r.right = item->rcItem.right - w_scale(bar,12);
+        wchar_t symbol = row->checked ? 0xe73e : row->glyph;
+        if (symbol) DrawTextW(item->hDC,&symbol,1,&r,DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
+        if (row->opens_panel) DrawTextW(item->hDC,L"\xe76c",1,&r,DT_SINGLELINE|DT_VCENTER|DT_RIGHT);
+        SetTextColor(item->hDC,ink);
+        SelectObject(item->hDC,bar->font);
+        r.left += w_scale(bar,26);
+        if (row->opens_panel) r.right -= w_scale(bar,22);
         DrawTextW(item->hDC, row->label, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        if ((item->itemState & (ODS_FOCUS|ODS_NOFOCUSRECT)) == ODS_FOCUS &&
+            !(SendMessageW(menu->list,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS))
+            DrawFocusRect(item->hDC,&item->rcItem);
         SelectObject(item->hDC, old);
         return TRUE;
     }
@@ -309,6 +302,7 @@ static LRESULT CALLBACK w_flyout_proc(HWND w, UINT message, WPARAM wp, LPARAM lp
             open_menu = NULL;
         SetWindowLongPtrW(w, GWLP_USERDATA, 0);
         DeleteObject(menu->heading);
+        DeleteObject(menu->symbols);
         if (menu->owns_memory)
             free(menu);
         break;
@@ -320,7 +314,8 @@ static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count
     if (count < 2)
         return;
     if (open_menu) {
-        bool same = open_menu->bar == bar && !strcmp(open_menu->module, bar->hits[hit].module);
+        bool same = open_menu->bar == bar && open_menu->anchor_hit == hit &&
+                    !strcmp(open_menu->instance,bar->hits[hit].instance);
         w_dismiss(open_menu, true);
         if (same)
             return;
@@ -329,13 +324,16 @@ static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count
     if (!menu)
         return;
     menu->bar = bar;
+    w_menu_colors(menu);
     menu->previous = GetForegroundWindow();
     menu->language_target = language_target;
     if (language_target)
         menu->language_thread = GetWindowThreadProcessId(language_target, NULL);
     menu->count = count;
     menu->pressed_row = -1;
+    menu->anchor_hit = hit;
     w_str_copy(menu->module, sizeof(menu->module), bar->hits[hit].module);
+    w_str_copy(menu->instance, sizeof(menu->instance), bar->hits[hit].instance);
     memcpy(menu->rows, rows, (size_t)count * sizeof(*rows));
 
     RECT anchor = bar->hits[hit].box;
@@ -348,7 +346,7 @@ static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count
     for (int i = 0; i < count; ++i) {
         SIZE size = {0};
         GetTextExtentPoint32W(dc, rows[i].label, (int)wcslen(rows[i].label), &size);
-        width = max(width, size.cx + w_scale(bar, 60));
+        width = max(width, size.cx + w_scale(bar, 84));
     }
     SelectObject(dc, old);
     ReleaseDC(bar->hwnd, dc);
@@ -382,6 +380,8 @@ static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count
     menu->owns_memory = true;
     menu->heading = CreateFontW(-w_scale(bar, 15), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, L"Segoe UI");
+    menu->symbols = CreateFontW(-w_scale(bar,15),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
+                                OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,0,L"Segoe MDL2 Assets");
     if (audio) {
         INITCOMMONCONTROLSEX init = {sizeof(init), ICC_BAR_CLASSES};
         InitCommonControlsEx(&init);
@@ -389,11 +389,10 @@ static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count
                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
                         margin, w_scale(bar, 36), width - 2 * margin, w_scale(bar, 34),
                         popup, NULL, instance, NULL);
-        if (!menu->slider || !SetWindowSubclass(menu->slider, w_slider_proc, 1, (DWORD_PTR)menu)) {
+        if (!w_percent_slider_init(menu->slider) || !SetWindowSubclass(menu->slider, w_slider_proc, 1, (DWORD_PTR)menu)) {
             DestroyWindow(popup);
             return;
         }
-        SendMessageW(menu->slider, TBM_SETRANGE, FALSE, MAKELPARAM(0, 100));
         SendMessageW(menu->slider, TBM_SETPOS, TRUE, max(0, bar->audio_percent));
         EnableWindow(menu->slider, bar->audio_percent >= 0);
     }
@@ -410,9 +409,14 @@ static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count
     SendMessageW(menu->list, LB_SETITEMHEIGHT, 0, row_height);
     int selected = 0;
     for (int i = 1; i < count; ++i) {
-        SendMessageW(menu->list, LB_ADDSTRING, 0, (LPARAM)rows[i].label);
+        wchar_t text[256];
+        w_row_name(&rows[i],text);
+        SendMessageW(menu->list, LB_ADDSTRING, 0, (LPARAM)text);
         if (rows[i].checked)
             selected = i - 1;
+    }
+    if (rows[selected+1].disabled) {
+        for (int i=1; i<count; ++i) if (!rows[i].disabled) { selected=i-1; break; }
     }
     SendMessageW(menu->list, LB_SETCURSEL, selected, 0);
     open_menu = menu;
@@ -443,13 +447,16 @@ void w_bar_menu_audio_changed(w_bar_window *b) {
         w_volume_header(menu, b->audio_percent);
     }
     w_menu_row *mute = &menu->rows[1];
+    bool changed = mute->disabled != !available;
     mute->disabled = !available;
     const wchar_t *label = b->audio_muted ? L"Unmute" : L"Mute";
-    if (wcscmp(label, mute->label)) {
+    if (changed || wcscmp(label, mute->label)) {
+        wchar_t text[256];
         int selected = (int)SendMessageW(menu->list, LB_GETCURSEL, 0, 0);
         wcscpy(mute->label, label);
+        w_row_name(mute,text);
         SendMessageW(menu->list, LB_DELETESTRING, 0, 0);
-        SendMessageW(menu->list, LB_INSERTSTRING, 0, (LPARAM)label);
+        SendMessageW(menu->list, LB_INSERTSTRING, 0, (LPARAM)text);
         SendMessageW(menu->list, LB_SETCURSEL, selected, 0);
     }
     InvalidateRect(menu->list, NULL, FALSE);
@@ -472,7 +479,7 @@ HWND w_bar_input_target(void) {
 
 // Windows encodes alternate layouts as Fxxx handles; their registry entries
 // identify the matching variant with "Layout Id" (for example US Dvorak).
-static void w_layout_label(HKL layout, wchar_t *out, size_t cap) {
+void w_bar_layout_label(HKL layout, wchar_t *out, size_t cap) {
     DWORD value = (DWORD)(uintptr_t)layout;
     WORD physical = HIWORD(value);
     wchar_t language[96] = {0}, name[96] = {0}, key[KL_NAMELENGTH];
@@ -514,20 +521,22 @@ static void w_language_menu(w_bar_window *b, int hit) {
     HKL active = target ? GetKeyboardLayout(GetWindowThreadProcessId(target, NULL)) : NULL;
     int count = GetKeyboardLayoutList(0, NULL);
     HKL *layouts = count > 0 ? calloc(count, sizeof(*layouts)) : NULL;
-    w_menu_row *rows = calloc((size_t)count + 3, sizeof(*rows));
+    w_menu_row *rows = calloc((size_t)count + 5, sizeof(*rows));
     if (rows) {
-        wcscpy(rows[0].label, L"Keyboard layouts");
+        wcscpy(rows[0].label, L"Languages & input");
         count = layouts ? GetKeyboardLayoutList(count, layouts) : 0;
         for (int i = 0; i < count; ++i) {
             w_menu_row *row = &rows[i + 1];
             row->layout = layouts[i];
             row->checked = active == layouts[i];
             row->disabled = !target;
-            w_layout_label(layouts[i], row->label, count_of(row->label));
+            w_bar_layout_label(layouts[i], row->label, count_of(row->label));
         }
-        rows[count + 1] = (w_menu_row){.label = L"Add languages and keyboards\u2026", .action = "languages"};
-        rows[count + 2] = (w_menu_row){.label = L"Set up keyboard layouts\u2026", .action = "keyboard_settings"};
-        w_show(b, hit, rows, count + 3, target);
+        rows[count + 1] = (w_menu_row){.label=L"Add or remove languages", .action="languages", .glyph=0xe710, .opens_panel=true};
+        rows[count + 2] = (w_menu_row){.label=L"Manage keyboard layouts", .action="keyboard_settings", .glyph=0xe765, .opens_panel=true};
+        rows[count + 3] = (w_menu_row){.label=L"Input methods and typing", .action="input_methods", .glyph=0xe8d2, .opens_panel=true};
+        rows[count + 4] = (w_menu_row){.label=L"Get Google Japanese Input", .action="google_japanese_input", .glyph=0xe896, .opens_panel=true};
+        w_show(b, hit, rows, count + 5, target);
     }
     free(rows);
     free(layouts);
@@ -564,7 +573,7 @@ bool w_bar_menu_open(w_bar_window *b, int hit) {
         b->invoke(b->output, "date_time");
         return true;
     }
-    w_menu_row rows[5] = {0};
+    w_menu_row rows[9] = {0};
     int n = 1;
     if (!strcmp(key, "audio")) {
         if (b->audio_percent < 0)
@@ -574,21 +583,27 @@ bool w_bar_menu_open(w_bar_window *b, int hit) {
                      b->audio_muted ? L"Muted" : L"Output volume", b->audio_percent);
         wcscpy(rows[n].label, b->audio_muted ? L"Unmute" : L"Mute");
         rows[n].disabled = b->audio_percent < 0;
+        rows[n].glyph = 0xe74f;
         rows[n++].action = "mute";
-        rows[n++] = (w_menu_row){.label = L"Volume mixer\u2026", .action = "volume_mixer"};
-        rows[n++] = (w_menu_row){.label = L"Choose sound devices\u2026", .action = "audio"};
+        rows[n++] = (w_menu_row){.label=L"Output devices", .action="audio", .glyph=0xe7f5, .opens_panel=true};
+        rows[n++] = (w_menu_row){.label=L"Microphones", .action="microphone", .glyph=0xe720, .opens_panel=true};
+        rows[n++] = (w_menu_row){.label=L"App volume mixer", .action="volume_mixer", .glyph=0xe9e9, .opens_panel=true};
     } else if (!strcmp(key, "battery")) {
-        wcsncpy(rows[0].label, b->hits[hit].tooltip, count_of(rows[0].label) - 1);
-        rows[n++] = (w_menu_row){.label = L"Keep awake", .checked = b->view.inhibit, .action = "idle_inhibit"};
-        rows[n++] = (w_menu_row){.label = L"Power settings\u2026", .action = "power_settings"};
-        rows[n++] = (w_menu_row){.label = L"Sleep\u2026", .action = "sleep"};
-        rows[n++] = (w_menu_row){.label = L"Restart\u2026", .action = "restart"};
+        wcscpy(rows[0].label,L"Power and session");
+        rows[n++] = (w_menu_row){.label=L"Keep awake", .checked=b->view.inhibit, .action="idle_inhibit", .glyph=0xe7e8};
+        rows[n++] = (w_menu_row){.label=L"Power plans and timeouts", .action="power_settings", .glyph=0xe83e, .opens_panel=true};
+        rows[n++] = (w_menu_row){.label=L"Configure toolbar", .action="bar_settings", .glyph=0xe713, .opens_panel=true};
+        rows[n++] = (w_menu_row){.label=L"Lock", .action="lock", .glyph=0xe72e};
+        rows[n++] = (w_menu_row){.label=L"Sleep\u2026", .action="sleep", .glyph=0xe708};
+        rows[n++] = (w_menu_row){.label=L"Restart\u2026", .action="restart", .glyph=0xe777};
+        rows[n++] = (w_menu_row){.label=L"Sign out\u2026", .action="confirm_sign_out", .glyph=0xf3b1};
     } else if (!strcmp(key, "media")) {
         wcscpy(rows[0].label, L"Playback");
-        rows[n++] = (w_menu_row){.label = L"Play / pause", .action = "media_play"};
-        rows[n++] = (w_menu_row){.label = L"Previous track", .action = "media_previous"};
-        rows[n++] = (w_menu_row){.label = L"Next track", .action = "media_next"};
-        rows[n++] = (w_menu_row){.label = L"Stop", .action = "media_stop"};
+        rows[n++] = (w_menu_row){.label=L"Play / pause", .action="media_play", .glyph=0xe768};
+        rows[n++] = (w_menu_row){.label=L"Previous track", .action="media_previous", .glyph=0xe892};
+        rows[n++] = (w_menu_row){.label=L"Next track", .action="media_next", .glyph=0xe893};
+        rows[n++] = (w_menu_row){.label=L"Stop", .action="media_stop", .glyph=0xe71a};
+        rows[n++] = (w_menu_row){.label=L"App volume mixer", .action="volume_mixer", .glyph=0xe9e9, .opens_panel=true};
     } else
         return false;
     w_show(b, hit, rows, n, NULL);

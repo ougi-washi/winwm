@@ -205,14 +205,25 @@ void w_desktop_activate(int slot) {
     w_desktop_apply();
 }
 
+bool w_desktop_close_target(HWND window, DWORD pid, w_window_id owner) {
+    DWORD current = 0;
+    GetWindowThreadProcessId(window,&current);
+    if (!pid || current != pid || !w_model_valid(&desk.model,owner) ||
+        !w_model_visible(&desk.model,owner.slot) || !w_can_activate(window) || IsIconic(window) ||
+        w_os_cloaked(window) || w_os_app_window(window) != desk.windows[owner.slot].hwnd)
+        return false;
+    w_desktop_focus_cancel();
+    w_select_owner(desk.windows[owner.slot].hwnd);
+    return PostMessageW(window, WM_CLOSE, 0, 0) != 0;
+}
+
 bool w_desktop_close_foreground(void) {
     HWND window = GetForegroundWindow();
     int slot = w_desktop_find(w_os_app_window(window));
-    if (slot < 0 || !w_model_visible(&desk.model, slot) || !w_can_activate(window))
-        return false;
-    w_desktop_focus_cancel();
-    w_select_owner(desk.windows[slot].hwnd);
-    return PostMessageW(window, WM_CLOSE, 0, 0) != 0;
+    if (slot < 0) return false;
+    DWORD pid = 0;
+    GetWindowThreadProcessId(window,&pid);
+    return w_desktop_close_target(window,pid,(w_window_id){slot,desk.model.windows[slot].generation});
 }
 
 static BOOL CALLBACK w_await_owned_popup(HWND window, LPARAM owner) {

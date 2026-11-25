@@ -15,16 +15,17 @@ enum { command_prompt = -palette_group_count, command_submit = command_prompt - 
 static const struct {
     const wchar_t *label;
     wchar_t glyph;
+    const wchar_t *hint;
 } groups[palette_group_count] = {
-    [palette_apps] = {L"Applications", 0xe71d},
-    [palette_places] = {L"Places", 0xe8b7},
-    [palette_windows] = {L"Windows & workspaces", 0xe737},
-    [palette_capture] = {L"Capture", 0xe722},
-    [palette_devices] = {L"Devices", 0xe772},
-    [palette_appearance] = {L"Appearance", 0xe790},
-    [palette_tools] = {L"Tools", 0xe90f},
-    [palette_developer] = {L"Developer", 0xe756},
-    [palette_system] = {L"System", 0xe7e8},
+    [palette_apps] = {L"Applications", 0xe71d, L"Installed apps"},
+    [palette_places] = {L"Files & projects", 0xe8b7, L"Folders and terminals"},
+    [palette_windows] = {L"Windows & workspaces", 0xe737, L"Tiling and monitors"},
+    [palette_tools] = {L"Tools", 0xe756, L"Commands, capture, clipboard"},
+    [palette_settings] = {L"Settings", 0xe713, L"Devices and appearance"},
+    [palette_input] = {L"Languages & input", 0xe8c1, L"Keyboards and IMEs"},
+    [palette_software] = {L"Software", 0xe896, L"Install and update"},
+    [palette_session] = {L"Session", 0xe7e8, L"Lock, sleep, sign out"},
+    [palette_toolbar] = {L"Toolbar actions", 0xe713, L"Configured commands"},
 };
 
 typedef struct {
@@ -171,6 +172,7 @@ static int w_match_tier(const wchar_t *text, const wchar_t *query, const w_query
     const wchar_t *hit = wcsstr(text, query);
     if (hit == text)
         return 1;
+    if (!hit && !query[1]) return -1;
     for (const wchar_t *p = hit; p; p = wcsstr(p + 1, query)) {
         if (w_word_start(text, p)) {
             *cost += (int)(p - text);
@@ -265,8 +267,12 @@ static void w_search_results(void) {
         }
     }
     if (!grouped || group || word_count) {
-        if (run_line && (group == palette_developer || (!group && word_count))) {
+        if (run_line && (group == palette_tools || (!group && word_count))) {
             int cost=0, tier=word_count ? w_match_tier(L"run a command",query,words,word_count,&cost) : 0;
+            if (word_count && tier != 0) {
+                int alt_cost=0, alt=w_match_tier(L"execute command shell cmd powershell",query,words,word_count,&alt_cost);
+                if (alt>=0 && (tier<0 || alt<tier)) { tier=alt; cost=alt_cost+palette_text_capacity; }
+            }
             if (tier >= 0) results[result_count++] = (w_result){command_prompt,tier,cost};
         }
         for (int i = 0; i < row_count; ++i) {
@@ -275,7 +281,7 @@ static void w_search_results(void) {
             int tier = 0, cost = 0;
             if (word_count) {
                 tier = w_match_tier(r->normalized, query, words, word_count, &cost);
-                if (*r->alias) {
+                if (tier != 0 && *r->alias) {
                     int alias_cost = 0, alias_tier = w_match_tier(r->alias, query, words, word_count, &alias_cost);
                     // Prefer a visible label to an equally good command alias.
                     if (alias_tier >= 0 && (tier < 0 || alias_tier < tier)) {
@@ -283,6 +289,11 @@ static void w_search_results(void) {
                         cost = alias_cost + palette_text_capacity;
                     }
                 }
+                if (tier != 0 && r->entry.keywords) {
+                    int extra=0, match=w_match_tier(r->entry.keywords,query,words,word_count,&extra);
+                    if (match>=0 && (tier<0 || match<tier)) { tier=match; cost=extra+2*palette_text_capacity; }
+                }
+                if (!tier && !*r->alias && r->entry.group==palette_apps) --cost;
             }
             if (tier >= 0) results[result_count++] = (w_result){i,tier,cost};
         }
@@ -380,7 +391,7 @@ static void w_draw_result(NMLVCUSTOMDRAW *draw) {
     if (source == no_result) return;
     const w_palette_entry *entry = source >= 0 ? &rows[source].entry : NULL;
     bool category = source < 0 && source > command_prompt;
-    enum w_palette_group kind = entry ? entry->group : category ? (enum w_palette_group)-source : palette_developer;
+    enum w_palette_group kind = entry ? entry->group : category ? (enum w_palette_group)-source : palette_tools;
     RECT r = {0};
     if (!ListView_GetItemRect(list,index,&r,LVIR_BOUNDS)) return;
     RECT viewport;
@@ -410,6 +421,14 @@ static void w_draw_result(NMLVCUSTOMDRAW *draw) {
         arrow.left = arrow.right-px(21);
         w_glyph(dc, 0xe76c, arrow, selected ? ink : w_theme_accent());
         label.right = arrow.left-px(6);
+        if (viewport.right >= px(435)) {
+            RECT hint=label;
+            hint.left+=px(183);
+            SelectObject(dc,small_font);
+            SetTextColor(dc,selected ? ink : w_theme_hint());
+            DrawTextW(dc,groups[kind].hint,-1,&hint,DT_RIGHT|DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
+            label.right=hint.left-px(6);
+        }
     } else if (kind && !group && viewport.right >= px(350)) {
         SelectObject(dc, small_font);
         SIZE size;
@@ -677,7 +696,7 @@ static bool w_create_palette(void) {
     WNDCLASSW wc = {.hInstance = inst, .lpszClassName = L"WinwmPalette", .lpfnWndProc = w_palette_proc,
                     .hCursor = LoadCursorW(NULL,IDC_ARROW)};
     RegisterClassW(&wc);
-    panel = CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST, wc.lpszClassName,L"Run",
+    panel = CreateWindowExW(WS_EX_TOOLWINDOW|WS_EX_TOPMOST, wc.lpszClassName,L"Menu",
                             WS_POPUP|WS_THICKFRAME|WS_SYSMENU|WS_CLIPCHILDREN,CW_USEDEFAULT,0,540,480,NULL,NULL,inst,NULL);
     if (!panel) return false;
     DWORD visible = WS_CHILD|WS_VISIBLE;
@@ -762,7 +781,7 @@ void w_palette_open(HMONITOR monitor, const wchar_t *title, const w_palette_entr
     run_line = line_callback;
     if (run_line) {
         grouped = true;
-        ++in_group[palette_developer];
+        ++in_group[palette_tools];
     }
     // Leave room beyond the dispatch limit so an oversized paste stays invalid.
     SendMessageW(edit,EM_SETLIMITTEXT,run_line ? UINT16_MAX : palette_text_capacity-1,0);
@@ -795,6 +814,11 @@ void w_palette_open(HMONITOR monitor, const wchar_t *title, const w_palette_entr
     w_route(palette_flat);
     if (preserve) return;
     if (!w_palette_shown()) return_to = GetForegroundWindow();
+    w_palette_position(monitor);
+    w_palette_focus();
+}
+
+void w_palette_position(HMONITOR monitor) {
     MONITORINFO mi = {.cbSize = sizeof(mi)};
     if (!monitor || !GetMonitorInfoW(monitor,&mi)) {
         monitor = MonitorFromWindow(GetForegroundWindow(),MONITOR_DEFAULTTOPRIMARY);
@@ -802,11 +826,17 @@ void w_palette_open(HMONITOR monitor, const wchar_t *title, const w_palette_entr
     }
     UINT dpi=96, vertical=96;
     GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpi, &vertical);
-    int width = min(mi.rcWork.right-mi.rcWork.left, MulDiv(520,dpi,96));
-    int height = min(mi.rcWork.bottom-mi.rcWork.top, MulDiv(grouped ? 512 : 404,dpi,96));
+    int width = MulDiv(520,dpi,96), height = MulDiv(grouped ? 512 : 404,dpi,96);
+    RECT current;
+    UINT old_dpi = GetDpiForWindow(panel);
+    if (w_palette_shown() && old_dpi && GetWindowRect(panel,&current)) {
+        width = MulDiv(current.right-current.left,dpi,old_dpi);
+        height = MulDiv(current.bottom-current.top,dpi,old_dpi);
+    }
+    width = min(mi.rcWork.right-mi.rcWork.left,width);
+    height = min(mi.rcWork.bottom-mi.rcWork.top,height);
     SetWindowPos(panel,HWND_TOPMOST,(mi.rcWork.left+mi.rcWork.right-width)/2,
                  (mi.rcWork.top+mi.rcWork.bottom-height)/2,width,height,SWP_SHOWWINDOW|SWP_NOACTIVATE);
-    w_palette_focus();
 }
 
 bool w_palette_visible(const wchar_t *title) {

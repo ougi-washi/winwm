@@ -1,7 +1,7 @@
 #include "bar/bar.h"
 #include "bar/menu.h"
+#include "bar/tooltip.h"
 #include <windowsx.h>
-#include <commctrl.h>
 #include <stdio.h>
 #include <wchar.h>
 
@@ -16,11 +16,23 @@ static int w_format_module(w_bar_window *b, const char *key, wchar_t *s, int cap
     if (!strncmp(key, "custom/", 7) && b->custom)
         b->custom(key, s, cap, action, 128);
     else if (!strcmp(key, "menu")) {
-        wcscpy(s, L"Run");
-        strcpy(action, "launcher");
+        wcscpy(s, L"Menu");
+        strcpy(action, "menu");
     } else if (!strcmp(key, "bluetooth")) {
         wcscpy(s, L"Bluetooth devices");
         strcpy(action, "bluetooth");
+    } else if (!strcmp(key,"display")) {
+        swprintf(s,cap,L"%d×%d",b->screen.w,b->screen.h);
+        strcpy(action,"display");
+    } else if (!strcmp(key,"project")) {
+        wcscpy(s,L"Projects");
+        strcpy(action,"project");
+    } else if (!strcmp(key,"clipboard")) {
+        wcscpy(s,L"Clipboard history");
+        strcpy(action,"clipboard");
+    } else if (!strcmp(key,"notifications")) {
+        wcscpy(s,L"Desktop notifications");
+        strcpy(action,"notifications");
     } else if (!strcmp(key, "audio")) {
         if (b->audio_percent < 0)
             wcscpy(s, L"No audio output");
@@ -54,11 +66,6 @@ static int w_format_module(w_bar_window *b, const char *key, wchar_t *s, int cap
         else
             wcscpy(s, L"KB");
         strcpy(action, "languages");
-    } else if (!strcmp(key, "memory")) {
-        MEMORYSTATUSEX ms = {.dwLength = sizeof(ms)};
-        if (GlobalMemoryStatusEx(&ms))
-            swprintf(s, cap, L"%lu%% RAM", ms.dwMemoryLoad);
-        strcpy(action, "activity");
     } else if (b->custom)
         b->custom(key, s, cap, action, 128);
     return (int)wcslen(s);
@@ -67,16 +74,33 @@ static int w_format_module(w_bar_window *b, const char *key, wchar_t *s, int cap
 typedef struct w_bar_cell {
     wchar_t text[256], tooltip[256];
     const w_module_style *style;
-    char action[128], key[56];
+    char action[128], key[56], instance[56];
     int width, workspace;
     bar_icon icon;
-    bool active, empty;
+    bool active, empty, label;
 } w_bar_cell;
 
 typedef struct w_bar_group {
     w_bar_cell *cells;
     int capacity, count, length;
 } w_bar_group;
+
+// Keep source and destination separate so repeated fields can be expanded safely.
+static void w_template(const char *format, const wchar_t *value, wchar_t *out, size_t cap) {
+    wchar_t pattern[192];
+    if (!w_os_wide(format,pattern,count_of(pattern))) return;
+    size_t used=0;
+    for (const wchar_t *p=pattern; *p && used+1<cap;) {
+        if (!wcsncmp(p,L"{text}",6)) {
+            size_t n=min(wcslen(value),cap-1-used);
+            wmemcpy(out+used,value,n);
+            used+=n;
+            p+=6;
+        } else out[used++]=*p++;
+    }
+    if (used && IS_HIGH_SURROGATE(out[used-1])) --used;
+    out[used]=0;
+}
 
 static void w_measure(w_bar_window *b, HDC dc, const char *spec, bool vertical, w_bar_group *g) {
     w_bar_cell *cells = g->cells;
@@ -105,7 +129,7 @@ static void w_measure(w_bar_window *b, HDC dc, const char *spec, bool vertical, 
             *cell = (w_bar_cell){0};
             if (spaces) {
                 cell->workspace = j+1;
-                if (j >= 5 && j != b->view.selected && !(b->view.occupied & (1 << j)))
+                if (j >= b->config->bar_workspace_count && j != b->view.selected && !(b->view.occupied & (1 << j)))
                     continue;
                 if (!b->config->workspace_names[j][0] ||
                     !w_os_wide(b->config->workspace_names[j], cell->text, count_of(cell->text)))
@@ -117,34 +141,24 @@ static void w_measure(w_bar_window *b, HDC dc, const char *spec, bool vertical, 
                 continue;
             cell->style = style;
             wcscpy(cell->tooltip, cell->text);
-            if (!strcmp(base, "keyboard")) {
-                HKL layout = GetKeyboardLayout(GetWindowThreadProcessId(w_bar_input_target(), NULL));
-                GetLocaleInfoW(LOWORD((uintptr_t)layout), LOCALE_SLOCALIZEDDISPLAYNAME, cell->tooltip,
-                               count_of(cell->tooltip));
-            } else if (!strcmp(base, "clock")) {
+            if (!strcmp(base, "clock")) {
                 GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, DATE_LONGDATE, NULL, NULL, cell->tooltip,
                                 count_of(cell->tooltip), NULL);
             }
             if (style) {
                 if (*style->tooltip)
-                    w_os_wide(style->tooltip, cell->tooltip, count_of(cell->tooltip));
+                    w_template(style->tooltip,cell->text,cell->tooltip,count_of(cell->tooltip));
                 if (*style->action)
                     strcpy(cell->action, style->action);
                 if (*style->format) {
-                    wchar_t format[128];
-                    if (w_os_wide(style->format, format, count_of(format))) {
-                        wchar_t *field = wcsstr(format, L"{text}"), out[512];
-                        if (field) {
-                            *field = 0;
-                            swprintf(out, count_of(out), L"%ls%ls%ls", format, cell->text, field + 6);
-                        } else
-                            wcscpy(out, format);
-                        wcsncpy(cell->text, out, count_of(cell->text) - 1);
-                        cell->text[count_of(cell->text) - 1] = 0;
-                    }
+                    wchar_t raw[count_of(cell->text)];
+                    wcscpy(raw,cell->text);
+                    w_template(style->format,raw,cell->text,count_of(cell->text));
                 }
             }
-            bool clock_lines = vertical && !strcmp(base, "clock") && (!style || !*style->format);
+            enum w_module_display display = style ? style->display : module_auto;
+            bool formatted = style && *style->format;
+            bool clock_lines = vertical && !strcmp(base, "clock") && !formatted && display != module_icon;
             if (clock_lines) {
                 if (b->calendar_date) {
                     SYSTEMTIME t;
@@ -153,15 +167,19 @@ static void w_measure(w_bar_window *b, HDC dc, const char *spec, bool vertical, 
                 } else
                     cell->text[2] = L'\n';
             }
-            if (!style || !*style->format) {
+            if (display != module_text && (display != module_auto || !formatted)) {
                 static const struct w_module_icon {
                     const char *key;
                     bar_icon icon;
-                } icons[] = {{"menu", icon_run},    {"bluetooth", icon_bluetooth}, {"network", icon_network},
+                } icons[] = {{"menu", icon_menu},    {"bluetooth", icon_bluetooth}, {"network", icon_network},
                              {"audio", icon_audio}, {"battery", icon_battery},     {"memory", icon_memory},
-                             {"media", icon_play},  {"cpu", icon_memory}};
+                             {"media", icon_play},  {"cpu", icon_cpu}, {"keyboard",icon_keyboard},
+                             {"clock",icon_clock}, {"throughput",icon_traffic}, {"display",icon_display},
+                             {"project",icon_project}, {"clipboard",icon_clipboard}, {"notifications",icon_bell}};
                 for (size_t k = 0; b->icons.coverage && k < count_of(icons); ++k)
                     if (!strcmp(base, icons[k].key)) {
+                        if (display == module_auto && (!strcmp(base,"clock") || !strcmp(base,"keyboard") ||
+                                                      !strcmp(base,"throughput"))) break;
                         cell->icon = icons[k].icon;
                         if (cell->icon == icon_audio && (b->audio_muted || b->audio_percent < 0))
                             cell->icon = icon_muted;
@@ -174,13 +192,33 @@ static void w_measure(w_bar_window *b, HDC dc, const char *spec, bool vertical, 
                         break;
                     }
             }
+            cell->label = !cell->icon || display == module_icon_text;
+            if (cell->icon && display == module_auto && !vertical)
+                cell->label = !strcmp(base,"cpu") || !strcmp(base,"memory") || !strcmp(base,"display") ||
+                              (!strcmp(base,"audio") && b->audio_percent >= 0) ||
+                              (!strcmp(base,"battery") && cell->icon != icon_plug);
+            if (cell->label && cell->icon && !formatted) {
+                // Keep the full measurement in the hover card.
+                wchar_t *percent = wcschr(cell->text,L'%');
+                if (percent) {
+                    wchar_t *start = percent;
+                    while (start>cell->text && start[-1] >= L'0' && start[-1] <= L'9') --start;
+                    if (start != percent) {
+                        percent[1]=0;
+                        memmove(cell->text,start,(wcslen(start)+1)*sizeof(*start));
+                    }
+                }
+            }
             SelectObject(dc, b->font);
             strcpy(cell->key, base);
+            strcpy(cell->instance,key);
             SIZE size;
             GetTextExtentPoint32W(dc, cell->text, (int)wcslen(cell->text), &size);
-            if (cell->icon)
-                size = (SIZE){b->icons.size, b->icons.size};
-            cell->width = vertical ? size.cy * (clock_lines ? 2 : 1) + 10 : size.cx + MulDiv(16, b->dpi, 96);
+            if (cell->icon && cell->label) {
+                if (vertical) size.cy+=b->icons.size+MulDiv(3,b->dpi,96);
+                else size.cx+=b->icons.size+MulDiv(5,b->dpi,96);
+            } else if (cell->icon) size=(SIZE){b->icons.size,b->icons.size};
+            cell->width = vertical ? size.cy * (clock_lines ? 2 : 1) + MulDiv(10,b->dpi,96) : size.cx + MulDiv(16, b->dpi, 96);
             cell->width = min(cell->width, MulDiv(160, b->dpi, 96));
             length += cell->width;
             used++;
@@ -203,11 +241,10 @@ static COLORREF w_blend(COLORREF a, COLORREF b, double t) {
                GetBValue(a)+(int)((GetBValue(b)-GetBValue(a))*t));
 }
 
-static void w_cell_colors(w_bar_window *b, struct w_bar_hit *hit, const w_bar_cell *cell,
-                          COLORREF paper, COLORREF ink, uint64_t now) {
+static void w_cell_colors(w_bar_window *b, struct w_bar_hit *hit, COLORREF paper, COLORREF ink, uint64_t now) {
     w_transition timing = b->config->motion[motion_modules];
-    bool animate = b->motion_allowed && timing.ms && !strcmp(hit->module,cell->key) &&
-                   hit->workspace == cell->workspace && hit->style == cell->style;
+    bool animate = b->motion_allowed && !b->high_contrast && timing.ms && hit->painted;
+    hit->painted = true;
     if (animate && (paper != hit->target_paper || ink != hit->target_ink)) {
         hit->from_paper = hit->paper;
         hit->from_ink = hit->ink;
@@ -229,55 +266,79 @@ static void w_cell_colors(w_bar_window *b, struct w_bar_hit *hit, const w_bar_ce
     }
 }
 
-static void w_draw_group(w_bar_window *b, HDC dc, RECT r, const w_bar_group *g, bool vertical, int pos, int end) {
-    uint64_t now = GetTickCount64();
-    for (int i = 0; i < g->count && pos < end; i++) {
-        const w_bar_cell *cell = &g->cells[i];
-        RECT box = r;
+static void w_place_group(w_bar_window *b, RECT bounds, const w_bar_group *group, bool vertical, int pos, int end) {
+    for (int i=0;i<group->count && pos<end;++i) {
+        const w_bar_cell *cell=&group->cells[i];
+        struct w_bar_hit *hit=&b->hits[b->hit_count++];
+        if (strcmp(hit->instance,cell->instance) || hit->workspace!=cell->workspace)
+            hit->painted=false;
+        hit->box=bounds;
         if (vertical) {
-            box.top = pos;
-            box.bottom = min(end, pos + cell->width);
+            hit->box.top=pos;
+            hit->box.bottom=min(pos+cell->width,end);
         } else {
-            box.left = pos;
-            box.right = min(end, pos + cell->width);
+            hit->box.left=pos;
+            hit->box.right=min(pos+cell->width,end);
         }
-        struct w_bar_hit *hit = &b->hits[b->hit_count];
-        COLORREF background = w_rgb_value(b->config->background);
-        bool hovered = b->pointer_inside && PtInRect(&box,b->pointer);
-        COLORREF paper = cell->active ? w_rgb_value(b->config->accent)
-                         : hovered ? w_mix(b->config->background,b->config->foreground,12) : background;
-        uint32_t ink = cell->active ? b->config->background :
-                       cell->style && cell->style->colored ? cell->style->color : b->config->foreground;
-        w_cell_colors(b,hit,cell,paper,cell->empty ? w_mix(b->config->background,ink,55) : w_rgb_value(ink),now);
-        paper = hit->paper;
-        if (paper != background) {
-            SetDCBrushColor(dc, paper);
-            RECT pill = box;
-            InflateRect(&pill, -2, -MulDiv(5, b->dpi, 96));
-            HGDIOBJ pen = SelectObject(dc, GetStockObject(NULL_PEN));
-            HGDIOBJ brush = SelectObject(dc, GetStockObject(DC_BRUSH));
-            RoundRect(dc, pill.left, pill.top, pill.right, pill.bottom, 8, 8);
-            SelectObject(dc, brush);
-            SelectObject(dc, pen);
+        hit->workspace=cell->workspace;
+        hit->style=cell->style;
+        hit->active=cell->active;
+        hit->empty=cell->empty;
+        hit->label=cell->label;
+        hit->icon=cell->icon;
+        strcpy(hit->module,cell->key);
+        strcpy(hit->instance,cell->instance);
+        strcpy(hit->action,cell->action);
+        wcscpy(hit->tooltip,cell->tooltip);
+        wcscpy(hit->text,cell->text);
+        pos+=cell->width;
+    }
+}
+
+static void w_paint_hit(w_bar_window *b,HDC dc,struct w_bar_hit *hit,COLORREF background,bool vertical,uint64_t now) {
+    RECT box=hit->box;
+    bool hovered=b->pointer_inside && PtInRect(&box,b->pointer);
+    COLORREF paper=hit->active ? w_rgb_value(b->config->accent) :
+                   hovered ? w_mix(b->config->background,b->config->foreground,12) : background;
+    uint32_t color=hit->active ? b->config->background :
+                   hit->style && hit->style->colored ? hit->style->color : b->config->foreground;
+    COLORREF ink=hit->empty ? w_mix(b->config->background,color,55) : w_rgb_value(color);
+    if (b->high_contrast) {
+        paper=hit->active || hovered ? GetSysColor(COLOR_HIGHLIGHT) : background;
+        ink=GetSysColor(hit->active || hovered ? COLOR_HIGHLIGHTTEXT : COLOR_WINDOWTEXT);
+    }
+    w_cell_colors(b,hit,paper,ink,now);
+    if (hit->paper != background) {
+        RECT pill=box;
+        InflateRect(&pill,-MulDiv(2,b->dpi,96),-MulDiv(3,b->dpi,96));
+        SetDCBrushColor(dc,hit->paper);
+        HGDIOBJ pen=SelectObject(dc,GetStockObject(NULL_PEN)),brush=SelectObject(dc,GetStockObject(DC_BRUSH));
+        int radius=MulDiv(8,b->dpi,96);
+        RoundRect(dc,pill.left,pill.top,pill.right,pill.bottom,radius,radius);
+        SelectObject(dc,brush);
+        SelectObject(dc,pen);
+    }
+    SetTextColor(dc,hit->ink);
+    RECT label=box,icon=box;
+    if (hit->icon && hit->label) {
+        if (vertical) {
+            icon.top+=MulDiv(5,b->dpi,96);
+            icon.bottom=icon.top+b->icons.size;
+            label.top=icon.bottom;
+        } else {
+            icon.left+=MulDiv(8,b->dpi,96);
+            icon.right=icon.left+b->icons.size;
+            label.left=icon.right+MulDiv(5,b->dpi,96);
+            label.right-=MulDiv(6,b->dpi,96);
         }
-        SetTextColor(dc, hit->ink);
-        SelectObject(dc, b->font);
-        UINT flags = DT_CENTER | DT_NOPREFIX;
-        if (!wcschr(cell->text, L'\n'))
-            flags |= DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS;
-        if (cell->icon)
-            w_icons_draw(&b->icons, dc, cell->icon, box, GetTextColor(dc), paper);
-        else
-            DrawTextW(dc, cell->text, -1, &box, flags);
-        if (b->hit_count < (int)count_of(b->hits)) {
-            hit->workspace = cell->workspace;
-            strcpy(b->hits[b->hit_count].module, cell->key);
-            b->hits[b->hit_count].style = cell->style;
-            wcscpy(b->hits[b->hit_count].tooltip, cell->tooltip);
-            b->hits[b->hit_count].box = box;
-            strcpy(b->hits[b->hit_count++].action, cell->action);
-        }
-        pos += cell->width;
+    }
+    if (hit->icon && icon.right-icon.left>=b->icons.size && icon.bottom-icon.top>=b->icons.size &&
+        icon.right<=box.right && icon.bottom<=box.bottom)
+        w_icons_draw(&b->icons,dc,hit->icon,icon,hit->ink,hit->paper);
+    if (hit->label && label.right>label.left && label.bottom>label.top) {
+        UINT flags=DT_NOPREFIX|DT_CENTER;
+        if (!wcschr(hit->text,L'\n')) flags|=DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS;
+        DrawTextW(dc,hit->text,-1,&label,flags);
     }
 }
 
@@ -289,6 +350,7 @@ static int w_hit_at(const w_bar_window *b, POINT p) {
 }
 
 static void w_hover(w_bar_window *b, int hit) {
+    w_bar_tip_track(b,hit);
     if (hit == b->hover)
         return;
     int previous = b->hover;
@@ -330,33 +392,33 @@ static HDC w_paint_buffer(w_bar_window *b, HDC target, RECT r) {
     return dc;
 }
 
+static void w_bar_layout(w_bar_window *b,HDC dc,RECT r,bool vertical);
+
 static LRESULT w_paint_bar(w_bar_window *b, HWND w) {
     PAINTSTRUCT ps;
     HDC target = BeginPaint(w, &ps);
     RECT r;
     GetClientRect(w, &r);
     HDC dc = w_paint_buffer(b, target, r);
-    SetDCBrushColor(dc, w_rgb_value(b->config->background));
-    FillRect(dc, &r, GetStockObject(DC_BRUSH));
+    COLORREF background=b->high_contrast ? GetSysColor(COLOR_WINDOW) : w_rgb_value(b->config->background);
+    SetDCBrushColor(dc, background);
+    FillRect(dc, &ps.rcPaint, GetStockObject(DC_BRUSH));
     HGDIOBJ old = SelectObject(dc, b->font ? b->font : GetStockObject(DEFAULT_GUI_FONT));
     SetBkMode(dc, TRANSPARENT);
     bool vertical = r.bottom > r.right;
-    int length = vertical ? r.bottom : r.right;
-    int margin = MulDiv(6, b->dpi ? b->dpi : 96, 96);
-    w_bar_cell cells[48];
-    w_bar_group left = {.cells = cells, .capacity = count_of(cells)};
-    w_measure(b, dc, b->config->bar_left, vertical, &left);
-    w_bar_group center = {.cells = cells + left.count, .capacity = left.capacity - left.count};
-    w_measure(b, dc, b->config->bar_center, vertical, &center);
-    w_bar_group right = {.cells = center.cells + center.count, .capacity = center.capacity - center.count};
-    w_measure(b, dc, b->config->bar_right, vertical, &right);
-    int middle = max(margin, (length - center.length) / 2);
-    int center_end = min(length - margin, middle + center.length);
-    int right_start = max(center.length ? center_end : margin, length - margin - right.length);
-    b->hit_count = 0;
-    w_draw_group(b, dc, r, &left, vertical, margin, center.length ? middle : right_start);
-    w_draw_group(b, dc, r, &center, vertical, middle, center_end);
-    w_draw_group(b, dc, r, &right, vertical, right_start, length - margin);
+    if (EqualRect(&r,&ps.rcPaint) || !b->hit_count)
+        w_bar_layout(b,dc,r,vertical);
+    if (b->pointer_inside && !b->pressed) {
+        int hit=w_hit_at(b,b->pointer);
+        w_hover(b,hit);
+        if (b->tip.showing && EqualRect(&r,&ps.rcPaint)) w_bar_tip_update(b);
+    }
+    uint64_t now=GetTickCount64();
+    for (int i=0; i<b->hit_count; ++i) {
+        RECT dirty;
+        if (IntersectRect(&dirty,&ps.rcPaint,&b->hits[i].box))
+            w_paint_hit(b,dc,&b->hits[i],background,vertical,now);
+    }
     SelectObject(dc, old);
     if (dc != target) {
         RECT dirty = ps.rcPaint;
@@ -366,6 +428,61 @@ static LRESULT w_paint_bar(w_bar_window *b, HWND w) {
     EndPaint(w, &ps);
     w_os_mark(L"bar_paint");
     return 0;
+}
+
+static void w_bar_layout(w_bar_window *b,HDC dc,RECT r,bool vertical) {
+    int length = vertical ? r.bottom : r.right;
+    int margin = MulDiv(6, b->dpi ? b->dpi : 96, 96);
+    const char *groups[]={b->config->bar_left,b->config->bar_center,b->config->bar_right};
+    int count=0;
+    for (size_t i=0;i<count_of(groups);++i) {
+        const char *p=groups[i];
+        while (*(p+=strspn(p," "))) {
+            size_t n=strcspn(p," ");
+            bool spaces=n>=10 && !strncmp(p,"workspaces",10) && (n==10 || p[10]=='#');
+            count+=spaces ? workspace_limit : 1;
+            p+=n;
+        }
+    }
+    b->hit_count=0;
+    if (!count) return;
+    // A named workspace instance may expand as other workspaces become occupied.
+    // The three configuration strings bound the total. Retain storage through resizes.
+    if (count>b->cell_capacity) {
+        w_bar_cell *cells=malloc((size_t)count*sizeof(*cells));
+        struct w_bar_hit *hits=calloc((size_t)count,sizeof(*hits));
+        if (!cells || !hits) { free(cells); free(hits); return; }
+        free(b->cells);
+        free(b->hits);
+        b->cells=cells;
+        b->hits=hits;
+        b->cell_capacity=count;
+    }
+    w_bar_group left = {.cells = b->cells, .capacity = count};
+    w_measure(b, dc, b->config->bar_left, vertical, &left);
+    w_bar_group center = {.cells = b->cells + left.count, .capacity = left.capacity - left.count};
+    w_measure(b, dc, b->config->bar_center, vertical, &center);
+    w_bar_group right = {.cells = center.cells + center.count, .capacity = center.capacity - center.count};
+    w_measure(b, dc, b->config->bar_right, vertical, &right);
+    if (!vertical && left.length+center.length+right.length>length-2*margin) {
+        w_bar_group *groups[]={&right,&left,&center};
+        for (size_t k=0;k<count_of(groups);k++)
+            for (int i=0;i<groups[k]->count && left.length+center.length+right.length>length-2*margin;i++) {
+                w_bar_cell *cell=&groups[k]->cells[i];
+                if (!cell->icon || !cell->label || (cell->style && cell->style->display!=module_auto)) continue;
+                cell->label=false;
+                int width=b->icons.size+MulDiv(16,b->dpi,96);
+                groups[k]->length+=width-cell->width;
+                cell->width=width;
+            }
+    }
+    // Keep status controls on the trailing edge. Shift the clock before clipping a group.
+    int right_start=max(margin,length-margin-right.length);
+    int middle=max(margin,min(max(margin+left.length,(length-center.length)/2),right_start-center.length));
+    int center_end=min(right_start,middle+center.length);
+    w_place_group(b,r,&left,vertical,margin,center.length ? middle : right_start);
+    w_place_group(b,r,&center,vertical,middle,center_end);
+    w_place_group(b,r,&right,vertical,right_start,length-margin);
 }
 
 static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
@@ -378,6 +495,26 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return DefWindowProcW(w, msg, wp, lp);
     if (msg == WM_PAINT)
         return w_paint_bar(b, w);
+    // A status or configuration change can move controls before the next WM_PAINT.
+    if (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONUP || msg==WM_RBUTTONUP || msg==WM_MBUTTONUP ||
+        msg==WM_MOUSEWHEEL) UpdateWindow(w);
+    if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN ||
+        msg == WM_MOUSEWHEEL || msg == WM_CANCELMODE) w_bar_tip_hide(b);
+    if (msg == WM_TIMER && (wp == bar_tip_show_timer || wp == bar_tip_hide_timer)) {
+        w_bar_tip_timer(b,wp);
+        return 0;
+    }
+    if (msg == WM_MOVE || msg == WM_SIZE || msg == WM_THEMECHANGED || msg == WM_SETTINGCHANGE ||
+        msg == WM_SYSCOLORCHANGE) {
+        if (msg == WM_SIZE) InvalidateRect(w,NULL,FALSE);
+        if (msg != WM_MOVE && msg != WM_SIZE) {
+            HIGHCONTRASTW hc={.cbSize=sizeof(hc)};
+            b->high_contrast=SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(hc),&hc,0) && (hc.dwFlags&HCF_HIGHCONTRASTON);
+            InvalidateRect(w,NULL,FALSE);
+        }
+        b->pointer_inside=false;
+        w_hover(b,-1);
+    }
     if (msg == WM_TIMER && wp == bar_modules_timer) {
         bool active = false;
         for (int i = 0; i < b->hit_count; i++)
@@ -397,22 +534,25 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == WM_SHOWWINDOW && !wp) {
+        w_bar_tip_track(b,-1);
         KillTimer(w,bar_modules_timer);
         KillTimer(w,bar_fade_timer);
         b->modules_ticking = b->pointer_inside = false;
         b->fade = (w_layer_fade){0};
         b->hover = -1;
         b->hit_count = 0;
-        memset(b->hits,0,sizeof(b->hits));
+        if (b->hits) memset(b->hits,0,(size_t)b->cell_capacity*sizeof(*b->hits));
         w_bar_menu_close(b, true);
     }
     if (msg == WM_MOUSEMOVE && !b->pressed) {
         POINT p = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         b->pointer = p;
-        b->pointer_inside = true;
-        TRACKMOUSEEVENT track = {sizeof(track), TME_LEAVE, w, 0};
-        TrackMouseEvent(&track);
+        if (!b->pointer_inside) {
+            TRACKMOUSEEVENT track = {sizeof(track), TME_LEAVE, w, 0};
+            b->pointer_inside = TrackMouseEvent(&track)!=0;
+        }
         w_hover(b, w_hit_at(b, p));
+        w_bar_tip_move(b);
         return 0;
     }
     if (msg == WM_MOUSELEAVE) {
@@ -421,26 +561,25 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == WM_DESTROY) {
+        w_bar_tip_track(b,-1);
+        if (IsWindow(b->tip.window)) DestroyWindow(b->tip.window);
+        b->tip.window=NULL;
         w_free_buffer(b);
         DeleteObject(b->font);
+        DeleteObject(b->heading_font);
         w_icons_free(&b->icons);
-        return 0;
-    }
-    if (msg == WM_NOTIFY && ((NMHDR *)lp)->code == TTN_GETDISPINFOW) {
-        NMTTDISPINFOW *tip = (NMTTDISPINFOW *)lp;
-        POINT p;
-        GetCursorPos(&p);
-        ScreenToClient(w, &p);
-        tip->lpszText = L"";
-        for (int i = 0; i < b->hit_count; i++)
-            if (PtInRect(&b->hits[i].box, p)) {
-                tip->lpszText = b->hits[i].tooltip;
-                break;
-            }
+        free(b->hits);
+        free(b->cells);
+        b->hits=NULL;
+        b->cells=NULL;
+        b->cell_capacity=b->hit_count=0;
         return 0;
     }
     if (msg == WM_LBUTTONDOWN) {
         b->press = (POINT){GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+        int hit=w_hit_at(b,b->press);
+        strcpy(b->press_instance,hit>=0 ? b->hits[hit].instance : "");
+        b->press_workspace=hit>=0 ? b->hits[hit].workspace : 0;
         ClientToScreen(w, &b->press);
         b->pressed = true;
         SetCapture(w);
@@ -474,7 +613,8 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         int hit = w_hit_at(b, p);
         POINT start = b->press;
         ScreenToClient(w, &start);
-        if (hit != w_hit_at(b, start))
+        if (hit != w_hit_at(b, start) || hit<0 || strcmp(b->press_instance,b->hits[hit].instance) ||
+            b->press_workspace!=b->hits[hit].workspace)
             return 0;
         bool custom_action = hit >= 0 && b->hits[hit].style && *b->hits[hit].style->action;
         if (hit >= 0 && !custom_action && strcmp(b->hits[hit].module, "media") && w_bar_menu_open(b, hit))
@@ -495,8 +635,12 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (hit < 0)
             return 0;
         const char *key = b->hits[hit].module, *action = NULL;
-        if (!strcmp(key, "audio"))
+        const w_module_style *style=b->hits[hit].style;
+        if (style && *(msg==WM_MBUTTONUP ? style->middle_click : style->right_click))
+            action=msg==WM_MBUTTONUP ? style->middle_click : style->right_click;
+        else if (!strcmp(key, "audio"))
             action = "mute";
+        else if (msg == WM_MBUTTONUP && !strcmp(key,"menu")) action="bar_settings";
         else if (msg == WM_RBUTTONUP) {
             if (!strcmp(key, "media")) {
                 w_bar_menu_open(b, hit);
@@ -551,6 +695,17 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
+    if (msg == WM_SETCURSOR && LOWORD(lp)==HTCLIENT) {
+        POINT cursor;
+        if (GetCursorPos(&cursor) && ScreenToClient(w,&cursor)) {
+            int hit=w_hit_at(b,cursor);
+            if (hit>=0 && (*b->hits[hit].action || !strcmp(b->hits[hit].module,"audio") ||
+                (b->hits[hit].style && (*b->hits[hit].style->right_click || *b->hits[hit].style->middle_click)))) {
+                SetCursor(LoadCursorW(NULL,IDC_HAND));
+                return TRUE;
+            }
+        }
+    }
     if (msg == WM_MOUSEACTIVATE)
         return MA_NOACTIVATE;
     if (msg == WM_ERASEBKGND)
@@ -567,25 +722,14 @@ bool w_bar_create(w_bar_window *b, int output, const w_desktop_config *cfg, bar_
                     .lpfnWndProc = w_bar_proc,
                     .hCursor = LoadCursorW(NULL, IDC_ARROW)};
     RegisterClassW(&wc);
-    b->hover = b->audio_percent = -1;
+    b->tip.index = b->hover = b->audio_percent = -1;
+    HIGHCONTRASTW hc={.cbSize=sizeof(hc)};
+    b->high_contrast=SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(hc),&hc,0) && (hc.dwFlags&HCF_HIGHCONTRASTON);
     b->config = cfg;
     b->output = output;
     b->invoke = invoke;
     b->hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, wc.lpszClassName,
                               L"winwm bar", WS_POPUP, 0, 0, 1, 1, NULL, NULL, wc.hInstance, b);
-    if (b->hwnd) {
-        INITCOMMONCONTROLSEX controls = {sizeof(controls), ICC_WIN95_CLASSES};
-        InitCommonControlsEx(&controls);
-        HWND tips = CreateWindowExW(WS_EX_TOPMOST, TOOLTIPS_CLASSW, NULL, WS_POPUP | TTS_ALWAYSTIP,
-                                    CW_USEDEFAULT, 0, 0, 0, b->hwnd, NULL, wc.hInstance, NULL);
-        TOOLINFOW info = {.cbSize = sizeof(info),
-                          .uFlags = TTF_SUBCLASS | TTF_IDISHWND,
-                          .hwnd = b->hwnd,
-                          .uId = (UINT_PTR)b->hwnd,
-                          .lpszText = LPSTR_TEXTCALLBACKW};
-        if (tips)
-            SendMessageW(tips, TTM_ADDTOOLW, 0, (LPARAM)&info);
-    }
     return b->hwnd != NULL;
 }
 
@@ -598,14 +742,19 @@ w_rect w_bar_position(w_bar_window *b, w_rect screen, int dpi, bool hidden) {
         w_icons_resize(&b->icons, dpi);
         if (b->font)
             DeleteObject(b->font);
+        DeleteObject(b->heading_font);
         b->dpi = dpi;
         b->font = CreateFontW(-MulDiv(10, dpi, 72), 0, 0, 0, FW_MEDIUM, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                               OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, DEFAULT_PITCH,
                               L"Segoe UI");
+        b->heading_font=CreateFontW(-MulDiv(11,dpi,72),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
+                                    OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,DEFAULT_PITCH,L"Segoe UI");
+        InvalidateRect(b->hwnd,NULL,FALSE);
     }
     int n = MulDiv(b->config->bar_height, dpi, 96);
     if (hidden) {
         if (IsWindowVisible(b->hwnd) && b->fade.target) {
+            w_bar_tip_track(b,-1);
             w_bar_menu_close(b,true);
             if (GetCapture() == b->hwnd)
                 ReleaseCapture();

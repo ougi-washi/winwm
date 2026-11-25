@@ -7,6 +7,7 @@
 typedef struct w_audio_state {
     bool available, muted;
     int percent;
+    wchar_t device[128];
 } w_audio_state;
 
 ////////////////

@@ -5,6 +5,7 @@
 #include "desktop_tools/display.h"
 #include <initguid.h>
 #include "desktop_tools/sound.h"
+#include "win_platform/percent_slider.h"
 #include "desktop_tools/network.h"
 #include <wlanapi.h>
 #ifndef ERROR_NDIS_DOT11_POWER_STATE_INVALID
@@ -29,9 +30,11 @@ static HWND password, network_switch, saved_action;
 static w_adapter_problem network_problems[32];
 static size_t problem_count;
 static IP_ADAPTER_ADDRESSES *adapters;
-static bool mixer;
-static HWND sound_slider, default_device, refresh_sound;
-static ULONGLONG sound_refresh_due;
+static enum w_sound_view sound_view;
+static const wchar_t *sound_tabs[] = {L"Output", L"Input", L"App mixer"};
+static HWND sound_slider, sound_tab, default_device, calls_device, refresh_sound;
+static ULONGLONG sound_refresh_due, sound_error_until;
+static bool sound_watching;
 static HANDLE wlan;
 static struct w_wifi_profile {
     GUID adapter;
@@ -78,12 +81,78 @@ static void w_audio_selection(void) {
     bool ready = w_sound_state(id, &percent, &muted);
     EnableWindow(sound_slider, ready);
     EnableWindow(apply, ready);
-    EnableWindow(default_device, ready && w_sound_can_default(id));
-    SendMessageW(sound_slider, TBM_SETPOS, TRUE, percent);
-    SetWindowTextW(apply, muted ? L"Unmute" : L"Mute");
+    EnableWindow(default_device, ready && w_sound_can_default(id,false));
+    EnableWindow(calls_device, ready && w_sound_can_default(id,true));
+    if (SendMessageW(sound_slider, TBM_GETPOS, 0, 0) != percent)
+        SendMessageW(sound_slider, TBM_SETPOS, TRUE, percent);
+    wchar_t old[96];
+    const wchar_t *mute = muted ? L"Unmute" : L"Mute";
+    GetWindowTextW(apply,old,count_of(old));
+    if (wcscmp(mute,old)) SetWindowTextW(apply,mute);
     wchar_t level[64];
-    swprintf(level, count_of(level), L"Volume   %d%%%ls", percent, muted ? L"   ·   Muted" : L"");
-    w_message(ready ? level : id >= 0 ? L"Disconnected. Refresh." : mixer ? L"No audio sessions" : L"No sound devices");
+    swprintf(level, count_of(level), L"%ls   %d%%%ls", sound_view == sound_inputs ? L"Input" : L"Volume",
+             percent, muted ? L"   ·   Muted" : L"");
+    const wchar_t *text = ready ? level : id >= 0 ? L"Device unavailable" :
+        SendMessageW(list,LB_GETCOUNT,0,0)>0 ? L"Select a device or app" :
+        sound_view == sound_apps ? L"No audio sessions" : sound_view == sound_inputs ? L"No input device" : L"No output device";
+    GetWindowTextW(status,old,count_of(old));
+    if (GetTickCount64() >= sound_error_until && wcscmp(text,old)) w_message(text);
+}
+
+static void w_audio_error(const wchar_t *text) {
+    sound_error_until = GetTickCount64()+4000;
+    w_message(text);
+}
+
+static void w_audio_open_view(enum w_sound_view next) {
+    if (next >= sound_view_count || next < sound_outputs) return;
+    sound_view = next;
+    sound_error_until = 0;
+    ShowWindow(default_device, next == sound_apps ? SW_HIDE : SW_SHOWNA);
+    ShowWindow(calls_device, next == sound_apps ? SW_HIDE : SW_SHOWNA);
+    SetWindowTextW(list, next == sound_apps ? L"Applications" : next == sound_inputs ? L"Input devices" : L"Output devices");
+    SetWindowTextW(sound_slider, next == sound_inputs ? L"Microphone level" : L"Volume");
+    sound_watching = w_sound_watch();
+    w_sound_refresh(list,next);
+    sound_refresh_due = GetTickCount64()+5000;
+    w_audio_selection();
+}
+
+static LRESULT CALLBACK w_sound_tab_proc(HWND tab, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR data) {
+    (void)data;
+    if (msg == WM_ERASEBKGND) return TRUE;
+    if (msg == WM_PAINT || msg == WM_PRINTCLIENT || msg == WM_PRINT) {
+        PAINTSTRUCT paint;
+        HDC dc = msg == WM_PAINT ? BeginPaint(tab,&paint) : (HDC)wp;
+        int saved = SaveDC(dc);
+        RECT r;
+        GetClientRect(tab,&r);
+        FillRect(dc,&r,w_theme_brush());
+        SelectObject(dc,(HFONT)SendMessageW(tab,WM_GETFONT,0,0));
+        SetBkMode(dc,TRANSPARENT);
+        int active = TabCtrl_GetCurSel(tab);
+        for (int i=0; i<(int)count_of(sound_tabs); ++i) {
+            if (!TabCtrl_GetItemRect(tab,i,&r)) continue;
+            InflateRect(&r,-1,-1);
+            SetDCBrushColor(dc,i==active ? w_theme_selection(false) : w_theme_background());
+            FillRect(dc,&r,GetStockObject(DC_BRUSH));
+            SetTextColor(dc,i==active ? w_theme_selection(true) : w_theme_hint());
+            DrawTextW(dc,sound_tabs[i],-1,&r,DT_SINGLELINE|DT_VCENTER|DT_CENTER);
+            if (i==active) {
+                RECT accent = r;
+                accent.top = accent.bottom-max(1,MulDiv(2,GetDpiForWindow(tab),96));
+                SetDCBrushColor(dc,w_theme_selection(true));
+                FillRect(dc,&accent,GetStockObject(DC_BRUSH));
+                if (GetFocus()==tab && !(SendMessageW(tab,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS))
+                    DrawFocusRect(dc,&r);
+            }
+        }
+        RestoreDC(dc,saved);
+        if (msg == WM_PAINT) EndPaint(tab,&paint);
+        return 0;
+    }
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(tab,w_sound_tab_proc,id);
+    return DefSubclassProc(tab,msg,wp,lp);
 }
 
 static struct w_wifi_api {
@@ -464,7 +533,7 @@ static void w_use_selection(void) {
     if (page == page_audio) {
         bool ok = w_sound_change(id, -1);
         w_audio_selection();
-        if (!ok) w_message(L"Unable to change mute.");
+        if (!ok) w_audio_error(L"Mute change failed");
     } else if (page == page_wifi && id >= 0 && id < profile_count && IsWindowEnabled(apply)) {
         if (profiles[id].network.dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED) {
             if (wifi.disconnect && wifi.disconnect(wlan, &profiles[id].adapter, NULL) == ERROR_SUCCESS) {
@@ -520,8 +589,7 @@ static void w_size_controls(bool update_font) {
     GetClientRect(window, &area);
     int width = MulDiv(area.right, 96, dpi);
     int dx = width - 544, dy = MulDiv(area.bottom, 96, dpi) - 344;
-    bool wrap = width < 456 && (page == page_display || page == page_bluetooth || page == page_wifi ||
-                               (page == page_audio && !mixer));
+    bool wrap = width < 456 && (page == page_display || page == page_bluetooth || page == page_wifi);
     int extra_row = wrap ? 38 : 0;
     for (size_t i = 0; i < position_count; ++i) {
         HWND c = positions[i].control;
@@ -534,6 +602,10 @@ static void w_size_controls(bool update_font) {
         }
         if (c == list || (c == status && page != page_audio) || c == password || c == sound_slider ||
             (page == page_display && w_display_stretches(c))) r.right += dx;
+        if (c == refresh_sound) OffsetRect(&r,dx,0);
+        if (c == sound_tab) r.right += dx;
+        if (c == sound_tab && update_font)
+            TabCtrl_SetItemSize(c,MulDiv(79,dpi,96),MulDiv(30,dpi,96));
         if (wrap && (c == password || (page == page_display && positions[i].logical.left >= 320)))
             r.right = width - 12;
         if (page == page_power && positions[i].logical.top < 48) {
@@ -556,6 +628,13 @@ static LRESULT CALLBACK w_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return color_result;
     if (page == page_display && w_display_message(msg, wp, lp)) return 0;
     if (page == page_power && w_power_message(msg, wp, lp)) return 0;
+    if (msg == WM_NOTIFY && sound_slider && ((NMHDR *)lp)->hwndFrom == sound_slider && ((NMHDR *)lp)->code == NM_CUSTOMDRAW)
+        return w_percent_slider_draw(sound_slider,(NMCUSTOMDRAW *)lp,w_theme_background(),w_theme_separator(),
+                                     w_theme_accent(),w_theme_foreground());
+    if (msg == WM_NOTIFY && sound_tab && ((NMHDR *)lp)->hwndFrom == sound_tab && ((NMHDR *)lp)->code == TCN_SELCHANGE) {
+        w_audio_open_view(TabCtrl_GetCurSel(sound_tab));
+        return 0;
+    }
     if (msg == WM_GETMINMAXINFO) {
         UINT dpi = GetDpiForWindow(w);
         RECT r = {0, 0, MulDiv(356,dpi,96), MulDiv(266,dpi,96)};
@@ -595,11 +674,10 @@ static LRESULT CALLBACK w_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (page == page_bluetooth && LOWORD(wp) == 105 &&
             !w_os_launch_provider("%SystemRoot%\\System32\\DevicePairingWizard.exe", NULL))
             w_message(L"Windows discovery for additional devices is unavailable.");
-        if (page == page_audio && (LOWORD(wp) == 106 || LOWORD(wp) == 107)) {
-            bool ok = LOWORD(wp) == 106 || w_sound_make_default(w_current_item());
-            w_sound_refresh(list, mixer);
-            w_audio_selection();
-            if (!ok) w_message(L"Default device change failed.");
+        if (page == page_audio && ((HWND)lp == default_device || (HWND)lp == calls_device || (HWND)lp == refresh_sound)) {
+            bool ok = (HWND)lp == refresh_sound || w_sound_make_default(w_current_item(), (HWND)lp == calls_device);
+            w_audio_open_view(sound_view);
+            if (!ok) w_audio_error(L"Default change failed");
         }
         return 0;
     }
@@ -614,15 +692,17 @@ static LRESULT CALLBACK w_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == WM_HSCROLL && sound_slider && (HWND)lp == sound_slider) {
+        if (LOWORD(wp) == TB_ENDTRACK) return 0;
         bool ok = w_sound_change(w_current_item(), (int)SendMessageW(sound_slider, TBM_GETPOS, 0, 0));
         w_audio_selection();
-        if (!ok) w_message(L"Volume change failed.");
+        if (!ok) w_audio_error(L"Volume change failed");
         return 0;
     }
     if (msg == WM_TIMER && wp == 2 && page == page_audio) {
         if (!GetCapture() && !IsIconic(w)) {
-            if (GetTickCount64() >= sound_refresh_due) {
-                w_sound_refresh(list, mixer);
+            if (w_sound_inventory_changed() || ((sound_view == sound_apps || !sound_watching) && GetTickCount64() >= sound_refresh_due)) {
+                if (!sound_watching) sound_watching = w_sound_watch();
+                w_sound_refresh(list, sound_view);
                 sound_refresh_due = GetTickCount64() + 5000;
             }
             w_audio_selection();
@@ -654,8 +734,8 @@ int w_settings_run(const wchar_t *name) {
            : !wcscmp(name, L"display")   ? page_display
            : !wcscmp(name, L"bluetooth") ? page_bluetooth
                                          : page_audio;
-    mixer = !wcscmp(name, L"volume_mixer");
-    INITCOMMONCONTROLSEX common = {sizeof(common), ICC_BAR_CLASSES | ICC_DATE_CLASSES};
+    sound_view = !wcscmp(name,L"volume_mixer") ? sound_apps : !wcscmp(name,L"microphone") ? sound_inputs : sound_outputs;
+    INITCOMMONCONTROLSEX common = {sizeof(common), ICC_BAR_CLASSES | ICC_DATE_CLASSES | ICC_TAB_CLASSES};
     InitCommonControlsEx(&common);
     CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     HINSTANCE inst = GetModuleHandleW(NULL);
@@ -664,7 +744,7 @@ int w_settings_run(const wchar_t *name) {
                     .lpszClassName = L"WinwmSettings",
                     .hCursor = LoadCursorW(NULL, IDC_ARROW),
                     .hbrBackground = NULL};
-    const wchar_t *titles[] = {mixer ? L"Application volume mixer" : L"Sound devices", L"Wi-Fi networks", L"Bluetooth devices", L"Display settings",
+    const wchar_t *titles[] = {L"Sound", L"Wi-Fi networks", L"Bluetooth devices", L"Display settings",
                                L"Power plans", L"Network adapters"};
     RegisterClassW(&wc);
     MONITORINFO monitor = {.cbSize = sizeof(monitor)};
@@ -680,7 +760,7 @@ int w_settings_run(const wchar_t *name) {
                             width, height, NULL, NULL, inst, NULL);
     if (!window)
         return 1;
-    list = CreateWindowExW(WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+    list = CreateWindowExW(page == page_audio ? 0 : WS_EX_CLIENTEDGE, L"LISTBOX", L"",
                            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_HASSTRINGS |
                            LBS_OWNERDRAWFIXED | LBS_NOINTEGRALHEIGHT, 12, 10, 520, 238,
                            window, NULL, inst, NULL);
@@ -690,15 +770,27 @@ int w_settings_run(const wchar_t *name) {
                           BS_OWNERDRAW | WS_CHILD | WS_TABSTOP | (page == page_network ? 0 : WS_VISIBLE),
                           12, 300, 140, 30, window, (HMENU)101, inst, NULL);
     if (page == page_audio) {
+        MoveWindow(list,12,52,520,196,FALSE);
+        sound_tab = CreateWindowW(WC_TABCONTROLW,L"Sound controls",WS_CHILD|WS_VISIBLE|WS_TABSTOP|
+                                  TCS_FIXEDWIDTH|TCS_FOCUSONBUTTONDOWN,
+                                  12,10,432,32,window,NULL,inst,NULL);
+        SetWindowSubclass(sound_tab,w_sound_tab_proc,1,0);
+        for (size_t i=0; i<count_of(sound_tabs); ++i) {
+            TCITEMW item = {.mask=TCIF_TEXT,.pszText=(wchar_t *)sound_tabs[i]};
+            TabCtrl_InsertItem(sound_tab,(int)i,&item);
+        }
+        TabCtrl_SetCurSel(sound_tab,sound_view);
+        refresh_sound = CreateWindowW(L"BUTTON",L"Refresh",BS_OWNERDRAW|WS_CHILD|WS_TABSTOP|WS_VISIBLE,
+                                      450,10,82,30,window,(HMENU)106,inst,NULL);
         sound_slider = CreateWindowW(TRACKBAR_CLASSW, L"Volume", WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_NOTICKS,
                                      164, 252, 368, 36, window, NULL, inst, NULL);
         MoveWindow(status, 12, 258, 148, 34, FALSE);
-        SendMessageW(sound_slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
-        SendMessageW(sound_slider, TBM_SETPAGESIZE, 0, 5);
-        default_device = CreateWindowW(L"BUTTON", L"Set as default", BS_OWNERDRAW | WS_CHILD | WS_TABSTOP |
-                                       (mixer ? 0 : WS_VISIBLE), 160, 300, 150, 30, window, (HMENU)107, inst, NULL);
-        refresh_sound = CreateWindowW(L"BUTTON", L"Refresh", BS_OWNERDRAW | WS_CHILD | WS_TABSTOP | WS_VISIBLE,
-                                      mixer ? 160 : 320, 300, 110, 30, window, (HMENU)106, inst, NULL);
+        w_percent_slider_init(sound_slider);
+        MoveWindow(apply,12,300,77,30,FALSE);
+        default_device = CreateWindowW(L"BUTTON",L"Set as default",BS_OWNERDRAW|WS_CHILD|WS_TABSTOP,
+                                       95,300,121,30,window,(HMENU)107,inst,NULL);
+        calls_device = CreateWindowW(L"BUTTON",L"Use for calls",BS_OWNERDRAW|WS_CHILD|WS_TABSTOP,
+                                     222,300,114,30,window,(HMENU)110,inst,NULL);
     }
     if (page == page_network || page == page_wifi || page == page_bluetooth) {
         lower = CreateWindowW(L"BUTTON", page == page_bluetooth ? L"Scan nearby" : L"Refresh",
@@ -726,8 +818,7 @@ int w_settings_run(const wchar_t *name) {
     ShowWindow(window, SW_SHOW);
     UpdateWindow(window);
     if (page == page_audio) {
-        w_sound_refresh(list, mixer);
-        sound_refresh_due = GetTickCount64() + 5000;
+        w_audio_open_view(sound_view);
         SetTimer(window, 2, 1000, NULL);
     }
     else if (page == page_wifi || page == page_network)
@@ -768,7 +859,7 @@ int w_settings_run(const wchar_t *name) {
             DispatchMessageW(&m);
         }
     }
-    w_sound_clear();
+    w_sound_stop();
     free(adapters);
     w_bluetooth_close();
     if (wlan)

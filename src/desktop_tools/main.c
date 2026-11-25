@@ -25,6 +25,7 @@ UINT w_tool_work_area(MONITORINFO *info) {
 int w_tools_run(const wchar_t *mode) {
     if (!wcsncmp(mode,L"dns-",4)) return (int)w_adapter_apply_dns(mode+4);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    if (!wcscmp(mode,L"bar_settings")) return w_toolbar_run();
     if (!wcscmp(mode,L"capture_window") || !wcsncmp(mode,L"capture_window-",15))
         return w_capture_run(mode);
     w_desktop_config *cfg = calloc(1, sizeof(*cfg));
@@ -39,12 +40,15 @@ int w_tools_run(const wchar_t *mode) {
         }
         free(cfg);
     } else if (!wcscmp(mode, L"project")) return 1;
-    if (!wcscmp(mode, L"languages") || !wcscmp(mode, L"keyboard_settings"))
-        return w_language_setup(!wcscmp(mode, L"keyboard_settings"));
+    if (!wcscmp(mode, L"languages")) return w_language_setup(input_languages);
+    if (!wcscmp(mode, L"keyboard_settings")) return w_language_setup(input_keyboards);
+    if (!wcscmp(mode, L"input_methods")) return w_language_setup(input_methods);
     if (!wcscmp(mode, L"date_time"))
         return w_clock_run();
     if (!wcscmp(mode, L"pick_color"))
         return w_color_run();
+    if (!wcscmp(mode,L"packages") || !wcscmp(mode,L"updates") || !wcscmp(mode,L"google_japanese_input"))
+        return w_packages_run(mode);
     if (!wcscmp(mode, L"activity"))
         return w_activity_run();
     int result = 0;

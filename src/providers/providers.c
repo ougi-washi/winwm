@@ -257,15 +257,41 @@ void w_providers_stop(void) {
 }
 
 void w_providers_configure(HWND w, UINT message, const w_desktop_config *cfg) {
-    w_providers_stop();
+    if (owner != w || changed != message) w_providers_stop();
     owner = w;
     changed = message;
+    // Reordering cells must not restart a stream or discard its last value.
+    bool retained[provider_limit] = {0};
     for (int i = 0; i < cfg->provider_count; i++) {
         char token[56];
-        snprintf(token, sizeof(token), "custom/%s", cfg->providers[i].name);
+        const w_provider_config *spec = &cfg->providers[i];
+        snprintf(token, sizeof(token), "custom/%s", spec->name);
         if (!w_config_has_module(cfg, token))
             continue;
-        slots[slot_count++] = (w_provider_slot){.spec = cfg->providers[i], .due = 1, .value.percent = -1};
+        for (int j=0;j<slot_count;j++) {
+            w_provider_config *old = &slots[j].spec;
+            if (strcmp(old->name,spec->name) || strcmp(old->executable,spec->executable) ||
+                old->interval != spec->interval || old->timeout != spec->timeout || old->stream != spec->stream)
+                continue;
+            retained[j] = true;
+            *old = *spec;
+            break;
+        }
+    }
+    int kept = 0;
+    for (int i=0;i<slot_count;i++) {
+        if (retained[i]) slots[kept++] = slots[i];
+        else w_stop_slot(&slots[i]);
+    }
+    slot_count = kept;
+    for (int i=0;i<cfg->provider_count;i++) {
+        const w_provider_config *spec = &cfg->providers[i];
+        int j=0;
+        while (j<kept && strcmp(slots[j].spec.name,spec->name)) ++j;
+        char token[56];
+        snprintf(token,sizeof(token),"custom/%s",spec->name);
+        if (j==kept && w_config_has_module(cfg,token))
+            slots[slot_count++] = (w_provider_slot){.spec=*spec, .due=1, .value.percent=-1};
     }
     w_providers_tick();
 }

@@ -41,23 +41,23 @@ static int on_release[256], on_repeat[256];
 static unsigned prefix_key, prefix_mods;
 static DWORD prefix_time, generation;
 static bool super_down[2], mapped_super[2];
-// Use the WM_HOTKEY foreground grant when opening Run from another process.
+// Use the WM_HOTKEY foreground grant when opening Menu from another process.
 // Binding dispatch always follows the matched physical press, including very
 // short taps where a queued notification may outlive its registration.
 enum { key_dispatch = WM_APP + 1 };
 
-static int launcher_binding = -1, registered_launcher = -1;
-static DWORD launcher_generation;
-static void w_launcher_hotkey(bool enable) {
-    if (!enable && registered_launcher >= 0) {
+static int menu_binding = -1, registered_menu = -1;
+static DWORD menu_generation;
+static void w_menu_hotkey(bool enable) {
+    if (!enable && registered_menu >= 0) {
         UnregisterHotKey(NULL, 1);
-        registered_launcher = -1;
+        registered_menu = -1;
     }
-    if (enable && registered_launcher < 0 && launcher_binding >= 0) {
-        w_chord_match *b = &bindings[launcher_binding];
+    if (enable && registered_menu < 0 && menu_binding >= 0) {
+        w_chord_match *b = &bindings[menu_binding];
         if (RegisterHotKey(NULL, 1, (b->mods & ~MOD_WIN) | MOD_NOREPEAT, b->key)) {
-            registered_launcher = launcher_binding;
-            launcher_generation = generation;
+            registered_menu = menu_binding;
+            menu_generation = generation;
         }
     }
 }
@@ -165,7 +165,7 @@ static bool w_consume_key(WPARAM event, const KBDLLHOOKSTRUCT *key) {
     if (vk == VK_LWIN || vk == VK_RWIN || (mapped_super[0] && vk == VK_F13) ||
         (mapped_super[1] && vk == VK_F14)) {
         super_down[vk == VK_RWIN || vk == VK_F14] = !up;
-        w_launcher_hotkey(super_down[0] || super_down[1]);
+        w_menu_hotkey(super_down[0] || super_down[1]);
         return true;
     }
     if (vk >= VK_LSHIFT && vk <= VK_RMENU)
@@ -197,7 +197,7 @@ static bool w_consume_key(WPARAM event, const KBDLLHOOKSTRUCT *key) {
             return true;
         }
         int release_id = -1, id = w_match(vk, scan, mods, key->time, &release_id);
-        if (id >= 0 && id == registered_launcher && generation == launcher_generation) {
+        if (id >= 0 && id == registered_menu && generation == menu_generation) {
             held[vk] = true;
             PostThreadMessageW(key_thread_id, key_dispatch, id, generation);
             return false;
@@ -246,13 +246,13 @@ static DWORD WINAPI w_pump_keyboard(void *ready) {
                 PostMessageW(target, action_msg, msg.wParam, msg.lParam);
             } else if (msg.message == WM_APP && !msg.hwnd) {
                 AcquireSRWLockExclusive(&matcher_lock);
-                w_launcher_hotkey(false);
-                w_launcher_hotkey(super_down[0] || super_down[1]);
+                w_menu_hotkey(false);
+                w_menu_hotkey(super_down[0] || super_down[1]);
                 ReleaseSRWLockExclusive(&matcher_lock);
             } else
                 DispatchMessageW(&msg);
         }
-        w_launcher_hotkey(false);
+        w_menu_hotkey(false);
         UnhookWindowsHookEx(keyboard);
     }
     return 0;
@@ -424,22 +424,22 @@ void w_input_bind(HWND w, UINT message, UINT hover_message, UINT context_message
     hover_msg = c->follow_mouse ? hover_message : 0;
     context_msg = context_message;
     binding_count = c->binding_count;
-    launcher_binding = -1;
+    menu_binding = -1;
     memset(bound, 0, sizeof(bound));
     for (int i = 0; i < binding_count; ++i) {
         const w_key_binding *b = &c->bindings[i];
         bindings[i] =
             (w_chord_match){b->key, b->next_key, b->mods, b->next_mods, b->modal, b->release, b->repeat};
         bound[b->key] = true;
-        if (b->action.kind == cmd_launcher && b->mods == MOD_WIN && b->key < 256 && !b->modal &&
+        if (b->action.kind == cmd_menu && b->mods == MOD_WIN && b->key < 256 && !b->modal &&
             !b->next_key && !b->release && !b->repeat)
-            launcher_binding = i;
+            menu_binding = i;
     }
     drag = resize_drag;
     drag_mods = c->drag_mods;
     inverse_drag = c->inverse_drag;
     generation++;
-    if (key_thread && registered_launcher >= 0)
+    if (key_thread && registered_menu >= 0)
         PostThreadMessageW(key_thread_id, WM_APP, 0, 0);
     prefix_key = 0;
     memset(on_release, 0, sizeof(on_release));

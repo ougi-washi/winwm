@@ -4,11 +4,12 @@
 #include <stdlib.h>
 #include <wchar.h>
 #include <shlobj.h>
+#include <shellapi.h>
 
 ////////////////
 //~ Actions
 
-enum launch_kind { launch_executable, launch_terminal, launch_command, launch_task_manager, launch_panel, launch_place, launch_window_capture };
+enum launch_kind { launch_executable, launch_terminal, launch_command, launch_task_manager, launch_panel, launch_place, launch_window_capture, launch_windows_update };
 typedef struct w_launch_job {
     char exe[1024], arg[4096];
     enum launch_kind kind;
@@ -47,6 +48,14 @@ static DWORD WINAPI w_launch_thread(void *ptr) {
     w_launch_job *j = ptr;
     bool launched;
     switch (j->kind) {
+    case launch_windows_update: {
+        HRESULT apartment = CoInitializeEx(NULL,COINIT_APARTMENTTHREADED|COINIT_DISABLE_OLE1DDE);
+        SHELLEXECUTEINFOW info = {.cbSize=sizeof(info), .fMask=SEE_MASK_NOASYNC|SEE_MASK_FLAG_NO_UI,
+                                  .lpVerb=L"open", .lpFile=L"ms-settings:windowsupdate", .nShow=SW_SHOWNORMAL};
+        launched = ShellExecuteExW(&info) != FALSE;
+        if (SUCCEEDED(apartment)) CoUninitialize();
+        break;
+    }
     case launch_place:
         launched = w_open_place(j->exe, j->arg);
         break;
@@ -230,7 +239,8 @@ bool w_desktop_run_on(const w_command *c, int output) {
     }
     if (!desk.ready && c->kind >= cmd_focus && c->kind <= cmd_close)
         return w_desktop_defer(c, output);
-    if ((unsigned)output >= output_limit || !desk.outputs[output].live)
+    bool explicit_output = (unsigned)output < output_limit && desk.outputs[output].live;
+    if (!explicit_output)
         output = o;
     int destination = -1;
     if (c->kind == cmd_workspace_select || c->kind == cmd_workspace_send || c->kind == cmd_workspace_follow) {
@@ -268,6 +278,12 @@ bool w_desktop_run_on(const w_command *c, int output) {
         break;
     }
     case cmd_activity:
+    case cmd_packages:
+    case cmd_updates:
+    case cmd_google_japanese_input:
+    case cmd_input_methods:
+    case cmd_bar_settings:
+    case cmd_microphone:
     case cmd_audio:
     case cmd_project:
     case cmd_pick_color:
@@ -306,7 +322,7 @@ bool w_desktop_run_on(const w_command *c, int output) {
              w_launch(desk.config.editor, s);
         break;
     }
-    case cmd_launcher:
+    case cmd_menu:
     case cmd_switcher:
     case cmd_shortcuts:
     case cmd_settings:
@@ -317,8 +333,8 @@ bool w_desktop_run_on(const w_command *c, int output) {
             desk.resize = false;
             w_input_mode(false);
         }
-        if (c->kind == cmd_launcher && w_palette_visible(L"Run"))
-            w_palette_focus();
+        if (c->kind == cmd_menu && w_palette_visible(L"Menu"))
+            w_desktop_focus_menu(explicit_output ? output : -1);
         else
             w_desktop_palette(c->kind, output);
         break;
@@ -466,6 +482,9 @@ bool w_desktop_run_on(const w_command *c, int output) {
     case cmd_lock:
         ok = LockWorkStation() != 0;
         break;
+    case cmd_windows_update:
+        ok = w_queue_launch("Windows Update",NULL,launch_windows_update,NULL);
+        break;
     case cmd_confirm_sign_out:
         if (MessageBoxW(NULL, L"Sign out and close your applications?", L"Sign out",
                         MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION) == IDYES)
@@ -515,6 +534,8 @@ bool w_desktop_run_on(const w_command *c, int output) {
         break;
     case cmd_bar_toggle:
         desk.hide_bars = !desk.hide_bars;
+        if (desk.hide_bars) w_providers_stop();
+        else w_providers_configure(desk.root,msg_devices,&desk.config);
         w_desktop_status_configure();
         w_desktop_timer();
         break;

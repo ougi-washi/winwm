@@ -11,8 +11,10 @@ static w_window_id targets[window_limit];
 static int row_count, configured_start;
 static int row_output[window_limit], palette_output;
 static enum command_kind current_palette;
-static HWND capture_target;
-static DWORD capture_pid;
+static HWND menu_target;
+static DWORD menu_pid;
+static w_window_id menu_owner;
+static bool dispatching_row;
 
 typedef struct {
     HWND owner;
@@ -50,7 +52,7 @@ static void w_add_row(const wchar_t *label, const char *action, w_window_id targ
     w_command command = {0};
     if (action && !w_command_parse(action, &command)) return;
     int n = row_count++;
-    row_output[n] = palette_output;
+    row_output[n] = -1;
     entries[n] = (w_palette_entry){.id = n, .group = group};
     wcsncpy(entries[n].label, label, 255);
     entries[n].label[255] = 0;
@@ -63,7 +65,7 @@ static void w_add_row(const wchar_t *label, const char *action, w_window_id targ
 }
 
 static void w_pick(int n) {
-    if (current_palette == cmd_launcher && n >= window_limit) {
+    if (current_palette == cmd_menu && n >= window_limit) {
         if (!w_catalog_launch_item(snapshot, n - window_limit))
             w_desktop_notice("Could not start the selected application.");
         return;
@@ -96,9 +98,15 @@ static void w_pick(int n) {
         if (mem)
             GlobalFree(mem);
     } else if (actions[n].kind == cmd_capture_window) {
-        w_desktop_capture_window(capture_target,capture_pid);
-    } else if (actions[n].kind)
-        w_desktop_run_on(&actions[n], row_output[n]);
+        w_desktop_capture_window(menu_target,menu_pid);
+    } else if (actions[n].kind == cmd_close) {
+        if (!w_desktop_close_target(menu_target,menu_pid,menu_owner))
+            w_desktop_notice("The selected window is no longer available to close.");
+    } else if (actions[n].kind) {
+        dispatching_row = true;
+        w_desktop_run_on(&actions[n], row_output[n] >= 0 ? row_output[n] : palette_output);
+        dispatching_row = false;
+    }
 }
 
 static void w_action_row(const char *label, const char *action) {
@@ -141,24 +149,33 @@ static const w_menu_item menu_items[] = {
     {palette_windows, "Grow focused split", "resize grow"},
     {palette_windows, "Shrink focused split", "resize shrink"},
     {palette_windows, "Close focused window", "close"},
-    {palette_capture, "Copy display screenshot", "capture"},
-    {palette_capture, "Copy window screenshot", "capture_window"},
-    {palette_capture, "Copy region screenshot", "capture_region"},
-    {palette_capture, "Record screen region", "record"},
-    {palette_capture, "Pick screen color", "pick_color"},
-    {palette_devices, "Sound devices", "audio"},
-    {palette_devices, "Application volume mixer", "volume_mixer"},
-    {palette_devices, "Wi-Fi networks", "wifi"},
-    {palette_devices, "Network adapters", "network_settings"},
-    {palette_devices, "Bluetooth devices", "bluetooth"},
-    {palette_devices, "Languages", "languages"},
-    {palette_devices, "Keyboard layouts", "keyboard_settings"},
-    {palette_devices, "Power plans and timeouts", "power_settings"},
-    {palette_appearance, "Change wallpaper", "wallpaper"},
-    {palette_appearance, "Show or hide toolbar", "bar_toggle"},
+    {palette_tools, "Open PowerShell", "program %SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe -NoLogo"},
+    {palette_tools, "Open Command Prompt", "program %SystemRoot%\\System32\\cmd.exe"},
+    {palette_tools, "Copy display screenshot", "capture"},
+    {palette_tools, "Copy window screenshot", "capture_window"},
+    {palette_tools, "Copy region screenshot", "capture_region"},
+    {palette_tools, "Record screen region", "record"},
+    {palette_tools, "Pick screen color", "pick_color"},
+    {palette_settings, "Sound devices", "audio"},
+    {palette_settings, "Microphone inputs", "microphone"},
+    {palette_settings, "Application volume mixer", "volume_mixer"},
+    {palette_settings, "Wi-Fi networks", "wifi"},
+    {palette_settings, "Network adapters", "network_settings"},
+    {palette_settings, "Bluetooth devices", "bluetooth"},
+    {palette_input, "Add or remove languages", "languages"},
+    {palette_input, "Manage keyboard layouts", "keyboard_settings"},
+    {palette_input, "Choose input method and test typing", "input_methods"},
+    {palette_input, "Get Google Japanese Input", "google_japanese_input"},
+    {palette_software, "Find and install software with WinGet", "packages"},
+    {palette_software, "Review and apply software updates", "updates"},
+    {palette_software, "Windows Update settings", "windows_update"},
+    {palette_settings, "Power plans and timeouts", "power_settings"},
+    {palette_settings, "Change wallpaper", "wallpaper"},
+    {palette_settings, "Show or hide toolbar", "bar_toggle"},
+    {palette_settings, "Configure toolbar", "bar_settings"},
     {palette_tools, "Clipboard history", "clipboard"},
     {palette_tools, "Notifications", "notifications"},
-    {palette_tools, "Date and time", "date_time"},
+    {palette_settings, "Date and time", "date_time"},
     {palette_tools, "Play or pause media", "media_play"},
     {palette_tools, "Previous track", "media_previous"},
     {palette_tools, "Next track", "media_next"},
@@ -166,19 +183,32 @@ static const w_menu_item menu_items[] = {
     {palette_tools, "Raise volume", "volume_up"},
     {palette_tools, "Lower volume", "volume_down"},
     {palette_tools, "Mute or unmute", "mute"},
-    {palette_developer, "Open project folder…", "project"},
-    {palette_developer, "Activity monitor", "activity"},
-    {palette_developer, "Edit winwm configuration", "edit_config"},
-    {palette_developer, "Reload configuration", "reload"},
-    {palette_developer, "Refresh toolbar providers", "provider_refresh"},
-    {palette_developer, "Keyboard shortcuts", "shortcuts"},
-    {palette_system, "Desktop settings", "settings"},
-    {palette_system, "Open configured task manager", "open_tasks"},
-    {palette_system, "Lock computer", "lock"},
-    {palette_system, "Sleep…", "sleep"},
-    {palette_system, "Restart computer…", "restart"},
-    {palette_system, "Sign out…", "confirm_sign_out"},
+    {palette_places, "Open project folder…", "project"},
+    {palette_tools, "Activity monitor", "activity"},
+    {palette_settings, "Edit winwm configuration", "edit_config"},
+    {palette_settings, "Reload configuration", "reload"},
+    {palette_settings, "Refresh toolbar providers", "provider_refresh"},
+    {palette_tools, "Keyboard shortcuts", "shortcuts"},
+    {palette_tools, "Open configured task manager", "open_tasks"},
+    {palette_session, "Lock computer", "lock"},
+    {palette_session, "Sleep…", "sleep"},
+    {palette_session, "Restart computer…", "restart"},
+    {palette_session, "Sign out…", "confirm_sign_out"},
 };
+
+static const wchar_t *w_menu_keywords(enum command_kind kind) {
+    switch (kind) {
+    case cmd_languages: return L"add remove language languages japanese english ja jp 日本語 preferred region";
+    case cmd_keyboard_settings: return L"add keyboard layout dvorak qwerty input";
+    case cmd_input_methods: return L"ime microsoft japanese input method romaji hiragana katakana kanji typing 日本語";
+    case cmd_google_japanese_input: return L"google japanese input ime gboard mozc 日本語入力";
+    case cmd_packages: return L"winget search install package packages software apps applications";
+    case cmd_updates: return L"winget upgrade update packages apps applications";
+    case cmd_windows_update: return L"windows system updates check security";
+    case cmd_project: return L"developer recent project folder terminal editor";
+    default: return NULL;
+    }
+}
 
 static void w_device_rows(void) {
     for (int o = 0; o < output_limit; ++o) {
@@ -196,23 +226,37 @@ static void w_device_rows(void) {
     }
 }
 
+static void w_toolbar_action(const char *module, const char *action, int first) {
+    if (!*action) return;
+    char label[200];
+    snprintf(label, sizeof(label), "%s   ·   %s", module, action);
+    wchar_t name[200];
+    if (!w_os_wide(label, name, count_of(name))) return;
+    for (int i = first; i < row_count; ++i)
+        if (!wcscmp(entries[i].label, name)) return;
+    w_add_row(name, action, (w_window_id){-1, 0});
+}
+
 static void w_menu_actions(bool run) {
     for (size_t i = 0; i < count_of(menu_items); ++i) {
         const w_menu_item *item = &menu_items[i];
-        if (!run && item->group != palette_devices && item->group != palette_appearance &&
-            item->group != palette_developer && strcmp(item->command,"date_time")) continue;
+        if (!run && item->group != palette_settings && item->group != palette_input &&
+            strcmp(item->command,"shortcuts") && strcmp(item->command,"activity") && strcmp(item->command,"project")) continue;
         group = run ? item->group : palette_flat;
+        int previous = row_count;
         w_action_row(item->label, item->command);
+        if (row_count>previous) entries[previous].keywords=w_menu_keywords(actions[previous].kind);
     }
-    group = run ? palette_devices : palette_flat;
+    group = run ? palette_settings : palette_flat;
     w_device_rows();
-    group = run ? palette_appearance : palette_flat;
+    group = run ? palette_settings : palette_flat;
     w_action_row(desk.motion_allowed ? "Disable animations" : "Enable animations", "animations_toggle");
     if (desk.config.animations != motion_system)
         w_action_row("Follow Windows animation preference", "animations_system");
     w_action_row(desk.borders_hidden ? "Show window borders" : "Hide window borders", "borders_toggle");
-    group = run ? palette_system : palette_flat;
+    group = run ? palette_session : palette_flat;
     w_action_row(desk.inhibit ? "Resume automatic sleep" : "Keep awake", "idle_inhibit");
+    group = run ? palette_tools : palette_flat;
     w_action_row("Clear clipboard history", "clipboard_clear");
     if (!run) return;
     group = palette_windows;
@@ -236,6 +280,21 @@ static void w_menu_actions(bool run) {
         snprintf(command,sizeof(command),"workspace_send %d",i+1);
         w_action_row(label,command);
     }
+    group = palette_toolbar;
+    int toolbar_first = row_count;
+    for (int i = 0; i < desk.config.style_count; ++i) {
+        const w_module_style *style = &desk.config.styles[i];
+        const char *commands[] = {style->action, style->middle_click, style->right_click,
+                                  style->scroll_up, style->scroll_down};
+        for (size_t j = 0; j < count_of(commands); ++j)
+            w_toolbar_action(style->name, commands[j], toolbar_first);
+    }
+    for (int i = 0; i < desk.config.provider_count; ++i) {
+        const w_provider_config *provider = &desk.config.providers[i];
+        char module[56];
+        snprintf(module, sizeof(module), "custom/%s", provider->name);
+        w_toolbar_action(module, provider->action, toolbar_first);
+    }
     group = palette_apps;
     configured_start = row_count;
     for (int i = 0; i < desk.config.app_count; ++i) {
@@ -252,23 +311,36 @@ void w_desktop_clear_clips(void) {
 }
 
 void w_desktop_catalog_update(void) {
-    if (!w_palette_visible(L"Run")) return;
+    if (!w_palette_visible(L"Menu")) return;
     int output = palette_output;
     if (!desk.outputs[output].live) output = desk.model.output;
-    w_desktop_palette(cmd_launcher, output);
+    w_desktop_palette(cmd_menu, output);
+}
+
+void w_desktop_focus_menu(int output) {
+    if ((unsigned)output < output_limit && desk.outputs[output].live && output != palette_output) {
+        palette_output = output;
+        w_palette_position(desk.outputs[output].monitor);
+    }
+    w_palette_focus();
 }
 
 void w_desktop_palette(enum command_kind kind, int output) {
-    if (!w_palette_shown()) {
-        capture_target = GetForegroundWindow();
-        capture_pid = 0;
-        GetWindowThreadProcessId(capture_target,&capture_pid);
+    // A submenu opens after its parent hides. Keep the original application for its actions.
+    if (!w_palette_shown() && !dispatching_row) {
+        menu_target = GetForegroundWindow();
+        menu_pid = 0;
+        GetWindowThreadProcessId(menu_target,&menu_pid);
+        int slot = w_desktop_find(w_os_app_window(menu_target));
+        menu_owner = (w_window_id){slot,slot >= 0 ? desk.model.windows[slot].generation : 0};
     }
+    if (w_palette_visible(L"Menu") && kind == cmd_menu && palette_output != output)
+        w_palette_position(desk.outputs[output].monitor);
     group = palette_flat;
     current_palette = kind;
     palette_output = output;
     row_count = 0;
-    const wchar_t *title = L"Run";
+    const wchar_t *title = L"Menu";
     if (kind == cmd_switcher) {
         title = L"Switch window";
         for (int j = 0; j < window_limit; j++)
@@ -313,7 +385,7 @@ void w_desktop_palette(enum command_kind kind, int output) {
             w_add_row(n ? preview : L"Whitespace", NULL, (w_window_id){-1, 0});
         }
     } else {
-        bool run = kind == cmd_launcher;
+        bool run = kind == cmd_menu;
         if (!run) title = L"Settings";
         w_menu_actions(run);
         if (run) {

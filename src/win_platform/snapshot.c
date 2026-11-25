@@ -2,7 +2,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
-enum { cache_limit = 256 * 1024 };
+enum { cache_limit = 512 * 1024, cache_format = 9 };
 
 ////////////////
 //~ Snapshot
@@ -162,6 +162,42 @@ static void w_contents(w_cache_stream *s, w_desktop_config *c) {
 #undef string_member
 }
 
+// Format 9 appends bar preferences, preserving the format 8 startup prefix.
+static void w_bar_preferences(w_cache_stream *s, w_desktop_config *c) {
+    w_field(s,&c->bar_tooltip_delay,sizeof(int));
+    w_field(s,&c->bar_tooltip_duration,sizeof(int));
+    w_field(s,&c->bar_workspace_count,sizeof(int));
+    w_field(s,&c->style_count,sizeof(int));
+    if (c->bar_tooltip_delay < 0 || c->bar_tooltip_delay > 10000 || c->bar_tooltip_duration < 0 ||
+        c->bar_tooltip_duration > 60000 || (unsigned)c->bar_workspace_count > workspace_limit ||
+        (unsigned)c->style_count > count_of(c->styles)) {
+        s->ok = false;
+        return;
+    }
+    for (int i=0; s->ok && i<workspace_limit; ++i)
+        w_string_field(s,c->workspace_names[i],sizeof(c->workspace_names[i]));
+    for (int i=0; s->ok && i<c->style_count; ++i) {
+        w_module_style *style = &c->styles[i];
+        unsigned char flags = (style->colored ? 1 : 0) | (style->hide_tooltip ? 2 : 0);
+        w_field(s,&flags,1);
+        w_field(s,&style->color,sizeof(style->color));
+        w_field(s,&style->display,sizeof(style->display));
+        style->colored = (flags & 1) != 0;
+        style->hide_tooltip = (flags & 2) != 0;
+        w_string_field(s,style->name,sizeof(style->name));
+        w_string_field(s,style->format,sizeof(style->format));
+        w_string_field(s,style->tooltip,sizeof(style->tooltip));
+        if (flags > 3 || (unsigned)style->display > module_icon_text ||
+            !*style->name || strpbrk(style->name," \t") || !w_config_modules_valid(style->name)) s->ok = false;
+        char *actions[] = {style->action, style->right_click, style->middle_click, style->scroll_up, style->scroll_down};
+        for (size_t j=0; s->ok && j<count_of(actions); ++j) {
+            w_string_field(s,actions[j],sizeof(style->action));
+            w_command cmd;
+            if (s->ok && *actions[j] && !w_command_parse(actions[j],&cmd)) s->ok = false;
+        }
+    }
+}
+
 static bool w_cache_path(wchar_t *out, bool create) {
     if (!w_os_data_path(out, os_path_cap, L"startup.bin", create) || out[1] != L':')
         return false;
@@ -179,8 +215,9 @@ void w_os_cache_write(w_desktop_config *cfg) {
     if (!s.data)
         return;
     w_contents(&s, cfg);
+    if (s.ok) w_bar_preferences(&s,cfg);
     if (s.ok) {
-        w_cache_header h = {0x4e444348, 8, (uint32_t)s.pos, w_checksum(s.data, s.pos)};
+        w_cache_header h = {0x4e444348, cache_format, (uint32_t)s.pos, w_checksum(s.data, s.pos)};
         swprintf(tmp, count_of(tmp), L"%ls.%lu.%lu.tmp", path, GetCurrentProcessId(), GetCurrentThreadId());
         HANDLE file = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (file != INVALID_HANDLE_VALUE) {
@@ -206,12 +243,14 @@ bool w_os_cache_read(w_desktop_config *cfg) {
     DWORD n;
     w_cache_header h;
     bool ok = false;
-    if (ReadFile(f, &h, sizeof(h), &n, NULL) && n == sizeof(h) && h.magic == 0x4e444348 && h.format == 8 &&
+    if (ReadFile(f, &h, sizeof(h), &n, NULL) && n == sizeof(h) && h.magic == 0x4e444348 &&
+        (h.format == 8 || h.format == cache_format) &&
         h.bytes > 0 && h.bytes <= cache_limit) {
         w_cache_stream s = {.data = malloc(h.bytes), .end = h.bytes, .ok = true};
         if (s.data && ReadFile(f, s.data, h.bytes, &n, NULL) && n == h.bytes &&
             w_checksum(s.data, n) == h.checksum) {
             w_contents(&s, cfg);
+            if (s.ok && h.format == cache_format) w_bar_preferences(&s,cfg);
             ok = s.ok && s.pos == s.end;
         }
         free(s.data);

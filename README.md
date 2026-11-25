@@ -30,8 +30,12 @@ Sign out and back in to start winwm as your shell.
 - Per-monitor workspaces, tiling, floating, fullscreen, scratchpad.
 - Hover focus. Win+left-drag to move. Win+right-drag to resize.
 - Configurable borders, gaps, animations, and keybindings.
-- Run menu (Win+D), app search, command execution, project launcher.
-- Toolbar controls for audio, input languages, Wi-Fi, Bluetooth, displays, and power.
+- Menu (Win+D). Search apps and actions. Type `> executable` to run a command.
+- Software. Search WinGet, install packages, review updates.
+- Languages & input. Add or remove languages. Select keyboards and IMEs. Install basic typing. Test input.
+- Configurable toolbar. Hover for details. Middle-click Menu to edit module order.
+- Custom toolbar commands appear in Menu under Toolbar actions.
+- Output, microphone, and app volume controls. Input languages, Wi-Fi, Bluetooth, displays, and power.
 - Activity monitor, clipboard history, screenshots, screen recording, color picker.
 
 ## Config
@@ -46,5 +50,11 @@ general {
 }
 input {
     follow_mouse = 1
+}
+bar {
+    modules_right = cpu network audio keyboard battery
+    audio:display = icon_text
+    audio:on_click_middle = mute
+    tooltip_duration = 4500
 }
 ```

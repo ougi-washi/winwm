@@ -4,6 +4,7 @@ src/app/main.c
 src/bar/bar.c
 src/bar/icons.c
 src/bar/menu.c
+src/bar/tooltip.c
 src/bar/motion.c
 src/base/json.c
 src/catalog/catalog.c
@@ -31,8 +32,10 @@ src/desktop_tools/color.c
 src/desktop_tools/main.c
 src/desktop_tools/languages.c
 src/desktop_tools/network.c
+src/desktop_tools/packages.c
 src/desktop_tools/power.c
 src/desktop_tools/settings.c
+src/desktop_tools/toolbar.c
 src/desktop_tools/sound.c
 src/input/input.c
 src/ipc/ipc.c
@@ -48,6 +51,7 @@ src/providers/audio.c
 src/providers/providers.c
 src/shell_host/main.c
 src/win_platform/snapshot.c
+src/win_platform/percent_slider.c
 src/win_platform/win_platform.c
 -luser32
 -lcrypt32
@@ -64,6 +68,8 @@ src/win_platform/win_platform.c
 -lcfgmgr32
 -lws2_32
 -lole32
+-loleaut32
+-limm32
 -lshell32
 -lshlwapi
 -luuid

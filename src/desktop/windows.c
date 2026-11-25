@@ -49,6 +49,16 @@ static bool w_custom_text(const char *name, wchar_t *s, int cap, char *action, s
     return true;
 }
 
+static bool w_module_detail(const char *name, wchar_t *text, int cap) {
+    if (strncmp(name, "custom/", 7))
+        return w_desktop_status_detail(name, text, cap);
+    w_provider_value v;
+    char action[128];
+    if (!w_providers_value(name + 7, &v, action, sizeof(action)) || !v.tooltip[0]) return false;
+    lstrcpynW(text, v.tooltip, cap);
+    return true;
+}
+
 static void w_dock_bar(int output) {
     w_output_state *o = &desk.outputs[output];
     o->work = w_bar_position(&o->bar, o->screen, o->dpi, o->bar_hidden);
@@ -90,6 +100,7 @@ static BOOL CALLBACK w_visit_monitor(HMONITOR mon, HDC dc, LPRECT bounds, LPARAM
     w_audio_state audio = w_audio_read();
     w_bar_set_audio(&o->bar, audio.available ? audio.percent : -1, audio.muted);
     o->bar.custom = w_custom_text;
+    o->bar.detail = w_module_detail;
     o->bar.dock = w_dock_bar;
     o->bar_hidden = desk.hide_bars;
     o->work = w_bar_position(&o->bar, o->screen, o->dpi, desk.hide_bars);

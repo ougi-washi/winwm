@@ -8,10 +8,13 @@ int w_capture_run(const wchar_t *mode);
 int w_settings_run(const wchar_t *page);
 int w_clock_run(void);
 int w_color_run(void);
+int w_packages_run(const wchar_t *mode);
 int w_activity_run(void);
 int w_project_run(const w_desktop_config *config);
+int w_toolbar_run(void);
 UINT w_tool_work_area(MONITORINFO *monitor);
-int w_language_setup(bool keyboards);
+typedef enum w_input_page { input_languages, input_keyboards, input_methods } w_input_page;
+int w_language_setup(w_input_page page);
 
 static inline RECT w_tool_fit_to_monitor(RECT bounds, HMONITOR monitor) {
     MONITORINFO info = {.cbSize = sizeof(info)};

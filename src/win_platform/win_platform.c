@@ -15,6 +15,7 @@ enum { file_limit = 256 * 1024, include_limit = 16, total_limit = 1024 * 1024 };
 
 typedef struct w_file_stack {
     wchar_t paths[include_limit][os_path_cap];
+    const wchar_t *candidate;
     unsigned depth, bytes, count;
 } w_file_stack;
 
@@ -328,7 +329,7 @@ static bool w_parse_file(w_config_language *lang, const wchar_t *path, char *err
     name = name ? name + 1 : path;
     char label[192] = "configuration";
     w_os_utf8(name, label, sizeof(label));
-    FILE *f = _wfopen(path, L"rb");
+    FILE *f = _wfopen(!stack->depth && stack->candidate ? stack->candidate : path, L"rb");
     if (!f) {
         snprintf(err, cap, "Cannot read %.150s", label);
         return false;
@@ -370,11 +371,21 @@ bool w_os_config_load(w_desktop_config *out, char *err, size_t cap) {
         snprintf(err, cap, "Cannot create the user profile's .config/winwm/winwm.conf");
         return false;
     }
+    return w_os_config_read_path(path, out, err, cap);
+}
+
+bool w_os_config_read_path(const wchar_t *path, w_desktop_config *out, char *err, size_t cap) {
+    return w_os_config_read_candidate(path,NULL,out,err,cap);
+}
+
+bool w_os_config_read_candidate(const wchar_t *path, const wchar_t *candidate, w_desktop_config *out,
+                                char *err, size_t cap) {
     w_file_stack *stack = calloc(1, sizeof(*stack));
     w_config_language *lang = calloc(1, sizeof(*lang));
     w_desktop_config *next = malloc(sizeof(*next));
     bool ok = false;
     if (lang && stack && next) {
+        stack->candidate = candidate;
         w_config_defaults(next);
         lang->config = next;
         lang->source = w_include_file;

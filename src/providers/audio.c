@@ -3,6 +3,7 @@
 #include <initguid.h>
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
+#include <functiondiscoverykeys_devpkey.h>
 
 /* All endpoint interfaces belong to the worker's COM apartment. RPC callbacks
    only enqueue work, so a device change cannot race a volume adjustment. */
@@ -101,12 +102,22 @@ static IAudioEndpointVolumeCallback levels = {&volume_vtbl};
 ////////////////
 //~ Audio endpoint
 
-static IAudioEndpointVolume *w_default_output(IMMDeviceEnumerator *enumerator) {
+static IAudioEndpointVolume *w_default_output(IMMDeviceEnumerator *enumerator, wchar_t *name, int cap) {
     IAudioEndpointVolume *volume = NULL;
     IMMDevice *endpoint = NULL;
+    *name = 0;
     if (enumerator &&
         SUCCEEDED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(enumerator, eRender, eMultimedia, &endpoint))) {
         IMMDevice_Activate(endpoint, &IID_IAudioEndpointVolume, CLSCTX_INPROC_SERVER, NULL, (void **)&volume);
+        IPropertyStore *props = NULL;
+        if (SUCCEEDED(IMMDevice_OpenPropertyStore(endpoint, STGM_READ, &props))) {
+            PROPVARIANT value = {0};
+            if (SUCCEEDED(IPropertyStore_GetValue(props, &PKEY_Device_FriendlyName, &value)) &&
+                value.vt == VT_LPWSTR && value.pwszVal)
+                lstrcpynW(name, value.pwszVal, cap);
+            PropVariantClear(&value);
+            IPropertyStore_Release(props);
+        }
         IMMDevice_Release(endpoint);
     }
     if (volume)
@@ -121,16 +132,18 @@ static void w_disconnect(IAudioEndpointVolume *volume) {
     }
 }
 
-static void w_publish(IAudioEndpointVolume *volume) {
+static void w_publish(IAudioEndpointVolume *volume, const wchar_t *name) {
     float level = 0;
     BOOL muted = FALSE;
     w_audio_state next = {0};
     if (volume && SUCCEEDED(IAudioEndpointVolume_GetMasterVolumeLevelScalar(volume, &level)) &&
         SUCCEEDED(IAudioEndpointVolume_GetMute(volume, &muted)))
-        next = (w_audio_state){true, muted != FALSE, (int)(level * 100 + 0.5f)};
+        next = (w_audio_state){.available=true, .muted=muted != FALSE, .percent=(int)(level * 100 + 0.5f)};
+    lstrcpynW(next.device,name,count_of(next.device));
     AcquireSRWLockExclusive(&lock);
     bool dirty =
-        next.available != current.available || next.percent != current.percent || next.muted != current.muted;
+        next.available != current.available || next.percent != current.percent || next.muted != current.muted ||
+        wcscmp(next.device,current.device);
     current = next;
     ReleaseSRWLockExclusive(&lock);
     if (dirty)
@@ -163,18 +176,19 @@ static DWORD WINAPI w_audio_worker(void *arg) {
     if (initialized && SUCCEEDED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
                                                   &IID_IMMDeviceEnumerator, (void **)&enumerator)))
         IMMDeviceEnumerator_RegisterEndpointNotificationCallback(enumerator, &devices);
-    IAudioEndpointVolume *volume = w_default_output(enumerator);
-    w_publish(volume);
+    wchar_t name[count_of(current.device)] = {0};
+    IAudioEndpointVolume *volume = w_default_output(enumerator,name,count_of(name));
+    w_publish(volume,name);
     DWORD delta;
     ULONG_PTR event;
     OVERLAPPED *unused;
     while (GetQueuedCompletionStatus(port, &delta, &event, &unused, INFINITE) && event != stop_worker) {
         if (event == endpoint_changed) {
             w_disconnect(volume);
-            volume = w_default_output(enumerator);
+            volume = w_default_output(enumerator,name,count_of(name));
         } else if (event == adjust_level || event == set_level) {
             if (!volume)
-                volume = w_default_output(enumerator);
+                volume = w_default_output(enumerator,name,count_of(name));
             HRESULT hr = event == adjust_level ? w_adjust(volume, (int)(LONG)delta)
                          : volume ? IAudioEndpointVolume_SetMasterVolumeLevelScalar(volume, delta / 100.f, NULL)
                                   : HRESULT_FROM_WIN32(ERROR_NOT_FOUND);
@@ -182,7 +196,7 @@ static DWORD WINAPI w_audio_worker(void *arg) {
                 PostMessageW(owner, changed, (WPARAM)(DWORD)hr, 0);
         } else
             InterlockedExchange(&refresh_pending, 0);
-        w_publish(volume);
+        w_publish(volume,name);
     }
     w_disconnect(volume);
     if (enumerator) {

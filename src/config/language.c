@@ -275,8 +275,8 @@ static bool w_dispatcher(w_desktop_config *c, const char *name, const char *arg,
         if (!strcmp(arg, c->terminal)) {
             action = "terminal";
             param = "";
-        } else if (!strcmp(arg, "Run")) {
-            action = "launcher";
+        } else if (!strcmp(arg, "Menu") || !strcmp(arg, "Run")) {
+            action = "menu";
             param = "";
         } else
             action = "program";
@@ -489,6 +489,12 @@ static bool w_option(w_config_language *l, const char *key, char *v) {
     }
     if (!strcmp(key, "bar:height"))
         return w_number(v, 16, 128, &c->bar_height);
+    if (!strcmp(key, "bar:tooltip_delay"))
+        return w_number(v, 0, 10000, &c->bar_tooltip_delay);
+    if (!strcmp(key, "bar:tooltip_duration"))
+        return w_number(v, 0, 60000, &c->bar_tooltip_duration);
+    if (!strcmp(key, "bar:workspace_count"))
+        return w_number(v, 0, workspace_limit, &c->bar_workspace_count);
     if (!strcmp(key, "bar:background"))
         return w_color(v, &c->background);
     if (!strcmp(key, "bar:foreground"))
@@ -501,7 +507,21 @@ static bool w_option(w_config_language *l, const char *key, char *v) {
                   : !strcmp(key, "bar:modules_right")  ? c->bar_right
                                                        : NULL;
     if (group)
-        return w_config_modules_valid(v) && w_str_copy(group, sizeof(c->bar_left), v);
+        return w_config_set_modules(group, sizeof(c->bar_left), v);
+    if (!strncmp(key,"bar:",4)) {
+        const char *name = key+4, *field = strchr(name,':');
+        char module[sizeof(c->styles[0].name)];
+        if (!field || (size_t)(field-name) >= sizeof(module)) return false;
+        memcpy(module,name,field-name);
+        module[field-name] = 0;
+        w_module_style *style = w_config_module_style(c,module);
+        if (!style) return false;
+        if (!strcmp(field+1,"color")) {
+            style->colored = w_color(v,&style->color);
+            return style->colored;
+        }
+        return w_config_style_option(style,field+1,v);
+    }
     char *exe = !strcmp(key, "programs:terminal")       ? c->terminal
                 : !strcmp(key, "programs:file_browser") ? c->file_browser
                 : !strcmp(key, "programs:task_manager") ? c->task_manager

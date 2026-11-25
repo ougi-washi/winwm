@@ -6,7 +6,7 @@
 
 typedef enum bar_icon {
     icon_none,
-    icon_run,
+    icon_menu,
     icon_bluetooth,
     icon_network,
     icon_audio,
@@ -18,6 +18,14 @@ typedef enum bar_icon {
     icon_plug,
     icon_ethernet,
     icon_offline,
+    icon_cpu,
+    icon_keyboard,
+    icon_clock,
+    icon_traffic,
+    icon_display,
+    icon_project,
+    icon_clipboard,
+    icon_bell,
     icon_count
 } bar_icon;
 

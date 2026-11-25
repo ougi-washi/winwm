@@ -9,8 +9,9 @@ typedef struct w_vertex {
     signed char x, y;
 } w_vertex;
 
-static const w_vertex run[] = {{3, 5}, {21, 5}, {21, 19}, {3, 19}, {3, 5},   {-1, 0},
-                             {6, 9}, {9, 12}, {6, 15},  {-1, 0}, {12, 15}, {17, 15}};
+static const w_vertex menu[] = {{3,4},{10,4},{10,10},{3,10},{3,4},{-1,0},
+    {14,4},{21,4},{21,10},{14,10},{14,4},{-1,0},
+    {3,14},{10,14},{10,20},{3,20},{3,14},{-1,0},{14,14},{21,14},{21,20},{14,20},{14,14}};
 static const w_vertex bluetooth[] = {{6, 6}, {17, 16}, {11, 22}, {11, 2}, {17, 8}, {6, 18}};
 static const w_vertex network[] = {{2, 8},   {5, 6},  {8, 5},   {12, 4},  {16, 5},  {19, 6},
                                  {22, 8},  {-1, 0}, {5, 12},  {8, 10},  {12, 9},  {16, 10},
@@ -29,6 +30,23 @@ static const w_vertex chip[] = {{6, 6},   {18, 6},  {18, 18}, {6, 18},  {6, 6}, 
                               {15, 18}, {15, 21}, {-1, 0},  {3, 9},   {6, 9},  {-1, 0},  {3, 15},
                               {6, 15},  {-1, 0},  {18, 9},  {21, 9},  {-1, 0}, {18, 15}, {21, 15}};
 static const w_vertex play[] = {{7, 4}, {20, 12}, {7, 20}, {7, 4}};
+static const w_vertex ram[] = {{2,6},{22,6},{22,16},{2,16},{2,6},{-1,0},{6,10},{6,12},
+    {-1,0},{10,10},{10,12},{-1,0},{14,10},{14,12},{-1,0},{18,10},{18,12},
+    {-1,0},{5,17},{5,20},{-1,0},{10,17},{10,20},{-1,0},{15,17},{15,20},{-1,0},{20,17},{20,20}};
+static const w_vertex keyboard[]={{2,5},{22,5},{22,19},{2,19},{2,5},{-1,0},{6,9},{7,9},
+    {-1,0},{11,9},{12,9},{-1,0},{16,9},{17,9},{-1,0},{7,14},{17,14}};
+static const w_vertex clock_face[]={{12,2},{19,5},{22,12},{19,19},{12,22},{5,19},{2,12},{5,5},{12,2},
+    {-1,0},{12,6},{12,12},{16,14}};
+static const w_vertex traffic[]={{7,4},{7,20},{-1,0},{3,8},{7,4},{11,8},{-1,0},
+    {17,20},{17,4},{-1,0},{13,16},{17,20},{21,16}};
+static const w_vertex monitor[]={{2,4},{22,4},{22,16},{2,16},{2,4},{-1,0},
+    {12,16},{12,20},{-1,0},{8,20},{16,20}};
+static const w_vertex project[]={{2,6},{8,6},{11,9},{21,9},{21,19},{2,19},{2,6},
+    {-1,0},{7,12},{9,14},{7,16},{-1,0},{12,16},{16,16}};
+static const w_vertex clipboard[]={{9,4},{9,2},{15,2},{15,6},{9,6},{9,4},{-1,0},
+    {8,4},{5,4},{5,21},{19,21},{19,4},{16,4},{-1,0},{9,11},{15,11},{-1,0},{9,15},{13,15}};
+static const w_vertex bell[]={{4,17},{6,14},{6,10},{7,6},{9,4},{12,3},{15,4},{17,6},
+    {18,10},{18,14},{20,17},{4,17},{-1,0},{9,20},{11,21},{13,21},{15,20}};
 static const w_vertex plug[] = {{8, 3}, {8, 8}, {-1,0}, {16, 3}, {16, 8}, {-1,0}, {5, 8}, {19, 8},
                                 {18, 14}, {15, 17}, {9, 17}, {6, 14}, {5, 8}, {-1,0}, {12,17}, {12,22}};
 static const w_vertex ethernet[] = {{3,5},{21,5},{21,16},{17,16},{17,20},{7,20},{7,16},{3,16},{3,5},
@@ -88,13 +106,21 @@ void w_icons_resize(w_icon_atlas *atlas, int dpi) {
         static const struct w_icon_shape {
             const w_vertex *path;
             size_t count;
-        } shapes[] = {[icon_run] = {run, count_of(run)},
+        } shapes[] = {[icon_menu] = {menu, count_of(menu)},
                       [icon_bluetooth] = {bluetooth, count_of(bluetooth)},
                       [icon_network] = {network, count_of(network)},
                       [icon_audio] = {speaker, count_of(speaker)},
                       [icon_muted] = {speaker, count_of(speaker)},
                       [icon_battery] = {battery, count_of(battery)},
-                      [icon_memory] = {chip, count_of(chip)},
+                      [icon_memory] = {ram,count_of(ram)},
+                      [icon_cpu] = {chip,count_of(chip)},
+                      [icon_keyboard] = {keyboard,count_of(keyboard)},
+                      [icon_clock] = {clock_face,count_of(clock_face)},
+                      [icon_traffic] = {traffic,count_of(traffic)},
+                      [icon_display] = {monitor,count_of(monitor)},
+                      [icon_project] = {project,count_of(project)},
+                      [icon_clipboard] = {clipboard,count_of(clipboard)},
+                      [icon_bell] = {bell,count_of(bell)},
                       [icon_play] = {play, count_of(play)},
                       [icon_plug] = {plug, count_of(plug)},
                       [icon_quiet] = {speaker, count_of(speaker)},

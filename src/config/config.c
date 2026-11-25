@@ -167,20 +167,23 @@ void w_config_defaults(w_desktop_config *c) {
     c->inactive_border = 0x292b33;
     c->follow_mouse = true;
     c->bar_height = 32;
+    c->bar_tooltip_delay = 400;
+    c->bar_tooltip_duration = 4500;
+    c->bar_workspace_count = 5;
     c->background = 0x101116;
     c->foreground = 0xe4e5ea;
     c->accent = 0x91aaf7;
     strcpy(c->edge, "top");
     strcpy(c->bar_left, "menu workspaces mode");
     strcpy(c->bar_center, "clock");
-    strcpy(c->bar_right, "bluetooth network audio keyboard battery");
+    strcpy(c->bar_right, "cpu bluetooth network audio keyboard battery");
     strcpy(c->file_browser, "FilePilot.exe");
     strcpy(c->task_manager, "TaskSlinger.exe");
     strcpy(c->terminal, "auto");
     strcpy(c->editor, "%SystemRoot%\\System32\\notepad.exe");
     static const char *const pairs[][2] = {{"super+enter", "terminal"},
-                                           {"super+d", "launcher"},
-                                           {"ctrl+alt+space", "launcher"},
+                                           {"super+d", "menu"},
+                                           {"ctrl+alt+space", "menu"},
                                            {"super+p", "open_folder"},
                                            {"super+shift+escape", "open_tasks"},
                                            {"super+tab", "switcher"},
@@ -191,7 +194,7 @@ void w_config_defaults(w_desktop_config *c) {
                                            {"alt+escape", "switcher"},
                                            {"alt+f4", "close"},
                                            {"ctrl+shift+escape", "open_tasks"},
-                                           {"ctrl+escape", "launcher"},
+                                           {"ctrl+escape", "menu"},
                                            {"resize:left", "resize shrink"},
                                            {"resize:right", "resize grow"},
                                            {"super+v", "split vertical"},
@@ -321,38 +324,103 @@ bool w_config_has_module(const w_desktop_config *c, const char *module) {
     return false;
 }
 
-bool w_config_modules_valid(const char *out) {
-    const char *allowed[] = {"menu",   "bluetooth", "workspaces", "mode",    "title", "clock", "battery",
-                             "memory", "keyboard",  "audio",      "network", "cpu",   "media", "throughput"};
-    const char *p = out;
-    while (*p) {
-        while (*p == ' ')
-            ++p;
-        if (!*p)
-            break;
-        size_t len = strcspn(p, " ");
-        size_t full_len = len;
-        const char *hash = memchr(p, '#', len);
-        if (full_len >= 56)
-            return false;
-        if (hash) {
-            len = (size_t)(hash - p);
-            if (len + 1 == full_len)
-                return false;
-        }
-        bool found = false;
-        for (size_t i = 0; i < count_of(allowed); i++)
-            if (strlen(allowed[i]) == len && !strncmp(p, allowed[i], len))
-                found = true;
-        if (!found && !(len > 7 && len < 46 && !strncmp(p, "custom/", 7)))
-            return false;
-        p += full_len;
+static const char *const builtins[] = {"menu", "workspaces", "mode", "title", "clock", "bluetooth",
+    "network", "throughput", "audio", "keyboard", "battery", "cpu", "memory", "media",
+    "display", "clipboard", "notifications", "project"};
+
+const char *w_config_module_name(int index) {
+    return (unsigned)index < count_of(builtins) ? builtins[index] : NULL;
+}
+
+static bool w_module_valid(const char *p, size_t length) {
+    if (!length || length >= sizeof(((w_module_style *)0)->name)) return false;
+    for (size_t i=0; i<length; ++i)
+        if ((unsigned char)p[i] <= ' ' || p[i] == 0x7f) return false;
+    const char *tag = memchr(p,'#',length);
+    size_t base = tag ? (size_t)(tag-p) : length;
+    if (tag && (base+1 == length || memchr(tag+1,'#',length-base-1))) return false;
+    for (size_t i=0; i<count_of(builtins); ++i)
+        if (strlen(builtins[i]) == base && !strncmp(p,builtins[i],base)) return true;
+    return base > 7 && base-7 < sizeof(((w_provider_config *)0)->name) && !strncmp(p,"custom/",7);
+}
+
+bool w_config_set_modules(char *out, size_t cap, const char *spec) {
+    char normalized[sizeof(((w_desktop_config *)0)->bar_left)];
+    size_t used = 0;
+    while (*(spec += strspn(spec," \t"))) {
+        size_t n = strcspn(spec," \t");
+        if (!w_module_valid(spec,n) || used + (used != 0) + n >= sizeof(normalized)) return false;
+        if (used) normalized[used++] = ' ';
+        memcpy(normalized+used,spec,n);
+        used += n;
+        spec += n;
     }
-    return true;
+    normalized[used] = 0;
+    return !out || w_str_copy(out,cap,normalized);
+}
+
+bool w_config_modules_valid(const char *spec) {
+    return w_config_set_modules(NULL,0,spec);
+}
+
+w_module_style *w_config_module_style(w_desktop_config *c, const char *name) {
+    if (!w_module_valid(name,strlen(name))) return NULL;
+    for (int i=0; i<c->style_count; ++i)
+        if (!strcmp(c->styles[i].name,name)) return &c->styles[i];
+    if (c->style_count >= (int)count_of(c->styles)) return NULL;
+    w_module_style *style = &c->styles[c->style_count++];
+    strcpy(style->name,name);
+    return style;
+}
+
+bool w_config_style_option(w_module_style *style, const char *key, const char *value) {
+    bool tooltip = !strcmp(key,"tooltip");
+    for (const unsigned char *p=(const unsigned char *)value; *p; ++p)
+        if ((*p < ' ' || *p == 0x7f) && !(tooltip && (*p == '\n' || *p == '\r' || *p == '\t'))) return false;
+    if (!strcmp(key,"format")) return w_str_copy(style->format,sizeof(style->format),value);
+    if (tooltip) return w_str_copy(style->tooltip,sizeof(style->tooltip),value);
+    if (!strcmp(key,"tooltip_enabled")) {
+        if (!strcmp(value,"true") || !strcmp(value,"1")) style->hide_tooltip = false;
+        else if (!strcmp(value,"false") || !strcmp(value,"0")) style->hide_tooltip = true;
+        else return false;
+        return true;
+    }
+    if (!strcmp(key,"display")) {
+        const char *const modes[] = {"auto", "icon", "text", "icon_text"};
+        for (size_t i=0; i<count_of(modes); ++i)
+            if (!strcmp(modes[i],value)) { style->display = (enum w_module_display)i; return true; }
+        return false;
+    }
+    char *action = !strcmp(key,"on_click") ? style->action :
+                   !strcmp(key,"on_click_right") ? style->right_click :
+                   !strcmp(key,"on_click_middle") ? style->middle_click :
+                   !strcmp(key,"scroll_up") ? style->scroll_up :
+                   !strcmp(key,"scroll_down") ? style->scroll_down : NULL;
+    w_command command;
+    return action && (!*value || w_command_parse(value,&command)) && w_str_copy(action,sizeof(style->action),value);
 }
 
 ////////////////
 //~ Configuration parsing
+
+static bool w_json_modules(const w_json_token *t, int v, char *out, size_t cap) {
+    char spec[sizeof(((w_desktop_config *)0)->bar_left)];
+    if (t[v].type == json_string)
+        return w_json_read(&t[v],spec,sizeof(spec)) && w_config_set_modules(out,cap,spec);
+    if (t[v].type != json_array) return false;
+    size_t used = 0;
+    for (int i=v+1; i<t[v].after; i=t[i].after) {
+        char name[sizeof(((w_module_style *)0)->name)];
+        if (!w_json_read(&t[i],name,sizeof(name)) || !w_module_valid(name,strlen(name))) return false;
+        size_t n = strlen(name);
+        if (used + (used != 0) + n >= sizeof(spec)) return false;
+        if (used) spec[used++] = ' ';
+        memcpy(spec+used,name,n);
+        used += n;
+    }
+    spec[used] = 0;
+    return w_str_copy(out,cap,spec);
+}
 
 static bool w_parse_object(w_desktop_config *c, w_json_token *t, int root, char *err, size_t cap) {
     bool version = false;
@@ -390,6 +458,12 @@ static bool w_parse_object(w_desktop_config *c, w_json_token *t, int root, char 
             }
         } else if (!strcmp(k, "bar_height"))
             ok = w_token_int(a, 16, 128, &c->bar_height);
+        else if (!strcmp(k, "bar_tooltip_delay"))
+            ok = w_token_int(a, 0, 10000, &c->bar_tooltip_delay);
+        else if (!strcmp(k, "bar_tooltip_duration"))
+            ok = w_token_int(a, 0, 60000, &c->bar_tooltip_duration);
+        else if (!strcmp(k, "bar_workspace_count"))
+            ok = w_token_int(a, 0, workspace_limit, &c->bar_workspace_count);
         else if (!strcmp(k, "background"))
             ok = w_color(a, &c->background);
         else if (!strcmp(k, "foreground"))
@@ -415,11 +489,11 @@ static bool w_parse_object(w_desktop_config *c, w_json_token *t, int root, char 
                  (!strcmp(c->edge, "top") || !strcmp(c->edge, "bottom") || !strcmp(c->edge, "left") ||
                   !strcmp(c->edge, "right"));
         else if (!strcmp(k, "bar_left"))
-            ok = (w_json_read(a, c->bar_left, sizeof(c->bar_left)) && w_config_modules_valid(c->bar_left));
+            ok = w_json_modules(t,v,c->bar_left,sizeof(c->bar_left));
         else if (!strcmp(k, "bar_center"))
-            ok = (w_json_read(a, c->bar_center, sizeof(c->bar_center)) && w_config_modules_valid(c->bar_center));
+            ok = w_json_modules(t,v,c->bar_center,sizeof(c->bar_center));
         else if (!strcmp(k, "bar_right"))
-            ok = (w_json_read(a, c->bar_right, sizeof(c->bar_right)) && w_config_modules_valid(c->bar_right));
+            ok = w_json_modules(t,v,c->bar_right,sizeof(c->bar_right));
         else if (!strcmp(k, "file_browser"))
             ok = w_json_read(a, c->file_browser, sizeof(c->file_browser)) && *c->file_browser;
         else if (!strcmp(k, "task_manager"))
@@ -463,17 +537,11 @@ static bool w_parse_object(w_desktop_config *c, w_json_token *t, int root, char 
                     ok = false;
                     break;
                 }
-                int n = 0;
-                while (n < c->style_count && strcmp(c->styles[n].name, name))
-                    n++;
-                if (n >= (int)count_of(c->styles)) {
+                w_module_style *style = w_config_module_style(c,name);
+                if (!style) {
                     ok = false;
                     break;
                 }
-                if (n == c->style_count)
-                    c->style_count++;
-                w_module_style *style = &c->styles[n];
-                strcpy(style->name, name);
                 for (int z = j + 2; ok && z < t[j + 1].after; z = t[z + 1].after) {
                     char field[32];
                     w_json_token *val = &t[z + 1];
@@ -481,20 +549,20 @@ static bool w_parse_object(w_desktop_config *c, w_json_token *t, int root, char 
                         ok = false;
                         break;
                     }
-                    if (!strcmp(field, "format"))
-                        ok = w_json_read(val, style->format, sizeof(style->format));
-                    else if (!strcmp(field, "tooltip"))
-                        ok = w_json_read(val, style->tooltip, sizeof(style->tooltip));
-                    else if (!strcmp(field, "color")) {
+                    if (!strcmp(field, "color")) {
                         ok = w_color(val, &style->color);
                         style->colored = ok;
+                    } else if (!strcmp(field,"tooltip_enabled") || (!strcmp(field,"tooltip") && val->type == json_scalar)) {
+                        bool enabled;
+                        ok = w_token_bool(val,&enabled);
+                        if (ok) style->hide_tooltip = !enabled;
                     } else {
-                        char *out = !strcmp(field, "on_click")      ? style->action
-                                    : !strcmp(field, "scroll_up")   ? style->scroll_up
-                                    : !strcmp(field, "scroll_down") ? style->scroll_down
-                                                                    : NULL;
-                        w_command action;
-                        ok = out && w_json_read(val, out, 128) && w_command_parse(out, &action);
+                        char value[sizeof(style->tooltip)];
+                        ok = w_json_read(val,value,sizeof(value)) && w_config_style_option(style,field,value);
+                    }
+                    if (!ok) {
+                        snprintf(err,cap,"line %d: invalid module option '%s.%s'",val->line,name,field);
+                        return false;
                     }
                 }
             }

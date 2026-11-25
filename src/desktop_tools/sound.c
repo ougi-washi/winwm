@@ -11,11 +11,61 @@ typedef struct {
     LPWSTR id;
     IAudioEndpointVolume *endpoint;
     ISimpleAudioVolume *session;
-    bool is_default;
+    bool is_default, calls_default;
 } w_sound_row;
 
 static w_sound_row *rows;
 static int used, capacity;
+static IMMDeviceEnumerator *devices;
+static bool watching;
+static LONG changed;
+static int last_view = -1;
+static wchar_t *selection[sound_view_count];
+static int scroll[sound_view_count];
+
+// The notification object lives for the lifetime of this helper process. Audio
+// service callbacks only mark the inventory dirty; the panel owns all COM rows.
+static ULONG STDMETHODCALLTYPE w_ref(IMMNotificationClient *self) { (void)self; return 2; }
+static ULONG STDMETHODCALLTYPE w_unref(IMMNotificationClient *self) { (void)self; return 1; }
+static HRESULT STDMETHODCALLTYPE w_query(IMMNotificationClient *self, REFIID id, void **out) {
+    if (!out) return E_POINTER;
+    *out = NULL;
+    if (!IsEqualIID(id,&IID_IUnknown) && !IsEqualIID(id,&IID_IMMNotificationClient)) return E_NOINTERFACE;
+    *out = self;
+    w_ref(self);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE w_device_event(IMMNotificationClient *self, LPCWSTR id) {
+    (void)self; (void)id;
+    InterlockedExchange(&changed,1);
+    return S_OK;
+}
+static HRESULT STDMETHODCALLTYPE w_state_event(IMMNotificationClient *self, LPCWSTR id, DWORD state) {
+    (void)state;
+    return w_device_event(self,id);
+}
+static HRESULT STDMETHODCALLTYPE w_role_event(IMMNotificationClient *self, EDataFlow flow, ERole role, LPCWSTR id) {
+    (void)flow; (void)role;
+    return w_device_event(self,id);
+}
+static HRESULT STDMETHODCALLTYPE w_property_event(IMMNotificationClient *self, LPCWSTR id, const PROPERTYKEY key) {
+    if (key.pid == PKEY_Device_FriendlyName.pid && IsEqualGUID(&key.fmtid,&PKEY_Device_FriendlyName.fmtid))
+        return w_device_event(self,id);
+    return S_OK;
+}
+static IMMNotificationClientVtbl listener_methods = {
+    w_query,w_ref,w_unref,w_state_event,w_device_event,w_device_event,w_role_event,w_property_event
+};
+static IMMNotificationClient listener = {&listener_methods};
+
+bool w_sound_watch(void) {
+    if (!devices && FAILED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
+                                           &IID_IMMDeviceEnumerator, (void **)&devices))) return false;
+    if (!watching) watching = SUCCEEDED(IMMDeviceEnumerator_RegisterEndpointNotificationCallback(devices,&listener));
+    return watching;
+}
+
+bool w_sound_inventory_changed(void) { return InterlockedExchange(&changed,0) != 0; }
 
 static void w_sound_release(w_sound_row row) {
     CoTaskMemFree(row.id);
@@ -23,12 +73,22 @@ static void w_sound_release(w_sound_row row) {
     if (row.session) ISimpleAudioVolume_Release(row.session);
 }
 
-void w_sound_clear(void) {
+static void w_sound_clear(void) {
     for (int i = 0; i < used; ++i)
         w_sound_release(rows[i]);
     free(rows);
     rows = NULL;
     used = capacity = 0;
+}
+
+void w_sound_stop(void) {
+    w_sound_clear();
+    for (int i=0; i<sound_view_count; ++i) { free(selection[i]); selection[i]=NULL; }
+    if (watching) IMMDeviceEnumerator_UnregisterEndpointNotificationCallback(devices,&listener);
+    if (devices) IMMDeviceEnumerator_Release(devices);
+    devices = NULL;
+    watching = false;
+    last_view = -1;
 }
 
 static void w_add_sound(HWND list, const wchar_t *label, w_sound_row row) {
@@ -95,67 +155,79 @@ static void w_sessions(HWND list, IMMDevice *device, const wchar_t *endpoint) {
     IAudioSessionManager2_Release(manager);
 }
 
-void w_sound_refresh(HWND list, bool sessions) {
+static LPWSTR w_default_id(EDataFlow flow, ERole role) {
+    IMMDevice *active = NULL;
+    LPWSTR id = NULL;
+    if (SUCCEEDED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(devices,flow,role,&active))) {
+        IMMDevice_GetId(active,&id);
+        IMMDevice_Release(active);
+    }
+    return id;
+}
+
+void w_sound_refresh(HWND list, enum w_sound_view view) {
     LRESULT selected = SendMessageW(list, LB_GETCURSEL, 0, 0);
     LRESULT top = SendMessageW(list, LB_GETTOPINDEX, 0, 0);
     int previous = selected < 0 ? -1 : (int)SendMessageW(list, LB_GETITEMDATA, selected, 0);
-    wchar_t *id = previous >= 0 && previous < used ? _wcsdup(rows[previous].id) : NULL;
+    if (last_view >= 0) {
+        scroll[last_view] = (int)top;
+        if (previous >= 0 && previous < used) {
+            wchar_t *copy = _wcsdup(rows[previous].id);
+            if (copy) { free(selection[last_view]); selection[last_view] = copy; }
+        }
+    }
+    last_view = view;
+    const wchar_t *id = selection[view];
     SendMessageW(list, WM_SETREDRAW, FALSE, 0);
     SendMessageW(list, LB_RESETCONTENT, 0, 0);
     w_sound_clear();
-    IMMDeviceEnumerator *devices = NULL;
-    if (SUCCEEDED(CoCreateInstance(&CLSID_MMDeviceEnumerator, NULL, CLSCTX_INPROC_SERVER,
-                                   &IID_IMMDeviceEnumerator, (void **)&devices))) {
-        for (EDataFlow flow = eRender; flow <= (sessions ? eRender : eCapture); ++flow) {
-            IMMDeviceCollection *collection = NULL;
-            if (FAILED(IMMDeviceEnumerator_EnumAudioEndpoints(devices, flow, DEVICE_STATE_ACTIVE, &collection))) continue;
-            IMMDevice *active = NULL;
-            LPWSTR default_id = NULL;
-            if (SUCCEEDED(IMMDeviceEnumerator_GetDefaultAudioEndpoint(devices, flow, eConsole, &active))) {
-                IMMDevice_GetId(active, &default_id);
-                IMMDevice_Release(active);
+    EDataFlow flow = view == sound_inputs ? eCapture : eRender;
+    IMMDeviceCollection *collection = NULL;
+    if (devices && SUCCEEDED(IMMDeviceEnumerator_EnumAudioEndpoints(devices,flow,DEVICE_STATE_ACTIVE,&collection))) {
+        LPWSTR default_id = view == sound_apps ? NULL : w_default_id(flow,eConsole);
+        LPWSTR media_id = view == sound_apps ? NULL : w_default_id(flow,eMultimedia);
+        LPWSTR calls_id = view == sound_apps ? NULL : w_default_id(flow,eCommunications);
+        UINT count = 0;
+        IMMDeviceCollection_GetCount(collection, &count);
+        for (UINT i = 0; i < count; ++i) {
+            IMMDevice *device = NULL;
+            if (FAILED(IMMDeviceCollection_Item(collection, i, &device))) continue;
+            PROPVARIANT value;
+            PropVariantInit(&value);
+            IPropertyStore *properties = NULL;
+            if (SUCCEEDED(IMMDevice_OpenPropertyStore(device, STGM_READ, &properties))) {
+                IPropertyStore_GetValue(properties, &PKEY_Device_FriendlyName, &value);
+                IPropertyStore_Release(properties);
             }
-            UINT count = 0;
-            IMMDeviceCollection_GetCount(collection, &count);
-            for (UINT i = 0; i < count; ++i) {
-                IMMDevice *device = NULL;
-                if (FAILED(IMMDeviceCollection_Item(collection, i, &device))) continue;
-                PROPVARIANT value;
-                PropVariantInit(&value);
-                IPropertyStore *properties = NULL;
-                if (SUCCEEDED(IMMDevice_OpenPropertyStore(device, STGM_READ, &properties))) {
-                    IPropertyStore_GetValue(properties, &PKEY_Device_FriendlyName, &value);
-                    IPropertyStore_Release(properties);
-                }
-                const wchar_t *name = value.vt == VT_LPWSTR && value.pwszVal ? value.pwszVal : L"Audio device";
-                if (sessions) w_sessions(list, device, name);
-                else {
-                    w_sound_row row = {0};
-                    if (SUCCEEDED(IMMDevice_GetId(device, &row.id)) &&
-                        SUCCEEDED(IMMDevice_Activate(device, &IID_IAudioEndpointVolume, CLSCTX_ALL, NULL, (void **)&row.endpoint))) {
-                        row.is_default = default_id && !wcscmp(default_id, row.id);
-                        wchar_t label[512];
-                        swprintf(label, count_of(label), L"%ls   ·   %.400ls%ls", flow == eRender ? L"Output" : L"Input",
-                                 name, row.is_default ? L"   ·   Default" : L"");
-                        w_add_sound(list, label, row);
-                    } else w_sound_release(row);
-                }
-                PropVariantClear(&value);
-                IMMDevice_Release(device);
+            const wchar_t *name = value.vt == VT_LPWSTR && value.pwszVal ? value.pwszVal : L"Audio device";
+            if (view == sound_apps) w_sessions(list, device, name);
+            else {
+                w_sound_row row = {0};
+                if (SUCCEEDED(IMMDevice_GetId(device, &row.id)) &&
+                    SUCCEEDED(IMMDevice_Activate(device, &IID_IAudioEndpointVolume, CLSCTX_ALL, NULL, (void **)&row.endpoint))) {
+                    row.is_default = default_id && media_id && !wcscmp(default_id,row.id) && !wcscmp(media_id,row.id);
+                    row.calls_default = calls_id && !wcscmp(calls_id,row.id);
+                    wchar_t label[512];
+                    swprintf(label, count_of(label), L"%.410ls%ls%ls", name,
+                             row.is_default ? L"   ·   Default" : L"", row.calls_default ? L"   ·   Calls" : L"");
+                    w_add_sound(list, label, row);
+                } else w_sound_release(row);
             }
-            CoTaskMemFree(default_id);
-            IMMDeviceCollection_Release(collection);
+            PropVariantClear(&value);
+            IMMDevice_Release(device);
         }
-        IMMDeviceEnumerator_Release(devices);
+        CoTaskMemFree(default_id);
+        CoTaskMemFree(media_id);
+        CoTaskMemFree(calls_id);
+        IMMDeviceCollection_Release(collection);
     }
     selected = id ? -1 : 0;
     for (int i = 0; i < used; ++i) {
         if (id && !wcscmp(id, rows[i].id)) { selected = i; break; }
         if (!id && rows[i].is_default) { selected = i; break; }
     }
-    free(id);
     SendMessageW(list, LB_SETCURSEL, selected, 0);
-    if (top > 0 && top < used) SendMessageW(list, LB_SETTOPINDEX, top, 0);
+    if (scroll[view] > 0 && scroll[view] < used) SendMessageW(list, LB_SETTOPINDEX, scroll[view], 0);
     SendMessageW(list, WM_SETREDRAW, TRUE, 0);
     InvalidateRect(list, NULL, TRUE);
 }
@@ -173,20 +245,24 @@ bool w_sound_state(int index, int *percent, BOOL *muted) {
 }
 
 bool w_sound_change(int index, int percent) {
-    int level;
-    BOOL muted;
-    if (!w_sound_state(index, &level, &muted)) return false;
+    if (index < 0 || index >= used) return false;
     w_sound_row *r = &rows[index];
-    if (percent < 0)
+    if (percent < 0) {
+        BOOL muted;
+        HRESULT hr = r->session ? ISimpleAudioVolume_GetMute(r->session,&muted) :
+                                  IAudioEndpointVolume_GetMute(r->endpoint,&muted);
+        if (FAILED(hr)) return false;
         return SUCCEEDED(r->session ? ISimpleAudioVolume_SetMute(r->session, !muted, NULL) :
                                       IAudioEndpointVolume_SetMute(r->endpoint, !muted, NULL));
+    }
     float volume = w_clamp_int(percent, 0, 100) / 100.0f;
     return SUCCEEDED(r->session ? ISimpleAudioVolume_SetMasterVolume(r->session, volume, NULL) :
                                   IAudioEndpointVolume_SetMasterVolumeLevelScalar(r->endpoint, volume, NULL));
 }
 
-bool w_sound_can_default(int index) {
-    return index >= 0 && index < used && rows[index].endpoint && !rows[index].is_default;
+bool w_sound_can_default(int index, bool calls) {
+    return index >= 0 && index < used && rows[index].endpoint &&
+           !(calls ? rows[index].calls_default : rows[index].is_default);
 }
 
 // Windows exposes default endpoint selection through the PolicyConfig COM service.
@@ -200,14 +276,27 @@ struct w_policy {
     } *vt;
 };
 
-bool w_sound_make_default(int index) {
+bool w_sound_make_default(int index, bool calls) {
     static const GUID clsid = {0x870af99c,0x171d,0x4f9e,{0xaf,0x0d,0xe6,0x3d,0xf4,0x0c,0x2b,0xc9}};
     static const GUID iid = {0xf8679f50,0x850a,0x41cf,{0x9c,0x72,0x43,0x0f,0x29,0x02,0x90,0xc8}};
     w_policy *policy = NULL;
-    if (!w_sound_can_default(index) || FAILED(CoCreateInstance(&clsid, NULL, CLSCTX_ALL, &iid, (void **)&policy))) return false;
-    // Keep the dedicated communications choice intact.
-    HRESULT hr = policy->vt->set_default(policy, rows[index].id, eMultimedia);
-    if (SUCCEEDED(hr)) hr = policy->vt->set_default(policy, rows[index].id, eConsole);
+    if (!w_sound_can_default(index,calls) || FAILED(CoCreateInstance(&clsid,NULL,CLSCTX_ALL,&iid,(void **)&policy))) return false;
+    HRESULT hr;
+    if (calls) hr = policy->vt->set_default(policy,rows[index].id,eCommunications);
+    else {
+        EDataFlow flow = last_view == sound_inputs ? eCapture : eRender;
+        LPWSTR prior = w_default_id(flow,eMultimedia);
+        hr = policy->vt->set_default(policy,rows[index].id,eMultimedia);
+        if (SUCCEEDED(hr)) {
+            hr = policy->vt->set_default(policy,rows[index].id,eConsole);
+            if (FAILED(hr) && prior) {
+                LPWSTR current = w_default_id(flow,eMultimedia);
+                if (current && !wcscmp(current,rows[index].id)) policy->vt->set_default(policy,prior,eMultimedia);
+                CoTaskMemFree(current);
+            }
+        }
+        CoTaskMemFree(prior);
+    }
     policy->vt->unknown.Release((IUnknown *)policy);
     return SUCCEEDED(hr);
 }

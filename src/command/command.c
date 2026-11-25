@@ -38,8 +38,14 @@ int w_command_direction(const char *s) {
 
 bool w_command_parse(const char *s, w_command *out) {
     size_t n = strcspn(s, " ");
+    const char *name = s;
+    size_t name_length = n;
+    if (n == 8 && !strncmp(s, "launcher", n)) {
+        name = names[cmd_menu];
+        name_length = strlen(name);
+    }
     for (int i = 1; i < cmd_count; i++) {
-        if (strlen(names[i]) != n || strncmp(s, names[i], n))
+        if (strlen(names[i]) != name_length || strncmp(name, names[i], name_length))
             continue;
         w_command c = {.kind = (enum command_kind)i};
         s += n;

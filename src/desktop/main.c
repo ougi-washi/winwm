@@ -34,6 +34,8 @@ typedef struct w_config_result {
 
 static SRWLOCK cache_lock = SRWLOCK_INIT;
 static LONG config_revision;
+enum reload_scope { reload_none, reload_bar, reload_full };
+static enum reload_scope pending_reload;
 static DWORD WINAPI w_save_config(void *ptr) {
     w_config_result *r = ptr;
     AcquireSRWLockExclusive(&cache_lock);
@@ -44,20 +46,25 @@ static DWORD WINAPI w_save_config(void *ptr) {
     return 0;
 }
 
-static DWORD WINAPI w_load_thread(void *unused) {
-    (void)unused;
+static DWORD WINAPI w_load_thread(void *scope) {
     w_config_result *r = calloc(1, sizeof(*r));
     if (r)
         r->ok = w_os_config_load(&r->cfg, r->error, sizeof(r->error));
-    if (!PostMessageW(desk.root, msg_load, 0, (LPARAM)r))
+    if (!PostMessageW(desk.root, msg_load, (WPARAM)scope, (LPARAM)r))
         free(r);
     return 0;
 }
 
-void w_desktop_load(void) {
-    if (desk.loading)
+static void w_reload(enum reload_scope scope) {
+    if (desk.loading) {
+        if (scope > pending_reload) pending_reload = scope;
         return;
-    desk.loading = QueueUserWorkItem(w_load_thread, NULL, WT_EXECUTEDEFAULT) != 0;
+    }
+    desk.loading = QueueUserWorkItem(w_load_thread, (void *)(uintptr_t)scope, WT_EXECUTEDEFAULT) != 0;
+}
+
+void w_desktop_load(void) {
+    w_reload(reload_full);
 }
 
 void w_desktop_schedule(void) {
@@ -163,11 +170,10 @@ static void w_initialize(void) {
 void w_desktop_timer(void) {
     KillTimer(desk.root, 1);
     bool clock = w_config_has_module(&desk.config, "clock");
-    bool sample = w_config_has_module(&desk.config, "memory");
-    if (!desk.hide_bars && (clock || sample)) {
+    if (!desk.hide_bars && clock) {
         SYSTEMTIME t;
         GetLocalTime(&t);
-        UINT wait = sample ? 5000 : 60000 - t.wSecond * 1000 - t.wMilliseconds;
+        UINT wait = 60000 - t.wSecond * 1000 - t.wMilliseconds;
         SetTimer(desk.root, 1, wait, NULL);
     }
 }
@@ -228,6 +234,9 @@ void w_desktop_request(const char *s, char *reply, size_t cap) {
             if (!desk.registered[i])
                 n += snprintf(reply + n, cap - (size_t)n, "unavailable binding: %s\n",
                               desk.config.bindings[i].chord);
+    } else if (!strcmp(s, "reload-bar")) {
+        w_reload(reload_bar);
+        snprintf(reply, cap, "toolbar reload scheduled");
     } else if (!strcmp(s, "reload")) {
         w_desktop_load();
         snprintf(reply, cap, "reload scheduled");
@@ -259,7 +268,7 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         HMONITOR monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONULL);
         for (int i = 0; i < output_limit; i++)
             if (desk.outputs[i].live && desk.outputs[i].monitor == monitor) {
-                w_desktop_action(i, "launcher");
+                w_desktop_action(i, "menu");
                 break;
             }
         return 0;
@@ -301,6 +310,23 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     case msg_load: {
         w_config_result *r = (w_config_result *)lp;
         desk.loading = false;
+        if (pending_reload) {
+            enum reload_scope next = pending_reload;
+            pending_reload = reload_none;
+            w_reload(next);
+        }
+        bool layout_only = wp == reload_bar && desk.ready;
+        if (layout_only && r && r->ok) {
+            // Adopt the modules and their settings without running desktop startup programs again.
+            strcpy(desk.config.bar_left, r->cfg.bar_left);
+            strcpy(desk.config.bar_center, r->cfg.bar_center);
+            strcpy(desk.config.bar_right, r->cfg.bar_right);
+            desk.config.style_count = r->cfg.style_count;
+            memcpy(desk.config.styles, r->cfg.styles, sizeof(desk.config.styles));
+            desk.config.provider_count = r->cfg.provider_count;
+            memcpy(desk.config.providers, r->cfg.providers, sizeof(desk.config.providers));
+            r->cfg = desk.config;
+        }
         bool changed = r && r->ok && memcmp(&desk.config, &r->cfg, sizeof(desk.config)) != 0;
         if (r && r->ok) {
             if (!desk.ready || r->cfg.master_default != desk.config.master_default) {
@@ -309,14 +335,18 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                         desk.model.spaces[o][j].layout = r->cfg.master_default ? layout_master : layout_tree;
             }
             desk.config = r->cfg;
-            w_desktop_bind();
-            w_desktop_outputs();
+            if (!layout_only) {
+                w_desktop_bind();
+                w_desktop_outputs();
+            }
             w_desktop_timer();
             w_desktop_status_configure();
-            w_providers_configure(desk.root, msg_devices, &desk.config);
+            if (!desk.hide_bars) w_providers_configure(desk.root, msg_devices, &desk.config);
             w_desktop_notice("Configuration loaded");
-            w_desktop_start_programs(!loaded_programs);
-            loaded_programs = true;
+            if (!layout_only) {
+                w_desktop_start_programs(!loaded_programs);
+                loaded_programs = true;
+            }
             for (int i = 0; i < output_limit; i++)
                 if (desk.outputs[i].live)
                     InvalidateRect(desk.outputs[i].bar.hwnd, NULL, FALSE);
@@ -324,7 +354,7 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             w_desktop_notice(r ? r->error : "Configuration allocation failed");
         if (!desk.ready)
             w_discover_initial();
-        if (changed) {
+        if (changed || (layout_only && r && r->ok)) {
             r->revision = InterlockedIncrement(&config_revision);
             if (QueueUserWorkItem(w_save_config, r, WT_EXECUTEDEFAULT))
                 return 0;
@@ -415,7 +445,6 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             for (int i = 0; i < output_limit; i++)
                 if (desk.outputs[i].live && !desk.outputs[i].bar_hidden) {
                     w_bar_invalidate(&desk.outputs[i].bar, "clock");
-                    w_bar_invalidate(&desk.outputs[i].bar, "memory");
                 }
             w_desktop_timer();
         }
