@@ -83,7 +83,6 @@ static void CALLBACK w_observe(HWINEVENTHOOK hook, DWORD event, HWND w, LONG obj
                              DWORD time) {
     (void)hook;
     (void)thread;
-    (void)time;
     if (event == EVENT_SYSTEM_DESKTOPSWITCH) {
         w_input_reset();
         PostMessageW(desk.root, msg_window, event, 0);
@@ -99,7 +98,10 @@ static void CALLBACK w_observe(HWINEVENTHOOK hook, DWORD event, HWND w, LONG obj
         event_overflow = true;
         return;
     }
-    if (PostMessageW(desk.root, msg_window, event, (LPARAM)w))
+    if (event == EVENT_SYSTEM_FOREGROUND && w_os_same_process(w))
+        return;
+    WPARAM record = (WPARAM)event | ((WPARAM)time << 32);
+    if (PostMessageW(desk.root, msg_window, record, (LPARAM)w))
         pending_events++;
 }
 
@@ -128,8 +130,11 @@ static void w_discover_initial(void) {
                         {EVENT_OBJECT_CLOAKED, EVENT_OBJECT_UNCLOAKED}};
     _Static_assert(count_of(range) == count_of(desk.hooks), "window hook storage");
     for (size_t i = 0; i < count_of(range); i++) {
-        desk.hooks[i] = SetWinEventHook(range[i][0], range[i][1], NULL, w_observe, 0, 0,
-                                        WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS);
+        // A shell activation initiated by Menu can foreground another process's
+        // existing HWND without generating a show or location event.
+        DWORD flags = WINEVENT_OUTOFCONTEXT;
+        if (range[i][0] != EVENT_SYSTEM_FOREGROUND) flags |= WINEVENT_SKIPOWNPROCESS;
+        desk.hooks[i] = SetWinEventHook(range[i][0], range[i][1], NULL, w_observe, 0, 0, flags);
         if (!desk.hooks[i]) {
             w_desktop_notice("Window event hook unavailable");
             SetTimer(desk.root, discovery_timer, 2000, NULL);
@@ -255,7 +260,7 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         if (wp == HSHELL_LANGUAGE)
             w_invalidate_language();
         else if (desk.ready && wp == HSHELL_WINDOWCREATED)
-            w_desktop_event((HWND)lp, EVENT_OBJECT_SHOW);
+            w_desktop_event((HWND)lp, EVENT_OBJECT_SHOW, 0);
         return 0;
     }
     switch (msg) {
@@ -418,13 +423,13 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         free((void *)lp);
         return 0;
     case msg_window:
-        if (wp == EVENT_SYSTEM_DESKTOPSWITCH) {
+        if ((DWORD)wp == EVENT_SYSTEM_DESKTOPSWITCH) {
             w_desktop_scan(false);
             return 0;
         }
         pending_events--;
-        w_desktop_event((HWND)lp, (DWORD)wp);
-        if (wp == EVENT_SYSTEM_FOREGROUND)
+        w_desktop_event((HWND)lp, (DWORD)wp, (DWORD)(wp >> 32));
+        if ((DWORD)wp == EVENT_SYSTEM_FOREGROUND)
             w_invalidate_language();
         if (!pending_events && event_overflow) {
             event_overflow = false;

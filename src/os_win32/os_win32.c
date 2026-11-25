@@ -117,7 +117,7 @@ static bool w_launchable(const wchar_t *path) {
     DWORD flags = GetFileAttributesW(path);
     const wchar_t *ext = wcsrchr(base, L'.');
     return flags != INVALID_FILE_ATTRIBUTES && !(flags & FILE_ATTRIBUTE_DIRECTORY) && ext &&
-           !_wcsicmp(ext, L".exe") && _wcsicmp(base, L"explorer.exe");
+           !_wcsicmp(ext, L".exe");
 }
 
 static bool w_absolute_executable(const wchar_t *path, wchar_t *out, int cap) {
@@ -163,7 +163,7 @@ bool w_os_provider(const char *name, wchar_t *out, int cap) {
         return false;
     if (wcspbrk(path,L"\\/:"))
         return w_absolute_executable(path,out,cap);
-    if (!*path || !_wcsicmp(path,L"explorer") || !_wcsicmp(path,L"explorer.exe"))
+    if (!*path)
         return false;
     wchar_t *env = calloc(32768, sizeof(wchar_t));
     if (env) {
@@ -241,11 +241,13 @@ HANDLE w_os_launch_positioned(const wchar_t *exe, const wchar_t *arg, POINT orig
     return w_launch_at(exe, arg, NULL, &origin);
 }
 
-bool w_os_run_as_admin(const wchar_t *file, const wchar_t *parameters, const wchar_t *directory) {
+bool w_os_shell_execute(const wchar_t *file, const wchar_t *parameters, const wchar_t *directory, bool admin) {
     HRESULT apartment = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     SHELLEXECUTEINFOW info = {.cbSize = sizeof(info), .fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
-        .lpVerb = L"runas", .lpFile = file, .lpParameters = parameters, .lpDirectory = directory,
+        .lpVerb = admin ? L"runas" : NULL, .lpFile = file, .lpParameters = parameters, .lpDirectory = directory,
         .nShow = SW_SHOWNORMAL};
+    if (wcschr(file, L'%') && !PathIsURLW(file))
+        info.fMask |= SEE_MASK_DOENVSUBST;
     bool started = ShellExecuteExW(&info) != FALSE;
     DWORD error = started ? ERROR_SUCCESS : GetLastError();
     if (SUCCEEDED(apartment)) CoUninitialize();
@@ -258,7 +260,7 @@ bool w_os_run_executable(const wchar_t *exe, const wchar_t *argument, const wcha
         wchar_t quoted[2 * os_path_cap + 3];
         if (argument && wcslen(argument) >= os_path_cap) return false;
         if (argument && *argument) w_quote(quoted, argument);
-        return w_os_run_as_admin(exe, argument && *argument ? quoted : NULL, directory);
+        return w_os_shell_execute(exe, argument && *argument ? quoted : NULL, directory, true);
     }
     HANDLE child = w_launch_at(exe, argument, directory, NULL);
     if (!child) return false;
@@ -266,30 +268,38 @@ bool w_os_run_executable(const wchar_t *exe, const wchar_t *argument, const wcha
     return true;
 }
 
-bool w_os_launch_wide_line(wchar_t *line, bool admin) {
+static bool w_launch_command_line(wchar_t *line, bool admin, bool allow_shell_targets) {
     wchar_t path[os_path_cap], home[os_path_cap];
     int argc = 0;
     while (*line == L' ' || *line == L'\t') ++line;
-    if (!*line) return false;
+    if (!*line) { SetLastError(ERROR_INVALID_PARAMETER); return false; }
     wchar_t **argv = CommandLineToArgvW(line, &argc);
+    if (!argv) return false;
     char name[4096];
-    bool found =
-        argv && argc && w_os_utf8(argv[0], name, sizeof(name)) && w_os_provider(name, path, count_of(path));
-    if (argv)
+    bool found = argc && w_os_utf8(argv[0], name, sizeof(name)) && w_os_provider(name, path, count_of(path));
+    if (!found && !allow_shell_targets) {
         LocalFree(argv);
-    DWORD n = GetEnvironmentVariableW(L"USERPROFILE", home, count_of(home));
-    if (!found || !n || n >= count_of(home))
+        SetLastError(ERROR_FILE_NOT_FOUND);
         return false;
-    if (admin) {
-        // argv[0] is the executable. Give its original argument tail to ShellExecuteEx.
+    }
+    DWORD n = GetEnvironmentVariableW(L"USERPROFILE", home, count_of(home));
+    const wchar_t *directory = n && n < count_of(home) ? home : NULL;
+    if (admin || !found) {
+        // Let Windows resolve shell objects, applets and registered URI handlers.
+        // Preserve quoting in the argument tail of executable commands.
         const wchar_t *args = *line == L'"' ? wcschr(line + 1, L'"') : line + wcscspn(line, L" \t");
         if (args && *args == L'"') ++args;
         if (args) args += wcsspn(args, L" \t");
-        return w_os_run_as_admin(path, args && *args ? args : NULL, home);
+        bool started = w_os_shell_execute(found ? path : argv[0], args && *args ? args : NULL, directory, admin);
+        DWORD error = GetLastError();
+        LocalFree(argv);
+        SetLastError(error);
+        return started;
     }
+    LocalFree(argv);
     STARTUPINFOW si = {.cb = sizeof(si)};
     PROCESS_INFORMATION pi = {0};
-    if (!CreateProcessW(path, line, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, home, &si, &pi))
+    if (!CreateProcessW(path, line, NULL, NULL, FALSE, CREATE_UNICODE_ENVIRONMENT, NULL, directory, &si, &pi))
         return false;
     AllowSetForegroundWindow(pi.dwProcessId);
     CloseHandle(pi.hThread);
@@ -297,9 +307,13 @@ bool w_os_launch_wide_line(wchar_t *line, bool admin) {
     return true;
 }
 
-bool w_os_launch_line(const char *command, bool admin) {
+bool w_os_launch_wide_line(wchar_t *line, bool admin) {
+    return w_launch_command_line(line, admin, true);
+}
+
+bool w_os_launch_line(const char *command, bool admin, bool allow_shell_targets) {
     wchar_t line[os_path_cap];
-    return w_os_wide(command, line, count_of(line)) && w_os_launch_wide_line(line, admin);
+    return w_os_wide(command, line, count_of(line)) && w_launch_command_line(line, admin, allow_shell_targets);
 }
 
 bool w_os_launch_terminal_at(const char *name, const wchar_t *directory, bool admin) {
@@ -322,7 +336,11 @@ bool w_os_launch_terminal(const char *name, bool admin) {
 
 bool w_os_launch_provider(const char *name, const char *arg, bool admin) {
     wchar_t path[os_path_cap], param[os_path_cap];
-    if (!w_os_provider(name, path, count_of(path)) || !w_os_wide(arg ? arg : "", param, count_of(param)))
+    if (!w_os_provider(name, path, count_of(path))) {
+        return (!arg || !*arg) && w_os_wide(name, path, count_of(path)) &&
+               w_os_shell_execute(path, NULL, NULL, admin);
+    }
+    if (!w_os_wide(arg ? arg : "", param, count_of(param)))
         return false;
     return w_os_run_executable(path, param, NULL, admin);
 }
@@ -498,6 +516,10 @@ bool w_os_shell_hidden(HWND window) {
     return GetPropW(window, visibility_prop) != NULL;
 }
 
+bool w_os_hidden_confirmed(HWND window) {
+    return (uintptr_t)GetPropW(window, visibility_prop) == hidden_confirmed;
+}
+
 ////////////////
 //~ Visibility and appearance
 
@@ -526,7 +548,11 @@ bool w_os_set_visible(HWND w, bool wanted) {
         return false;
     UINT flags = SWP_ASYNCWINDOWPOS | SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE |
                  (wanted ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
-    if (SetWindowPos(w, NULL, 0, 0, 0, 0, flags))
+    // SWP_NOACTIVATE can leave an invisible panel as the foreground window.
+    // Let Windows transfer activation when hiding the current foreground app.
+    HWND foreground = GetForegroundWindow();
+    bool hide_active = !wanted && foreground && (foreground == w || w_os_app_window(foreground) == w);
+    if (hide_active ? ShowWindowAsync(w, SW_HIDE) : SetWindowPos(w, NULL, 0, 0, 0, 0, flags))
         return true;
     if (state)
         SetPropW(w, visibility_prop, (HANDLE)(uintptr_t)state);

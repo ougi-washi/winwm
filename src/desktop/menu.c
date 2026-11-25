@@ -28,8 +28,10 @@ static DWORD WINAPI w_run_line_worker(void *arg) {
     SetLastError(ERROR_SUCCESS);
     bool started = w_os_launch_wide_line(job->line, job->admin);
     DWORD error = ERROR_SUCCESS;
-    if (!started)
-        error = GetLastError() == ERROR_CANCELLED ? ERROR_CANCELLED : ERROR_GEN_FAILURE;
+    if (!started) {
+        error = GetLastError();
+        if (!error) error = ERROR_GEN_FAILURE;
+    }
     PostMessageW(job->owner, msg_run_result, job->request, error);
     free(job);
     return 0;
@@ -66,6 +68,7 @@ static const wchar_t command_glyphs[cmd_count] = {
     [cmd_packages]=0xe896, [cmd_chocolatey]=0xe896, [cmd_google_japanese_input]=0xe896, [cmd_updates]=0xe895, [cmd_windows_update]=0xe895,
     [cmd_reload]=0xe72c, [cmd_provider_refresh]=0xe72c, [cmd_lock]=0xe72e, [cmd_restart]=0xe777,
     [cmd_sleep]=0xe708, [cmd_confirm_sign_out]=0xf3b1, [cmd_power_settings]=0xe7e8, [cmd_quit]=0xe8bb,
+    [cmd_windows_security]=0xea18, [cmd_windows_settings]=0xe713,
 };
 
 static void w_add_row(const wchar_t *label, const char *action, w_window_id target) {
@@ -179,6 +182,9 @@ static const w_menu_item menu_items[] = {
     {palette_tools, "Copy region screenshot", "capture_region"},
     {palette_tools, "Record screen region", "record"},
     {palette_tools, "Pick screen color", "pick_color"},
+    {palette_settings, "Windows Security", "windows_security"},
+    {palette_settings, "Windows Settings", "windows_settings"},
+    {palette_settings, "Control Panel", "program %SystemRoot%\\System32\\control.exe"},
     {palette_settings, "Sound devices", "audio"},
     {palette_settings, "Microphone inputs", "microphone"},
     {palette_settings, "Application volume mixer", "volume_mixer"},
@@ -230,7 +236,8 @@ static const wchar_t *w_menu_keywords(enum command_kind kind) {
     case cmd_packages: return L"winget search install package packages software apps applications";
     case cmd_chocolatey: return L"choco chocolatey search install package packages software apps applications admin";
     case cmd_updates: return L"winget upgrade update packages apps applications";
-    case cmd_windows_update: return L"windows system updates check security";
+    case cmd_windows_update: return L"windows system updates check";
+    case cmd_windows_security: return L"defender antivirus virus threat protection firewall";
     case cmd_project: return L"developer recent project folder terminal editor";
     default: return NULL;
     }

@@ -13,7 +13,7 @@
 //~ Catalog
 
 typedef struct w_catalog_item {
-    wchar_t name[160], target[1024], args[512], directory[512];
+    wchar_t name[MAX_PATH], target[os_path_cap];
     uint32_t packaged;
 } w_catalog_item;
 
@@ -78,6 +78,8 @@ static void w_append(w_catalog_state *c, const w_catalog_item *item, LPCWSTR ico
         if (list) {
             c->images = list;
             row->icon = info.iIcon + 1;
+            if ((flags & SHGFI_DISPLAYNAME) && *info.szDisplayName)
+                wcscpy(row->app.name, info.szDisplayName);
         }
     }
 }
@@ -86,9 +88,7 @@ static int w_compare_apps(const void *a, const void *b) {
     const w_catalog_item *x = &((const w_catalog_row *)a)->app, *y = &((const w_catalog_row *)b)->app;
     int order = _wcsicmp(x->name, y->name);
     if (!order) order = (int)x->packaged - (int)y->packaged;
-    if (!order) order = _wcsicmp(x->target, y->target);
-    if (!order) order = wcscmp(x->args, y->args);
-    return order ? order : _wcsicmp(x->directory, y->directory);
+    return order ? order : _wcsicmp(x->target, y->target);
 }
 
 static void w_sort_apps(w_catalog_state *c) {
@@ -111,8 +111,7 @@ static void w_sort_apps(w_catalog_state *c) {
     c->count = unique;
 }
 
-static bool w_walk(w_catalog_state *c, IShellLinkW *link, IPersistFile *persist, const wchar_t *folder,
-                   int depth) {
+static bool w_walk(w_catalog_state *c, const wchar_t *folder, int depth) {
     if (depth > 32 || c->failed)
         return !c->failed;
     wchar_t pattern[os_path_cap];
@@ -126,35 +125,26 @@ static bool w_walk(w_catalog_state *c, IShellLinkW *link, IPersistFile *persist,
     }
     bool complete = true;
     do {
-        if (f.cFileName[0] == L'.' || f.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)
+        if (!wcscmp(f.cFileName, L".") || !wcscmp(f.cFileName, L".."))
             continue;
         wchar_t path[os_path_cap];
         if (swprintf(path, count_of(path), L"%ls\\%ls", folder, f.cFileName) < 0)
             continue;
         if (f.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
-            if (!w_walk(c, link, persist, path, depth + 1)) complete = false;
+            if (!(f.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) && !w_walk(c, path, depth + 1))
+                complete = false;
             continue;
         }
         wchar_t *ext = wcsrchr(f.cFileName, L'.');
-        if (!ext || _wcsicmp(ext, L".lnk"))
-            continue;
-        if (FAILED(IPersistFile_Load(persist, path, STGM_READ)))
+        if (!ext || (_wcsicmp(ext, L".lnk") && _wcsicmp(ext, L".url")))
             continue;
         w_catalog_item entry = {0};
-        WIN32_FIND_DATAW ignored;
-        if (FAILED(IShellLinkW_GetPath(link, entry.target, count_of(entry.target), &ignored, SLGP_RAWPATH)) ||
-            !*entry.target)
-            continue;
-        const wchar_t *base = wcsrchr(entry.target, L'\\');
-        base = base ? base + 1 : entry.target;
-        const wchar_t *suffix = wcsrchr(base, L'.');
-        if (!suffix || _wcsicmp(suffix, L".exe") || !_wcsicmp(base, L"explorer.exe"))
-            continue;
-        IShellLinkW_GetArguments(link, entry.args, count_of(entry.args));
-        IShellLinkW_GetWorkingDirectory(link, entry.directory, count_of(entry.directory));
+        // Preserve the shortcut itself. Its destination can be a shell item,
+        // a registered document, a packaged app or an executable with arguments.
+        wcscpy(entry.target, path);
         *ext = 0;
-        wcsncpy(entry.name, f.cFileName, count_of(entry.name) - 1);
-        w_append(c, &entry, path, 0);
+        wcscpy(entry.name, f.cFileName);
+        w_append(c, &entry, path, SHGFI_DISPLAYNAME);
     } while (!c->failed && FindNextFileW(listing, &f));
     if (c->failed || GetLastError() != ERROR_NO_MORE_FILES) complete = false;
     FindClose(listing);
@@ -218,8 +208,7 @@ static w_catalog_state *w_read_cache(const wchar_t *path) {
                 w_catalog_item item, *e = &item;
                 valid = fread(e, sizeof(*e), 1, f) == 1 &&
                     e->packaged <= 1 && *e->name && *e->target && wmemchr(e->name, 0, count_of(e->name)) &&
-                    wmemchr(e->target, 0, count_of(e->target)) && wmemchr(e->args, 0, count_of(e->args)) &&
-                    wmemchr(e->directory, 0, count_of(e->directory));
+                    wmemchr(e->target, 0, count_of(e->target));
                 if (valid) w_append(c, e, NULL, 0);
             }
             if (!valid || c->failed) {
@@ -289,25 +278,16 @@ static DWORD WINAPI w_index_worker(void *unused) {
     bool shortcuts_complete = false, packaged_complete = false;
     HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     if (SUCCEEDED(hr)) {
-        IShellLinkW *link = NULL;
-        IPersistFile *persist = NULL;
-        if (SUCCEEDED(CoCreateInstance(&CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, &IID_IShellLinkW,
-                                       (void **)&link)) &&
-            SUCCEEDED(IShellLinkW_QueryInterface(link, &IID_IPersistFile, (void **)&persist))) {
-            const KNOWNFOLDERID *folders[] = {&FOLDERID_Programs, &FOLDERID_CommonPrograms};
-            shortcuts_complete = true;
-            for (size_t i = 0; i < count_of(folders); i++) {
-                PWSTR path = NULL;
-                HRESULT folder = SHGetKnownFolderPath(folders[i], KF_FLAG_DONT_VERIFY, NULL, &path);
-                if (SUCCEEDED(folder)) {
-                    if (!w_walk(c, link, persist, path, 0)) shortcuts_complete = false;
-                    CoTaskMemFree(path);
-                } else shortcuts_complete = false;
-            }
-            IPersistFile_Release(persist);
+        const KNOWNFOLDERID *folders[] = {&FOLDERID_Programs, &FOLDERID_CommonPrograms};
+        shortcuts_complete = true;
+        for (size_t i = 0; i < count_of(folders); i++) {
+            PWSTR path = NULL;
+            HRESULT folder = SHGetKnownFolderPath(folders[i], KF_FLAG_DONT_VERIFY, NULL, &path);
+            if (SUCCEEDED(folder)) {
+                if (!w_walk(c, path, 0)) shortcuts_complete = false;
+                CoTaskMemFree(path);
+            } else shortcuts_complete = false;
         }
-        if (link)
-            IShellLinkW_Release(link);
         packaged_complete = w_packaged_items(c);
         CoUninitialize();
     }
@@ -349,7 +329,7 @@ int w_catalog_count(const w_catalog_state *c) {
 uint64_t w_catalog_identity(const w_catalog_state *c, int i) {
     const w_catalog_item *app = &c->rows[i].app;
     uint64_t hash = UINT64_C(14695981039346656037) ^ app->packaged;
-    const wchar_t *fields[] = {app->name, app->target, app->args, app->directory};
+    const wchar_t *fields[] = {app->name, app->target};
     for (size_t j = 0; j < count_of(fields); ++j) {
         const wchar_t *p = fields[j];
         do {
@@ -366,7 +346,7 @@ HANDLE w_catalog_images(const w_catalog_state *c) {
 void w_catalog_label(const w_catalog_state *c, int i, wchar_t *out, int cap, int *icon) {
     const w_catalog_row *r = &c->rows[i];
     *icon = r->icon;
-    if (!r->variant) swprintf(out, cap, L"%ls", r->app.name);
+    if (!r->variant) lstrcpynW(out, r->app.name, cap);
     else {
         const wchar_t *file = wcsrchr(r->app.target, L'\\');
         swprintf(out, cap, L"%.150ls  ·  %.80ls (%d)", r->app.name, file ? file+1 : r->app.target, r->variant);
@@ -409,24 +389,8 @@ static DWORD WINAPI w_launch_entry(void *ptr) {
             CoUninitialize();
         }
     } else {
-        char name[4096];
-        wchar_t resolved[os_path_cap], line[os_path_cap + 520];
-        if (w_os_utf8(e->target, name, sizeof(name)) && w_os_provider(name, resolved, count_of(resolved))) {
-            if (job->admin) {
-                launched = w_os_run_as_admin(resolved, *e->args ? e->args : NULL, *e->directory ? e->directory : NULL);
-                if (!launched) error = GetLastError();
-            } else if (swprintf(line, count_of(line), L"\"%ls\" %ls", resolved, e->args) > 0) {
-                STARTUPINFOW si = {.cb = sizeof(si)};
-                PROCESS_INFORMATION pi = {0};
-                if (CreateProcessW(resolved, line, NULL, NULL, FALSE, 0, NULL,
-                                   *e->directory ? e->directory : NULL, &si, &pi)) {
-                    AllowSetForegroundWindow(pi.dwProcessId);
-                    launched = true;
-                    CloseHandle(pi.hProcess);
-                    CloseHandle(pi.hThread);
-                }
-            }
-        }
+        launched = w_os_shell_execute(e->target, NULL, NULL, job->admin);
+        if (!launched) error = GetLastError();
     }
     if (!launched && error != ERROR_CANCELLED) PostMessageW(target_window, ready_message, job->admin ? 2 : 1, 0);
     free(job);

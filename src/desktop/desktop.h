@@ -40,6 +40,7 @@ enum float_update { float_move = 1, float_size = 2 };
 typedef struct w_window_state {
     HWND hwnd;
     DWORD pid;
+    ULONGLONG workspace_hide_tick;
     int displaced_from;
     w_rect issued, issued_native, rejected_bounds, float_before_request, drag_start;
     w_rect saved_float_work;
@@ -50,7 +51,7 @@ typedef struct w_window_state {
     unsigned floating_update;
     bool float_request_sent;
     enum { move_idle, move_dragging, move_released } native_move;
-    bool has_issued, restoring, wants_visible, decorated, active, custom_border;
+    bool has_issued, restoring, wants_visible, externally_shown, decorated, active, custom_border;
     BYTE alpha, corner;
     struct {
         ULONGLONG start;
@@ -101,7 +102,7 @@ extern w_desktop_state desk;
 
 void w_desktop_schedule(void);
 void w_desktop_scan(bool focus_new);
-void w_desktop_event(HWND hwnd, DWORD event);
+void w_desktop_event(HWND hwnd, DWORD event, DWORD event_tick);
 void w_desktop_outputs(void);
 int w_desktop_output_for_bounds(int current, w_rect r);
 void w_desktop_select(int slot);

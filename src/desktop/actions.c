@@ -4,12 +4,11 @@
 #include <stdlib.h>
 #include <wchar.h>
 #include <shlobj.h>
-#include <shellapi.h>
 
 ////////////////
 //~ Actions
 
-enum launch_kind { launch_executable, launch_terminal, launch_command, launch_task_manager, launch_panel, launch_place, launch_window_capture, launch_windows_update };
+enum launch_kind { launch_executable, launch_terminal, launch_command, launch_task_manager, launch_panel, launch_place, launch_window_capture };
 typedef struct w_launch_job {
     char exe[1024], arg[4096];
     enum launch_kind kind;
@@ -48,14 +47,6 @@ static DWORD WINAPI w_launch_thread(void *ptr) {
     bool launched;
     SetLastError(ERROR_SUCCESS);
     switch (j->kind) {
-    case launch_windows_update: {
-        HRESULT apartment = CoInitializeEx(NULL,COINIT_APARTMENTTHREADED|COINIT_DISABLE_OLE1DDE);
-        SHELLEXECUTEINFOW info = {.cbSize=sizeof(info), .fMask=SEE_MASK_NOASYNC|SEE_MASK_FLAG_NO_UI,
-                                  .lpVerb=L"open", .lpFile=L"ms-settings:windowsupdate", .nShow=SW_SHOWNORMAL};
-        launched = ShellExecuteExW(&info) != FALSE;
-        if (SUCCEEDED(apartment)) CoUninitialize();
-        break;
-    }
     case launch_place:
         launched = w_open_place(j->exe, j->arg, j->admin);
         break;
@@ -67,7 +58,7 @@ static DWORD WINAPI w_launch_thread(void *ptr) {
             break;
         }
         if (j->admin) {
-            launched = w_os_run_as_admin(self, mode, NULL);
+            launched = w_os_shell_execute(self, mode, NULL, true);
             break;
         }
         HANDLE child = w_os_launch_positioned(self, mode, j->origin);
@@ -84,7 +75,7 @@ static DWORD WINAPI w_launch_thread(void *ptr) {
         break;
     }
     case launch_command:
-        launched = w_os_launch_line(j->exe, j->admin);
+        launched = w_os_launch_line(j->exe, j->admin, true);
         break;
     case launch_terminal:
         launched = w_os_launch_terminal(j->exe, j->admin);
@@ -103,7 +94,7 @@ static DWORD WINAPI w_launch_thread(void *ptr) {
         if (why) {
             if (j->kind == launch_window_capture)
                 w_str_copy(why,512,launched ? "Window capture copied to clipboard." : "Could not capture the selected window.");
-            else snprintf(why, 512, "Could not start %.380s. Check its configured executable path.", j->exe);
+            else snprintf(why, 512, "Could not open %.380s.", j->exe);
             if (!PostMessageW(desk.root, msg_status, 0, (LPARAM)why))
                 free(why);
         }
@@ -143,7 +134,7 @@ bool w_desktop_capture_window(HWND target, DWORD pid) {
 static DWORD WINAPI w_start_configured_programs(void *ptr) {
     w_startup_entry *entries = ptr;
     for (int i = 0; entries[i].command_line[0]; i++) {
-        if (w_os_launch_line(entries[i].command_line, false))
+        if (w_os_launch_line(entries[i].command_line, false, false))
             continue;
         char *message = malloc(512);
         if (message) {
@@ -507,7 +498,13 @@ bool w_desktop_run_on(const w_command *c, int output, bool admin) {
         ok = LockWorkStation() != 0;
         break;
     case cmd_windows_update:
-        ok = w_queue_launch("Windows Update",NULL,launch_windows_update,NULL,false);
+        ok = w_queue_launch("ms-settings:windowsupdate", NULL, launch_command, NULL, false);
+        break;
+    case cmd_windows_security:
+        ok = w_queue_launch("windowsdefender:", NULL, launch_command, NULL, false);
+        break;
+    case cmd_windows_settings:
+        ok = w_queue_launch("ms-settings:", NULL, launch_command, NULL, false);
         break;
     case cmd_confirm_sign_out:
         if (MessageBoxW(NULL, L"Sign out and close your applications?", L"Sign out",

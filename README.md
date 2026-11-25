@@ -17,6 +17,7 @@ Tiling window manager for Windows x64. Runs alongside Explorer.
 - Hover to focus and center the pointer. Desktop gaps clear focus.
 - Configurable borders, animations, keybindings, and toolbar.
 - Win+D Menu for apps, commands, WinGet installs and updates, and elevated Chocolatey installs.
+- Menu → Settings opens Windows Security, Windows Settings, and Control Panel. `> ms-settings:display` opens Display. Win+I stays blocked while winwm runs.
 - Ctrl+Enter in Menu runs the selected app, tool, or command as administrator.
 - Win+Shift+Q closes the active panel or app.
 - Audio, network, displays, power, languages, keyboards, and IMEs.

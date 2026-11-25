@@ -84,7 +84,7 @@ if ($Action -eq 'Stage') {
         $fb=(Get-Item -LiteralPath $FileBrowser).FullName
         $tm=(Get-Item -LiteralPath $TaskManager).FullName
         foreach ($provider in $fb,$tm) {
-            if ([IO.Path]::GetExtension($provider) -ine '.exe' -or [IO.Path]::GetFileName($provider) -ieq 'explorer.exe') {
+            if ([IO.Path]::GetExtension($provider) -ine '.exe') {
                 throw "Invalid provider: $provider"
             }
         }

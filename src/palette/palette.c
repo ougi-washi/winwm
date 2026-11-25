@@ -318,7 +318,7 @@ static void w_filter(void) {
         while (*line == L' ' || *line == L'\t') ++line;
         if (length >= (int)count_of(input_text) || wcslen(line) > palette_command_limit)
             message = L"The command exceeds the Windows command-line limit.";
-        else if (!*line) message = L"Enter an executable and its arguments";
+        else if (!*line) message = L"Enter a command, file, or Windows settings URI";
         else {
             command_line = line;
             swprintf(command_label,count_of(command_label),L"Run   %.235ls%ls",line,wcslen(line)>235 ? L"…" : L"");
@@ -548,8 +548,11 @@ void w_palette_line_result(UINT request, DWORD error) {
     if (!w_palette_shown()) return;
     if (!error) w_dismiss(false);
     else {
-        launch_status = error == ERROR_CANCELLED ? L"Administrator launch canceled." :
-                                                   L"Could not start the command. Check the executable or path.";
+        static wchar_t message[256];
+        DWORD length = FormatMessageW(FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+                                      NULL, error, 0, message, count_of(message), NULL);
+        while (length && iswspace(message[length-1])) message[--length] = 0;
+        launch_status = length ? message : L"Windows could not open this command or location.";
         w_navigation_hint();
         SetFocus(edit);
     }

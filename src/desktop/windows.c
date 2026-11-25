@@ -412,7 +412,10 @@ void w_desktop_scan(bool focus_new) {
     w_desktop_schedule();
 }
 
-void w_desktop_event(HWND w, DWORD event) {
+static void w_follow_native_activation(HWND foreground, HWND owner, bool activated);
+
+void w_desktop_event(HWND w, DWORD event, DWORD event_tick) {
+    HWND event_window = w;
     int i = w_desktop_find(w);
     if (event == EVENT_OBJECT_DESTROY || !IsWindow(w)) {
         if (i >= 0)
@@ -450,8 +453,13 @@ void w_desktop_event(HWND w, DWORD event) {
         state->has_issued = false;
         w_desktop_schedule();
     }
-    if (event == EVENT_SYSTEM_FOREGROUND)
+    if (event == EVENT_SYSTEM_FOREGROUND) {
+        ULONGLONG now = GetTickCount64();
+        DWORD event_age = (DWORD)now - event_tick;
+        if (GetForegroundWindow() == event_window && event_age <= now - state->workspace_hide_tick)
+            w_follow_native_activation(event_window, w, true);
         w_desktop_focus_observe(w);
+    }
     if (event == EVENT_SYSTEM_MOVESIZESTART) {
         state->motion.start = 0;
         state->displaced_from = 0;
@@ -544,16 +552,47 @@ static BOOL CALLBACK w_sync_owned(HWND w, LPARAM unused) {
     if (owner == w || !GetPropW(owner, L"winwm.managed"))
         return TRUE;
     int i = w_desktop_find(owner);
-    if (i >= 0)
-        w_os_set_visible(w, desk.windows[i].wants_visible && IsWindowVisible(owner));
+    if (i >= 0) {
+        w_window_state *state = &desk.windows[i];
+        if (!state->wants_visible && w_os_hidden_confirmed(owner) && IsWindowVisible(w) &&
+            (!w_os_shell_hidden(w) || w_os_hidden_confirmed(w)))
+            state->externally_shown = true;
+        w_os_set_visible(w, state->wants_visible && IsWindowVisible(owner));
+    }
     return TRUE;
+}
+
+static void w_follow_native_activation(HWND foreground, HWND owner, bool activated) {
+    int slot = w_desktop_find(owner);
+    if (slot < 0 || desk.windows[slot].wants_visible || IsIconic(owner) || w_os_cloaked(foreground) ||
+        (foreground != owner && w_os_cloaked(owner)))
+        return;
+    bool hidden = w_os_hidden_confirmed(owner);
+    if (!(activated && (hidden || desk.windows[slot].externally_shown)) &&
+        !(hidden && IsWindowVisible(foreground)))
+        return;
+    // A single-instance app can reopen its existing window on another workspace.
+    // The show and foreground notifications can arrive in either order, even
+    // after we have hidden a window that initially reopened in the background.
+    // Windows Security can take foreground without showing its hidden HWND.
+    w_observe_visibility(slot);
+    w_model_window *w = &desk.model.windows[slot];
+    w_desktop_focus_cancel();
+    desk.model.output = w->output;
+    w_model_workspace(&desk.model, w->workspace);
+    if (w->scratch)
+        w->scratch_visible = true;
+    w_model_focus(&desk.model, slot);
 }
 
 void w_desktop_apply(void) {
     static int previous_workspace[output_limit];
+    static HWND previous_foreground;
     bool visibility_changed = false;
     HWND foreground = GetForegroundWindow();
     HWND active = w_os_app_window(foreground);
+    w_follow_native_activation(foreground, active, foreground != previous_foreground);
+    previous_foreground = foreground;
     for (int o = 0; o < output_limit; o++)
         if (desk.outputs[o].live) {
             w_output_state *output = &desk.outputs[o];
@@ -600,7 +639,13 @@ void w_desktop_apply(void) {
                 if (visible && desk.model.spaces[o][ws].layout == layout_tabs && !w->floating && i != tab)
                     visible = false;
                 bool entering = !s->wants_visible;
+                if (s->wants_visible && !visible)
+                    s->workspace_hide_tick = GetTickCount64();
                 s->wants_visible = visible;
+                if (visible)
+                    s->externally_shown = false;
+                else if (w_os_hidden_confirmed(hwnd) && IsWindowVisible(hwnd))
+                    s->externally_shown = true;
                 if (w->minimized || w->withdrawn || w->cloaked) {
                     w_effects_hide(i);
                     s->has_issued = false;
