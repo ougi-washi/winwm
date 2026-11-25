@@ -1,7 +1,12 @@
 #include "theme/theme.h"
 #include "desktop/entry.h"
+#include "native_notifications/publish.h"
+#include "native_notifications/listener.h"
 #include "shell_host/entry.h"
+#include "os_win32/environment.h"
 #include "desktop/desktop.h"
+#include "desktop/tray.h"
+#include "tray/host.h"
 #include "providers/audio.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -12,6 +17,7 @@
 
 w_desktop_state desk;
 static bool event_overflow, logging_off, loaded_programs;
+static bool shell_ready, config_ready, startup_config_loaded;
 static int pending_events;
 static UINT shell_notification, taskbar_created;
 enum { discovery_timer = 29 };
@@ -23,6 +29,14 @@ static void w_invalidate_language(void) {
     for (int i = 0; i < output_limit; ++i)
         if (desk.outputs[i].live && !desk.outputs[i].bar_hidden)
             w_bar_invalidate(&desk.outputs[i].bar, "keyboard");
+}
+
+static void w_repaint_bars(void) {
+    for (int i = 0; i < output_limit; ++i) {
+        w_output_state *output = &desk.outputs[i];
+        if (output->live && !output->bar_hidden && output->bar.hwnd)
+            InvalidateRect(output->bar.hwnd, NULL, FALSE);
+    }
 }
 
 typedef struct w_config_result {
@@ -74,7 +88,9 @@ void w_desktop_schedule(void) {
 
 void w_desktop_bind(void) {
     w_effects_preferences();
-    w_theme_colors(desk.config.background, desk.config.foreground, desk.config.accent);
+    w_theme_configure(&desk.config);
+    w_theme_publish(desk.root);
+    w_desktop_notifications_configure();
     w_input_bind(desk.root, msg_command, msg_hover, desk.preview ? 0 : msg_desktop_menu, msg_pointer_down,
                &desk.config, desk.registered, w_desktop_drag);
 }
@@ -149,6 +165,20 @@ static void w_discover_initial(void) {
     command_count = 0;
 }
 
+static void w_finish_startup(void) {
+    if (desk.ready || !shell_ready || !config_ready) return;
+    // Recovery must own shell restoration before we manage windows or launch
+    // any commands from the user's config. Input and config I/O can overlap it.
+    w_desktop_status_configure();
+    if (!desk.hide_bars) w_providers_configure(desk.root, msg_devices, &desk.config);
+    if (startup_config_loaded) {
+        w_desktop_start_programs(true);
+        loaded_programs = true;
+    }
+    w_discover_initial();
+    w_catalog_begin(desk.root,msg_catalog);
+}
+
 static void w_position_desktop(void) {
     if (desk.preview)
         ShowWindow(desk.root, SW_HIDE);
@@ -159,6 +189,8 @@ static void w_position_desktop(void) {
 }
 
 static void w_initialize(void) {
+    if (!startup_config_loaded)
+        w_desktop_load();
     w_position_desktop();
     shell_notification = RegisterWindowMessageW(L"SHELLHOOK");
     if (shell_notification)
@@ -168,10 +200,19 @@ static void w_initialize(void) {
     desk.ipc_live = w_ipc_name(pipe_name, count_of(pipe_name)) && w_ipc_start(desk.channels, pipe_name);
     if (!desk.ipc_live)
         w_desktop_notice("Control pipe unavailable");
-    w_desktop_load();
-    if (!desk.loading)
-        w_discover_initial();
+    if (!desk.loading) {
+        config_ready = true;
+        w_finish_startup();
+    }
     w_desktop_timer();
+}
+
+static bool w_startup_ui_ready(void) {
+    for (int i = 0; i < desk.config.binding_count; i++)
+        if (!desk.registered[i]) return false;
+    for (int i = 0; i < output_limit; i++)
+        if (desk.outputs[i].live && !desk.outputs[i].bar.hwnd) return false;
+    return desk.outputs[desk.model.output].live;
 }
 
 void w_desktop_timer(void) {
@@ -207,16 +248,12 @@ void w_desktop_request(const char *s, char *reply, size_t cap) {
         int n = snprintf(
             reply, cap,
             "desktop protocol 1\nwindow events: %s\nfile browser: %s\ntask manager: %s\nlast message: %s\n"
-            "animations: %s (%s)\nborder width: %d DIP\n",
+            "animations: %s (%s)\nborder width: %d DIP\nnotification capture: %s\nnotification history: %d\n",
             desk.ready ? "initialized" : "starting", desk.config.file_browser, desk.config.task_manager,
             desk.status, desk.motion_allowed ? "on" : "off",
             desk.config.animations == motion_system ? "follow Windows" : "winwm preference",
-            desk.borders_hidden ? 0 : desk.config.border_size);
-        wchar_t policy[os_path_cap];
-        DWORD bytes = sizeof(policy);
-        LSTATUS policy_status =
-            RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System",
-                         L"Shell", RRF_RT_REG_SZ, NULL, policy, &bytes);
+            desk.borders_hidden ? 0 : desk.config.border_size, w_desktop_notification_status(), w_notice_count());
+        DWORD shell_status = w_os_startup_shell();
         HWND host = FindWindowW(L"WinwmHost", NULL);
         HANDLE exit_code = GetPropW(host, L"winwm.child_exit");
         HANDLE key_error = GetPropW(host, L"winwm.recovery_hotkey_error");
@@ -224,10 +261,14 @@ void w_desktop_request(const char *s, char *reply, size_t cap) {
             n += snprintf(reply + n, cap - n, "Ctrl+Alt+F12 unavailable (Win32 %lu). Use ctl run rescue.\n",
                           (DWORD)(uintptr_t)key_error);
         if (n >= 0 && (size_t)n + 200 < cap)
-            n += snprintf(reply + n, cap - n, "user shell policy: %s\n",
-                          policy_status == ERROR_SUCCESS ? "configured" : "absent or managed elsewhere");
+            n += snprintf(reply + n, cap - n, "sign-in shell: %s\n",
+                          !shell_status ? "Explorer" : shell_status == ERROR_ALREADY_ASSIGNED ? "custom" : "unknown");
         if (n >= 0 && (size_t)n + 100 < cap)
             n += snprintf(reply + n, cap - n, "Windows shell desktop: %s\n",GetShellWindow() ? "present" : "absent");
+        if (n >= 0 && (size_t)n + 100 < cap)
+            n += snprintf(reply + n, cap - n, "application tray: %s\nregistered tray icons: %zu\n",
+                          w_tray_is_active() ? "winwm" : desk.preview ? "Explorer preview" : "external or unavailable",
+                          w_tray_count());
         if (exit_code && n >= 0 && (size_t)n + 120 < cap)
             n += snprintf(reply + n, cap - n, "previous desktop exit: %lu\n",
                           (DWORD)((uintptr_t)exit_code - 1));
@@ -251,9 +292,11 @@ void w_desktop_request(const char *s, char *reply, size_t cap) {
 
 static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (taskbar_created && msg == taskbar_created) {
+        // A replacement tray also broadcasts TaskbarCreated so apps republish their icons.
+        if (!desk.preview && !w_os_explorer_tray_present()) return 0;
         PostMessageW(hwnd, msg_shell_started, 0, 0);
         w_position_desktop();
-        if (desk.ready) w_desktop_outputs();
+        if (desk.root) w_desktop_outputs();
         return 0;
     }
     if (shell_notification && msg == shell_notification) {
@@ -310,6 +353,7 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     }
     case msg_pointer_down: {
         HWND hit = WindowFromPoint((POINT){(LONG)(LONG_PTR)wp, (LONG)lp});
+        w_notice_outside(hit);
         w_bar_menu_outside(hit);
         w_palette_outside(hit);
         w_desktop_popup_outside(hit);
@@ -344,6 +388,14 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     case msg_init:
         w_initialize();
         return 0;
+    case msg_tray_changed:
+        w_tray_ack();
+        w_desktop_tray_balloons();
+        w_desktop_tray_update();
+        return 0;
+    case msg_tray_refresh:
+        w_desktop_tray_update();
+        return 0;
     case msg_load: {
         w_config_result *r = (w_config_result *)lp;
         desk.loading = false;
@@ -372,25 +424,26 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                         desk.model.spaces[o][j].layout = r->cfg.master_default ? layout_master : layout_tree;
             }
             desk.config = r->cfg;
-            if (!layout_only) {
+            if (!layout_only && (desk.ready || changed || !w_startup_ui_ready())) {
                 w_desktop_bind();
                 w_desktop_outputs();
             }
             w_desktop_timer();
-            w_desktop_status_configure();
-            if (!desk.hide_bars) w_providers_configure(desk.root, msg_devices, &desk.config);
-            w_desktop_notice("Configuration loaded");
-            if (!layout_only) {
-                w_desktop_start_programs(!loaded_programs);
-                loaded_programs = true;
-            }
-            for (int i = 0; i < output_limit; i++)
-                if (desk.outputs[i].live)
-                    InvalidateRect(desk.outputs[i].bar.hwnd, NULL, FALSE);
+            if (desk.ready) w_desktop_notice("Configuration loaded");
+            else w_str_copy(desk.status,sizeof(desk.status),"Configuration loaded");
+            if (desk.ready) {
+                w_desktop_status_configure();
+                if (!desk.hide_bars) w_providers_configure(desk.root, msg_devices, &desk.config);
+                if (!layout_only) {
+                    w_desktop_start_programs(!loaded_programs);
+                    loaded_programs = true;
+                }
+            } else startup_config_loaded = true;
+            w_repaint_bars();
         } else
-            w_desktop_notice(r ? r->error : "Configuration allocation failed");
-        if (!desk.ready)
-            w_discover_initial();
+            w_desktop_notify(L"Configuration error", r ? r->error : "Configuration allocation failed");
+        config_ready = true;
+        w_finish_startup();
         if (changed || (layout_only && r && r->ok)) {
             r->revision = InterlockedIncrement(&config_revision);
             if (QueueUserWorkItem(w_save_config, r, WT_EXECUTEDEFAULT))
@@ -399,6 +452,18 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         free(r);
         return 0;
     }
+    case msg_notifications:
+        w_desktop_notifications_receive(lp);
+        return 0;
+    case msg_notification_published:
+        w_desktop_notification_published(lp);
+        return 0;
+    case msg_notification_banner:
+        w_desktop_banner_receive(wp,lp);
+        return 0;
+    case msg_notification_open:
+        w_desktop_run(&(w_command){.kind=cmd_notifications});
+        return 0;
     case msg_audio: {
         if (wp) {
             w_bar_menu_audio_error();
@@ -418,6 +483,10 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         w_desktop_status_done((void *)lp);
         return 0;
     case msg_catalog:
+        if (lp) {
+            w_catalog_shell_event(wp,lp);
+            return 0;
+        }
         if (wp) w_desktop_notice(wp == 2 ? "This application could not start as administrator." :
                                            "The selected application could not start.");
         else w_desktop_catalog_update();
@@ -426,10 +495,7 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         w_palette_line_result((UINT)wp, (DWORD)lp);
         return 0;
     case msg_devices:
-        w_providers_tick();
-        for (int i = 0; i < output_limit; i++)
-            if (desk.outputs[i].live)
-                InvalidateRect(desk.outputs[i].bar.hwnd, NULL, FALSE);
+        if (w_providers_tick()) w_repaint_bars();
         return 0;
     case msg_status:
         w_desktop_notice((char *)lp);
@@ -449,6 +515,9 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             w_desktop_scan(true);
         }
         return 0;
+    case msg_titles:
+        w_desktop_titles();
+        return 0;
     case msg_refresh:
         desk.refresh_pending = false;
         w_desktop_apply();
@@ -456,21 +525,34 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     case WM_DISPLAYCHANGE:
         w_desktop_popup_cancel();
         w_position_desktop();
-        if (desk.ready)
+        if (desk.root)
             w_desktop_outputs();
         return 0;
     case WM_SETTINGCHANGE:
-        if (desk.ready && wp == SPI_SETWORKAREA)
+        if (lp && !_wcsicmp((const wchar_t *)lp,L"Environment")) {
+            w_environment_refresh();
+            return 0;
+        }
+        if (desk.root && wp == SPI_SETWORKAREA)
             w_desktop_outputs();
+        w_notification_refresh();
         InvalidateRect(hwnd, NULL, FALSE);
         w_effects_preferences();
-        w_theme_colors(desk.config.background, desk.config.foreground, desk.config.accent);
+        w_theme_configure(&desk.config);
+        w_desktop_notifications_configure();
         w_desktop_schedule();
         return 0;
     case WM_SYSCOLORCHANGE:
     case WM_THEMECHANGED:
         InvalidateRect(hwnd, NULL, FALSE);
         return DefWindowProcW(hwnd, msg, wp, lp);
+    case winwm_packages_changed:
+        w_environment_refresh();
+        w_catalog_invalidate();
+        return 0;
+    case msg_environment:
+        if (wp) w_catalog_invalidate();
+        return 0;
     case WM_TIMER:
         if (wp == animation_timer) {
             w_effects_tick();
@@ -498,12 +580,12 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         return 0;
     case WM_TIMECHANGE:
     case WM_POWERBROADCAST:
+        if (msg == WM_POWERBROADCAST && (wp == PBT_APMRESUMEAUTOMATIC || wp == PBT_APMRESUMESUSPEND))
+            w_notification_refresh();
         if (desk.ready) {
             w_desktop_timer();
             w_desktop_schedule();
-            for (int i = 0; i < output_limit; i++)
-                if (desk.outputs[i].live)
-                    InvalidateRect(desk.outputs[i].bar.hwnd, NULL, FALSE);
+            w_repaint_bars();
         }
         return msg == WM_POWERBROADCAST ? TRUE : 0;
     case WM_CLIPBOARDUPDATE:
@@ -525,6 +607,16 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     }
 }
 
+typedef struct w_shell_handoff {
+    HANDLE recovery;
+    HWND host;
+} w_shell_handoff;
+
+static DWORD WINAPI w_take_shell(void *arg) {
+    const w_shell_handoff *handoff = arg;
+    return w_recovery_take_desktop(handoff->recovery, handoff->host);
+}
+
 int w_session_run(HINSTANCE instance, bool preview) {
     desk.preview = preview;
     DWORD host = w_os_instance_status(os_host_instance);
@@ -535,6 +627,20 @@ int w_session_run(HINSTANCE instance, bool preview) {
     if (error)
         return (int)error;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    w_config_defaults(&desk.config);
+    if (!w_os_cache_read(&desk.config)) {
+        char detail[256] = {0};
+        if (!w_os_config_load(&desk.config, detail, sizeof(detail))) {
+            wchar_t message[256] = L"Could not read winwm.lua.";
+            w_os_wide(detail, message, count_of(message));
+            w_os_instance_release(&lock);
+            if (!preview && !GetShellWindow()) w_os_ensure_shell();
+            if (!w_notification_publish(L"Configuration error", message))
+                MessageBoxW(NULL, message, L"winwm configuration error", MB_OK | MB_ICONERROR);
+            return ERROR_INVALID_DATA;
+        }
+        startup_config_loaded = true;
+    }
     HWND host_window = NULL;
     HANDLE recovery = w_recovery_attach(preview, &host_window);
     if (!recovery) {
@@ -547,8 +653,18 @@ int w_session_run(HINSTANCE instance, bool preview) {
     }
     w_os_mark(L"desktop_entry");
     w_model_init(&desk.model);
-    w_config_defaults(&desk.config);
-    w_os_cache_read(&desk.config);
+    for (int o = 0; o < output_limit; ++o)
+        for (int j = 0; j < workspace_limit; ++j)
+            desk.model.spaces[o][j].layout = desk.config.master_default ? layout_master : layout_tree;
+    if (startup_config_loaded) {
+        w_config_result *initial = malloc(sizeof(*initial));
+        if (initial) {
+            initial->cfg = desk.config;
+            initial->revision = InterlockedIncrement(&config_revision);
+            if (!QueueUserWorkItem(w_save_config, initial, WT_EXECUTEDEFAULT))
+                free(initial);
+        }
+    }
     WNDCLASSW wc = {
         .hInstance = instance, .lpszClassName = L"WinwmEvents", .lpfnWndProc = w_desktop_proc,
         .hCursor = LoadCursorW(NULL, IDC_ARROW)};
@@ -561,34 +677,62 @@ int w_session_run(HINSTANCE instance, bool preview) {
         w_os_instance_release(&lock);
         return 3;
     }
-    bool waiting_for_shell = false;
+    w_shell_handoff handoff = {recovery,host_window};
+    HANDLE shell_thread = NULL;
+    bool waiting_for_shell = false, tray_seen = false;
+    shell_ready = preview;
     if (!preview) {
-        error = w_recovery_take_desktop(recovery, host_window);
-        waiting_for_shell = error == ERROR_NOT_FOUND;
-        if (error && !waiting_for_shell) {
+        shell_thread = CreateThread(NULL,0,w_take_shell,&handoff,0,NULL);
+        if (!shell_thread) {
+            error = GetLastError();
             DestroyWindow(desk.root);
             CloseHandle(recovery);
             w_os_instance_release(&lock);
             return (int)error;
         }
     }
+    w_environment_start(desk.root,msg_environment);
     w_desktop_bind();
     w_os_mark(L"bindings_registered");
     PostMessageW(desk.root, msg_init, 0, 0);
     int result = 0;
     for (;;) {
-        HANDLE handles[2*ipc_slots+2];
+        HANDLE handles[2*ipc_slots+4];
         DWORD count = desk.ipc_live ? 2*ipc_slots : 0;
         for (DWORD i = 0; i < count / 2; i++) {
             handles[2*i] = desk.channels[i].peer_event;
             handles[2*i+1] = desk.channels[i].event;
         }
-        handles[count] = recovery;
+        DWORD total = count;
+        handles[total++] = recovery;
         HANDLE popup = w_desktop_popup_process();
-        if (popup) handles[count+1] = popup;
-        DWORD wait = MsgWaitForMultipleObjectsEx(count+1+(popup != NULL), handles, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-        if (wait == WAIT_OBJECT_0+count) break;
+        if (popup) handles[total++] = popup;
+        DWORD clipboard_index = total;
+        if (desk.clipboard_reader) handles[total++] = desk.clipboard_reader;
+        if (shell_thread) handles[total++] = shell_thread;
+        DWORD wait = MsgWaitForMultipleObjectsEx(total, handles, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        if (wait == WAIT_OBJECT_0+count) {
+            if (shell_thread) result = ERROR_PROCESS_ABORTED;
+            break;
+        }
         if (popup && wait == WAIT_OBJECT_0+count+1) w_desktop_popup_finished();
+        if (desk.clipboard_reader && wait == WAIT_OBJECT_0+clipboard_index)
+            w_desktop_clipboard_done();
+        if (shell_thread && wait == WAIT_OBJECT_0+total-1) {
+            if (!GetExitCodeThread(shell_thread,&error)) error = GetLastError();
+            CloseHandle(shell_thread);
+            shell_thread = NULL;
+            waiting_for_shell = error == ERROR_NOT_FOUND;
+            if (error && !waiting_for_shell) {
+                result = (int)error;
+                break;
+            }
+            shell_ready = true;
+            w_tray_start(desk.root,msg_tray_changed,w_desktop_tray_locate);
+            w_finish_startup();
+            if (waiting_for_shell && tray_seen) PostMessageW(desk.root,msg_shell_started,0,0);
+            tray_seen = false;
+        }
         if (wait == WAIT_FAILED) {
             result = 4;
             break;
@@ -603,13 +747,20 @@ int w_session_run(HINSTANCE instance, bool preview) {
         for (int i = 0; i < 64 && PeekMessageW(&message, NULL, 0, 0, PM_REMOVE); i++) {
             if (message.hwnd == desk.root && message.message == msg_shell_started) {
                 // At sign-in Explorer may create its first taskbar after winwm starts.
-                if (waiting_for_shell && !logging_off) {
-                    error = w_recovery_take_desktop(recovery, host_window);
-                    waiting_for_shell = error == ERROR_NOT_FOUND;
-                    if (error && !waiting_for_shell) {
-                        result = (int)error;
+                if (shell_thread) tray_seen = true;
+                else if (waiting_for_shell && !logging_off) {
+                    w_tray_stop();
+                    w_desktop_tray_update();
+                    shell_thread = CreateThread(NULL,0,w_take_shell,&handoff,0,NULL);
+                    if (!shell_thread) {
+                        result = (int)GetLastError();
                         goto done;
                     }
+                } else if (!preview && !logging_off && w_tray_is_active() && w_os_explorer_tray_present()) {
+                    // Explorer was explicitly restored after startup. Give its tray the registrations.
+                    w_tray_stop();
+                    w_desktop_tray_update();
+                    SendNotifyMessageW(HWND_BROADCAST,taskbar_created,0,0);
                 }
                 continue;
             }
@@ -617,13 +768,22 @@ int w_session_run(HINSTANCE instance, bool preview) {
                 result = (int)message.wParam;
                 goto done;
             }
-            if (!w_palette_message(&message)) {
+            if (!w_notice_message(&message) && !w_palette_message(&message)) {
                 TranslateMessage(&message);
                 DispatchMessageW(&message);
             }
         }
     }
 done:
+    w_desktop_notifications_stop();
+    w_tray_stop();
+    w_catalog_end();
+    if (desk.clipboard_enabled) RemoveClipboardFormatListener(desk.root);
+    if (desk.clipboard_reader) CloseHandle(desk.clipboard_reader);
+    if (shell_thread) {
+        WaitForSingleObject(shell_thread,INFINITE);
+        CloseHandle(shell_thread);
+    }
     w_desktop_popup_cancel();
     if (w_desktop_popup_process()) w_desktop_popup_finished();
     if ((DWORD)(uintptr_t)GetPropW(host_window,L"winwm.session_pid") == GetCurrentProcessId())
@@ -637,6 +797,7 @@ done:
     for (size_t i = 0; i < count_of(desk.hooks); i++)
         if (desk.hooks[i])
             UnhookWinEvent(desk.hooks[i]);
+    w_desktop_tray_stop();
     w_input_stop();
     DeregisterShellHookWindow(desk.root);
     w_desktop_status_stop();
@@ -649,5 +810,6 @@ done:
         w_os_ensure_shell();
     CloseHandle(recovery);
     w_os_instance_release(&lock);
+    w_environment_stop();
     return result;
 }

@@ -7,7 +7,10 @@
 
 typedef struct w_display {
     wchar_t device[CCHDEVICENAME];
+    wchar_t label[220];
     HANDLE physical;
+    bool write_pending;
+    DWORD requested;
 } w_display;
 
 static HWND panel, modes_list, message_line, preview_button, selector, slider, level;
@@ -19,6 +22,31 @@ static wchar_t preview_device[CCHDEVICENAME];
 static ULONGLONG deadline;
 static DWORD minimum, maximum, brightness;
 static bool adjustable, changing_mode;
+static bool refresh_posted, read_requested, closing, first_scan;
+static unsigned topology;
+typedef struct {
+    LONG refs;
+    HANDLE physical;
+    int display;
+    unsigned topology;
+    bool write, rejected, available;
+    DWORD requested, minimum, brightness, maximum;
+} w_brightness_job;
+static w_brightness_job *brightness_job;
+static HANDLE brightness_thread;
+typedef struct {
+    LONG refs;
+    bool full;
+    HMONITOR active;
+    wchar_t previous[220], device[CCHDEVICENAME];
+    w_display displays[count_of(displays)];
+    int display_count, preferred;
+    DEVMODEW modes[count_of(modes)], current;
+    int mode_count;
+} w_display_scan;
+static w_display_scan *scan;
+static HANDLE scan_thread;
+static bool scan_queued, topology_queued;
 enum { refresh_display = WM_APP + 60 };
 
 static int w_selected_display(void) {
@@ -32,6 +60,7 @@ static bool w_same_mode(const DEVMODEW *a, const DEVMODEW *b) {
 }
 
 static void w_clear_displays(void) {
+    ++topology;
     for (int i = 0; i < display_count; ++i)
         if (displays[i].physical)
             DestroyPhysicalMonitor(displays[i].physical);
@@ -39,9 +68,10 @@ static void w_clear_displays(void) {
     SendMessageW(selector, CB_RESETCONTENT, 0, 0);
 }
 
-static BOOL CALLBACK w_add_display(HMONITOR monitor, HDC dc, LPRECT rect, LPARAM active) {
+static BOOL CALLBACK w_add_display(HMONITOR monitor, HDC dc, LPRECT rect, LPARAM arg) {
     (void)dc;
     (void)rect;
+    w_display_scan *s = (w_display_scan *)arg;
     MONITORINFOEXW info = {.cbSize = sizeof(info)};
     if (!GetMonitorInfoW(monitor, (MONITORINFO *)&info))
         return TRUE;
@@ -64,16 +94,16 @@ static BOOL CALLBACK w_add_display(HMONITOR monitor, HDC dc, LPRECT rect, LPARAM
             size_t n = wcslen(label);
             swprintf(label + n, count_of(label)-n, L"   (%lu)", i + 1);
         }
-        if (display_count >= (int)count_of(displays) || SendMessageW(selector, CB_ADDSTRING, 0, (LPARAM)label) < 0) {
+        if (s->display_count >= (int)count_of(s->displays)) {
             if (handle)
                 DestroyPhysicalMonitor(handle);
             continue;
         }
-        w_display *d = &displays[display_count++];
+        w_display *d = &s->displays[s->display_count++];
+        d->physical=handle;
+        wcscpy(d->label,label);
         wcscpy(d->device, info.szDevice);
-        d->physical = handle;
-        if (monitor == (HMONITOR)active && !i)
-            SendMessageW(selector, CB_SETCURSEL, display_count - 1, 0);
+        if (monitor == s->active && !i) s->preferred = s->display_count-1;
     }
     free(physical);
     return TRUE;
@@ -93,57 +123,202 @@ static void w_show_brightness(void) {
     w_brightness_label(adjustable ? value : -1);
 }
 
-static void w_read_brightness(HANDLE h) {
-    DWORD caps, temperatures;
-    adjustable = h && GetMonitorCapabilities(h, &caps, &temperatures) && (caps & MC_CAPS_BRIGHTNESS) &&
-                 GetMonitorBrightness(h, &minimum, &brightness, &maximum) && maximum > minimum &&
-                 brightness >= minimum && brightness <= maximum;
-    w_show_brightness();
+static void w_release_brightness(w_brightness_job *job) {
+    if (job && !InterlockedDecrement(&job->refs)) {
+        if (job->physical) DestroyPhysicalMonitor(job->physical);
+        free(job);
+    }
 }
 
-static void w_display_modes(void) {
-    int display = w_selected_display(), selected = -1;
-    mode_count = 0;
-    SendMessageW(modes_list, LB_RESETCONTENT, 0, 0);
-    DEVMODEW current = {.dmSize = sizeof(current)};
-    if (display >= 0 && display < display_count &&
-        EnumDisplaySettingsW(displays[display].device, ENUM_CURRENT_SETTINGS, &current)) {
-        DEVMODEW mode = {.dmSize = sizeof(mode)};
-        for (DWORD j = 0; mode_count < (int)count_of(modes) && EnumDisplaySettingsW(displays[display].device, j, &mode); ++j) {
-            if (mode.dmBitsPerPel != current.dmBitsPerPel || mode.dmDisplayOrientation != current.dmDisplayOrientation)
-                continue;
-            bool active = w_same_mode(&current, &mode);
-            wchar_t s[128];
-            swprintf(s, count_of(s), L"%lu × %lu   %lu Hz%ls%ls", mode.dmPelsWidth, mode.dmPelsHeight, mode.dmDisplayFrequency,
-                     mode.dmDisplayFlags & DM_INTERLACED ? L"   Interlaced" : L"", active ? L"   Current" : L"");
-            if (SendMessageW(modes_list, LB_ADDSTRING, 0, (LPARAM)s) < 0)
-                continue;
-            SendMessageW(modes_list, LB_SETITEMDATA, mode_count, mode_count);
-            if (active)
-                selected = mode_count;
-            modes[mode_count++] = mode;
+static DWORD WINAPI w_brightness_worker(void *arg) {
+    w_brightness_job *job = arg;
+    DWORD caps, temperatures;
+    if (job->write) job->rejected = !SetMonitorBrightness(job->physical,job->requested);
+    job->available = (job->write || (GetMonitorCapabilities(job->physical,&caps,&temperatures) &&
+                      (caps & MC_CAPS_BRIGHTNESS))) &&
+                     GetMonitorBrightness(job->physical,&job->minimum,&job->brightness,&job->maximum) &&
+                     job->maximum > job->minimum && job->brightness >= job->minimum && job->brightness <= job->maximum;
+    w_release_brightness(job);
+    return 0;
+}
+
+// A slow DDC/CI monitor must not block dismissal, mode preview rollback, or other controls.
+static void w_next_brightness(void) {
+    if (brightness_thread) return;
+    int selected = w_selected_display(), i = 0;
+    while (i < display_count && !displays[i].write_pending) ++i;
+    if (i == display_count) {
+        if (!read_requested || selected < 0 || selected >= display_count) return;
+        i = selected;
+    }
+    if (i == selected) read_requested = false;
+    w_display *d = &displays[i];
+    if (!d->physical) return;
+    w_brightness_job *job = calloc(1,sizeof(*job));
+    if (job) {
+        job->refs = 2;
+        job->display = i;
+        job->topology = topology;
+        job->physical = d->physical;
+        job->write = d->write_pending;
+        job->requested = d->requested;
+        brightness_thread = CreateThread(NULL,0,w_brightness_worker,job,0,NULL);
+    }
+    d->write_pending = false;
+    if (brightness_thread) {
+        d->physical = NULL; // The worker owns the monitor until its completion is consumed.
+        brightness_job = job;
+    } else {
+        free(job);
+        SetWindowTextW(message_line,L"Could not start the brightness request.");
+    }
+}
+
+int w_display_pending(HANDLE handles[2]) {
+    int n = 0;
+    if (scan_thread) handles[n++] = scan_thread;
+    if (brightness_thread) handles[n++] = brightness_thread;
+    return n;
+}
+
+static void w_finish_brightness(void) {
+    w_brightness_job *job = brightness_job;
+    CloseHandle(brightness_thread);
+    brightness_thread = NULL;
+    brightness_job = NULL;
+    if (job->topology == topology) {
+        w_display *d = &displays[job->display];
+        d->physical = job->physical;
+        job->physical = NULL;
+        if (job->display == w_selected_display() && !d->write_pending && !scan_thread) {
+            read_requested = false;
+            adjustable = job->available;
+            minimum = job->minimum; brightness = job->brightness; maximum = job->maximum;
+            w_show_brightness();
+            if (job->rejected) SetWindowTextW(message_line,L"The monitor rejected the brightness change.");
         }
     }
-    SendMessageW(modes_list, LB_SETCURSEL, selected >= 0 ? selected : 0, 0);
-    EnableWindow(preview_button, mode_count > 0);
-    w_read_brightness(display >= 0 && display < display_count ? displays[display].physical : NULL);
+    w_release_brightness(job);
+    w_next_brightness();
+    if (closing && !brightness_thread) DestroyWindow(panel);
 }
 
-static void w_display_refresh(void) {
-    int old = w_selected_display();
-    wchar_t previous[220] = {0};
-    if (old >= 0 && old < display_count)
-        SendMessageW(selector, CB_GETLBTEXT, old, (LPARAM)previous);
-    w_clear_displays();
-    EnumDisplayMonitors(NULL, NULL, w_add_display, (LPARAM)MonitorFromWindow(panel, MONITOR_DEFAULTTOPRIMARY));
-    if (*previous) {
-        int index = (int)SendMessageW(selector, CB_FINDSTRINGEXACT, -1, (LPARAM)previous);
-        if (index >= 0)
-            SendMessageW(selector, CB_SETCURSEL, index, 0);
+static void w_release_scan(w_display_scan *s) {
+    if (s && !InterlockedDecrement(&s->refs)) {
+        for (int i = 0; i < s->display_count; ++i)
+            if (s->displays[i].physical) DestroyPhysicalMonitor(s->displays[i].physical);
+        free(s);
     }
-    if (w_selected_display() < 0)
-        SendMessageW(selector, CB_SETCURSEL, 0, 0);
-    w_display_modes();
+}
+
+static DWORD WINAPI w_scan_displays(void *arg) {
+    w_display_scan *s = arg;
+    if (s->full) {
+        EnumDisplayMonitors(NULL,NULL,w_add_display,(LPARAM)s);
+        for (int i = 0; i < s->display_count; ++i)
+            if (!wcscmp(s->previous,s->displays[i].label)) { s->preferred = i; break; }
+        if (s->display_count) wcscpy(s->device,s->displays[s->preferred].device);
+    }
+    s->current.dmSize = sizeof(s->current);
+    if (*s->device && EnumDisplaySettingsW(s->device,ENUM_CURRENT_SETTINGS,&s->current)) {
+        DEVMODEW mode = {.dmSize = sizeof(mode)};
+        for (DWORD i = 0; s->mode_count < (int)count_of(s->modes) && EnumDisplaySettingsW(s->device,i,&mode); ++i)
+            if (mode.dmBitsPerPel == s->current.dmBitsPerPel && mode.dmDisplayOrientation == s->current.dmDisplayOrientation)
+                s->modes[s->mode_count++] = mode;
+    }
+    w_release_scan(s);
+    return 0;
+}
+
+static void w_request_scan(bool full) {
+    topology_queued |= full || (scan && scan->full);
+    scan_queued = true;
+    mode_count = 0;
+    adjustable = false;
+    EnableWindow(preview_button,FALSE);
+    EnableWindow(slider,FALSE);
+    if (scan_thread) return;
+    scan_queued = false;
+    int old = w_selected_display();
+    scan = calloc(1,sizeof(*scan));
+    if (scan) {
+        scan->refs = 2;
+        scan->full = topology_queued;
+        scan->active = MonitorFromWindow(panel,MONITOR_DEFAULTTOPRIMARY);
+        if (old >= 0 && old < display_count) {
+            wcscpy(scan->previous,displays[old].label);
+            if (!scan->full) wcscpy(scan->device,displays[old].device);
+        }
+        scan_thread = CreateThread(NULL,0,w_scan_displays,scan,0,NULL);
+    }
+    if (scan_thread) topology_queued = false;
+    else {
+        free(scan);
+        scan = NULL;
+        SetWindowTextW(message_line,L"Could not read the display configuration.");
+    }
+}
+
+static void w_show_modes(const w_display_scan *s) {
+    int selected = -1;
+    mode_count = 0;
+    SendMessageW(modes_list,WM_SETREDRAW,FALSE,0);
+    SendMessageW(modes_list,LB_RESETCONTENT,0,0);
+    SendMessageW(modes_list,LB_INITSTORAGE,s->mode_count,(LPARAM)s->mode_count*64);
+    for (int i = 0; i < s->mode_count; ++i) {
+        const DEVMODEW *mode = &s->modes[i];
+        bool active = w_same_mode(&s->current,mode);
+        wchar_t label[128];
+        swprintf(label,count_of(label),L"%lu × %lu   %lu Hz%ls%ls",mode->dmPelsWidth,mode->dmPelsHeight,
+                 mode->dmDisplayFrequency,mode->dmDisplayFlags & DM_INTERLACED ? L"   Interlaced" : L"",
+                 active ? L"   Current" : L"");
+        if (SendMessageW(modes_list,LB_ADDSTRING,0,(LPARAM)label) < 0) continue;
+        SendMessageW(modes_list,LB_SETITEMDATA,mode_count,mode_count);
+        if (active) selected=mode_count;
+        modes[mode_count++] = *mode;
+    }
+    SendMessageW(modes_list,LB_SETCURSEL,selected >= 0 ? selected : 0,0);
+    SendMessageW(modes_list,WM_SETREDRAW,TRUE,0);
+    InvalidateRect(modes_list,NULL,TRUE);
+    EnableWindow(preview_button,mode_count > 0);
+    w_show_brightness();
+    read_requested = true;
+    w_next_brightness();
+}
+
+void w_display_finish(HANDLE completed) {
+    if (completed == brightness_thread) { w_finish_brightness(); return; }
+    w_display_scan *s = scan;
+    CloseHandle(scan_thread);
+    scan_thread = NULL;
+    scan = NULL;
+    if (!scan_queued && !closing && !deadline) {
+        if (s->full) {
+            w_clear_displays();
+            int preferred = 0;
+            for (int i = 0; i < s->display_count; ++i) {
+                if (SendMessageW(selector,CB_ADDSTRING,0,(LPARAM)s->displays[i].label) < 0) continue;
+                if (i == s->preferred) preferred = display_count;
+                displays[display_count++] = s->displays[i];
+                s->displays[i].physical = NULL;
+            }
+            SendMessageW(selector,CB_SETCURSEL,preferred,0);
+        }
+        int selected = w_selected_display();
+        if (selected >= 0 && selected < display_count && wcscmp(displays[selected].device,s->device))
+            scan_queued = true;
+        else {
+            if (selected < 0 || selected >= display_count) s->mode_count = 0;
+            w_show_modes(s);
+            if (first_scan) {
+                first_scan = false;
+                SetWindowTextW(message_line,display_count ? L"Select a resolution and refresh rate to preview." :
+                                                           L"No displays available.");
+            }
+        }
+    }
+    w_release_scan(s);
+    if (scan_queued && !closing && !deadline) w_request_scan(false);
 }
 
 static void w_end_preview(bool keep, bool closing) {
@@ -157,7 +332,7 @@ static void w_end_preview(bool keep, bool closing) {
     EnableWindow(selector, TRUE);
     EnableWindow(modes_list, TRUE);
     SetWindowTextW(preview_button, L"Preview");
-    if (!closing) w_display_refresh();
+    if (!closing) w_request_scan(true);
     SetWindowTextW(message_line, keep ? L"Display mode kept for this session." :
                    restored ? L"Original display mode restored." : L"Windows could not restore the previous display mode.");
 }
@@ -220,8 +395,14 @@ void w_display_create(HWND window, HWND list, HWND status, HWND apply) {
                          320, 300, 212, 32, window, NULL, instance, NULL);
     SendMessageW(slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
     SendMessageW(slider, TBM_SETPAGESIZE, 0, 5);
-    w_display_refresh();
-    SetWindowTextW(status, L"Select a resolution and refresh rate to preview.");
+    EnableWindow(preview_button,FALSE);
+    EnableWindow(slider,FALSE);
+    SetWindowTextW(status,L"Reading displays…");
+}
+
+void w_display_start(void) {
+    first_scan = true;
+    w_request_scan(true);
 }
 
 bool w_display_stretches(HWND control) {
@@ -232,7 +413,7 @@ bool w_display_message(UINT msg, WPARAM wp, LPARAM lp) {
     if (!panel)
         return false;
     if (msg == WM_COMMAND && (HWND)lp == selector && HIWORD(wp) == CBN_SELCHANGE) {
-        if (!deadline) w_display_modes();
+        if (!deadline) w_request_scan(false);
     } else if (msg == WM_HSCROLL && (HWND)lp == slider && adjustable) {
         int percent = (int)SendMessageW(slider, TBM_GETPOS, 0, 0), i = w_selected_display();
         if (i < 0 || i >= display_count)
@@ -241,24 +422,42 @@ bool w_display_message(UINT msg, WPARAM wp, LPARAM lp) {
             w_brightness_label(percent);
         else {
             DWORD value = minimum+(DWORD)(((uint64_t)(maximum - minimum)*percent + 50)/100);
-            if (value != brightness) {
-                bool ok = SetMonitorBrightness(displays[i].physical, value) != FALSE;
-                w_read_brightness(displays[i].physical);
-                if (!ok)
-                    SetWindowTextW(message_line, L"The monitor rejected the brightness change.");
+            if (value != brightness || displays[i].write_pending ||
+                (brightness_job && brightness_job->topology == topology && brightness_job->display == i)) {
+                displays[i].requested = value;
+                displays[i].write_pending = true;
+                w_brightness_label(percent);
+                w_next_brightness();
             } else w_show_brightness();
         }
     } else if (msg == WM_TIMER && wp == 1) {
         if (deadline && GetTickCount64() >= deadline)
             w_end_preview(false, false);
     } else if (msg == WM_DISPLAYCHANGE) {
-        if (!deadline && !changing_mode)
-            PostMessageW(panel, refresh_display, 0, 0);
+        if (!deadline && !changing_mode && !refresh_posted)
+            refresh_posted = PostMessageW(panel, refresh_display, 0, 0) != FALSE;
     } else if (msg == refresh_display) {
-        if (!deadline) w_display_refresh();
+        refresh_posted = false;
+        if (!deadline && !closing) w_request_scan(true);
+    } else if (msg == WM_CLOSE) {
+        bool writing = brightness_job && brightness_job->write;
+        for (int i = 0; i < display_count; ++i) writing |= displays[i].write_pending;
+        if (!writing) return false;
+        w_end_preview(false,true);
+        read_requested = false;
+        closing = true;
+        ShowWindow(panel,SW_HIDE);
     } else if (msg == WM_DESTROY) {
         w_end_preview(false, true);
         w_clear_displays();
+        if (scan_thread) CloseHandle(scan_thread);
+        scan_thread = NULL;
+        w_release_scan(scan);
+        scan = NULL;
+        if (brightness_thread) CloseHandle(brightness_thread);
+        brightness_thread = NULL;
+        w_release_brightness(brightness_job);
+        brightness_job = NULL;
         panel = NULL;
         return false;
     } else return false;

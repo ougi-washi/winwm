@@ -67,8 +67,7 @@ static UINT drag_button;
 static UINT secondary_button;
 static LONG next_drag, active_drag, canceled_drag;
 static POINT drag_point;
-static unsigned drag_mods;
-static bool inverse_drag;
+static unsigned char mouse_actions[2][16];
 
 static void w_queue_hover(POINT point) {
     bool moved = !hover_known || hover_point.x != point.x || hover_point.y != point.y;
@@ -280,13 +279,14 @@ static bool w_super_pressed(void) {
     return down;
 }
 
-static bool w_drag_modifier(void) {
+static enum w_mouse_action w_drag_action(int button) {
     AcquireSRWLockShared(&matcher_lock);
     unsigned mods = w_modifiers();
-    ReleaseSRWLockShared(&matcher_lock);
     if ((GetAsyncKeyState(VK_LWIN) | GetAsyncKeyState(VK_RWIN)) & 0x8000)
         mods |= MOD_WIN;
-    return (mods & drag_mods) == drag_mods;
+    enum w_mouse_action action = mouse_actions[button][mods];
+    ReleaseSRWLockShared(&matcher_lock);
+    return action;
 }
 
 static bool mouse_held[2];
@@ -329,10 +329,10 @@ static LRESULT CALLBACK w_mouse_proc(int code, WPARAM event, LPARAM data) {
             return 1;
         }
     } else if (drag && (event == WM_LBUTTONDOWN || event == WM_RBUTTONDOWN)) {
-        bool modified = w_drag_modifier();
-        bool move = (event == WM_LBUTTONDOWN) != inverse_drag;
-        enum input_drag_event gesture = !modified ? input_drag_edge : move ? input_drag_reposition : input_drag_inside;
-        if ((modified || event == WM_LBUTTONDOWN) && drag(gesture, m->pt)) {
+        enum w_mouse_action action = w_drag_action(event == WM_RBUTTONDOWN);
+        enum input_drag_event gesture = action == mouse_move ? input_drag_reposition :
+                                        action == mouse_resize ? input_drag_inside : input_drag_edge;
+        if ((action != mouse_unbound || event == WM_LBUTTONDOWN) && drag(gesture, m->pt)) {
             drag_button = (UINT)event;
             drag_point = m->pt;
             InterlockedExchange(&active_drag,InterlockedIncrement(&next_drag));
@@ -340,7 +340,7 @@ static LRESULT CALLBACK w_mouse_proc(int code, WPARAM event, LPARAM data) {
         }
     }
     if (event == WM_RBUTTONDOWN && !drag_button && context_msg && !GetShellWindow() &&
-        !w_super_pressed() && !w_drag_modifier() &&
+        !w_super_pressed() && w_drag_action(1) == mouse_unbound &&
         w_os_desktop_surface(GetAncestor(WindowFromPoint(m->pt), GA_ROOT))) {
         desktop_context_press = true;
         return 1;
@@ -440,8 +440,7 @@ void w_input_bind(HWND w, UINT message, UINT hover_message, UINT context_message
             menu_binding = i;
     }
     drag = resize_drag;
-    drag_mods = c->drag_mods;
-    inverse_drag = c->inverse_drag;
+    memcpy(mouse_actions, c->mouse_actions, sizeof(mouse_actions));
     generation++;
     if (key_thread && registered_menu >= 0)
         PostThreadMessageW(key_thread_id, WM_APP, 0, 0);

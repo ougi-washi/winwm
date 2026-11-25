@@ -173,17 +173,6 @@ static bool w_launch(const char *exe, const char *arg, bool admin) {
 ////////////////
 //~ Desktop commands
 
-void w_desktop_notice(const char *s) {
-    w_str_copy(desk.status, sizeof(desk.status), s);
-    if (desk.notice_count == 32) {
-        memmove(desk.notices, desk.notices + 1, 31 * sizeof(desk.notices[0]));
-        desk.notice_count--;
-    }
-    wchar_t *entry = desk.notices[desk.notice_count++];
-    if (!w_os_wide(s, entry, 256))
-        wcscpy(entry, L"See winwm.exe ctl doctor for details");
-}
-
 void w_desktop_action(int output, const char *s) {
     w_command c;
     if (w_command_parse(s, &c))
@@ -320,8 +309,10 @@ bool w_desktop_run_anchored(const w_command *c, int output, bool admin, const w_
     }
     bool popup = anchor && !admin && w_panel_command(c->kind) &&
                  c->kind != cmd_capture_region && c->kind != cmd_record && c->kind != cmd_pick_color;
+    if (c->kind != cmd_close && c->kind != cmd_notifications && c->kind != cmd_notify)
+        w_notice_close();
     if (!popup && (anchor || c->kind == cmd_workspace_select || c->kind == cmd_workspace_back ||
-                   c->kind == cmd_output_next || c->kind == cmd_menu))
+                   c->kind == cmd_output_next || c->kind == cmd_menu || c->kind == cmd_notifications))
         w_desktop_popup_cancel();
     if (popup) {
         w_palette_close();
@@ -371,12 +362,18 @@ bool w_desktop_run_anchored(const w_command *c, int output, bool admin, const w_
              w_launch(desk.config.editor, s, admin);
         break;
     }
+    case cmd_notifications:
+        w_desktop_focus_cancel();
+        w_bar_menu_close(NULL,true);
+        w_palette_close();
+        if (desk.resize) { desk.resize = false; w_input_mode(false); }
+        w_desktop_notifications_open(output,anchor);
+        break;
     case cmd_menu:
     case cmd_switcher:
     case cmd_shortcuts:
     case cmd_settings:
     case cmd_clipboard:
-    case cmd_notifications:
         w_desktop_focus_cancel();
         if (desk.resize) {
             desk.resize = false;
@@ -563,7 +560,7 @@ bool w_desktop_run_anchored(const w_command *c, int output, bool admin, const w_
         w_desktop_capture(output);
         break;
     case cmd_notify:
-        w_desktop_notice(c->arg);
+        w_desktop_notify(L"winwm",c->arg);
         break;
     case cmd_volume_up:
     case cmd_volume_down:
@@ -629,36 +626,94 @@ bool w_desktop_run_anchored(const w_command *c, int output, bool admin, const w_
 ////////////////
 //~ Clipboard and capture
 
-void w_desktop_copy_clip(void) {
-    if (!desk.clipboard_enabled || !OpenClipboard(desk.root))
-        return;
+static SRWLOCK clipboard_lock = SRWLOCK_INIT;
+static DWORD clipboard_generation, clipboard_sequence;
+static bool clipboard_again;
+static struct {
+    DWORD generation;
+    wchar_t text[count_of(desk.clips[0])];
+} clipboard_read;
 
+static bool w_history_permitted(void) {
     UINT exclude = RegisterClipboardFormatW(L"ExcludeClipboardContentFromMonitorProcessing");
     UINT history = RegisterClipboardFormatW(L"CanIncludeInClipboardHistory");
-    HANDLE h = NULL;
-    bool permitted = !IsClipboardFormatAvailable(exclude);
-    if (permitted && IsClipboardFormatAvailable(history)) {
-        HANDLE permission = GetClipboardData(history);
-        const DWORD *value = permission && GlobalSize(permission) >= sizeof(DWORD) ? GlobalLock(permission) : NULL;
-        permitted = value && *value == 1;
-        if (value) GlobalUnlock(permission);
-    }
-    if (permitted)
-        h = GetClipboardData(CF_UNICODETEXT);
-    if (h) {
-        const wchar_t *s = GlobalLock(h);
-        size_t bound = min(GlobalSize(h) / sizeof(wchar_t), count_of(desk.clips[0]));
-        if (s && bound && *s && wmemchr(s, 0, bound) &&
-            (!desk.clip_count || wcscmp(s, desk.clips[0]))) {
-            int keep = w_clamp_int(desk.clip_count, 0, 23);
-            memmove(desk.clips + 1, desk.clips, keep * sizeof(desk.clips[0]));
-            wcscpy(desk.clips[0], s);
-            desk.clip_count = keep + 1;
-        }
-        if (s)
+    if (!exclude || !history || IsClipboardFormatAvailable(exclude)) return false;
+    if (!IsClipboardFormatAvailable(history)) return true;
+    HANDLE h = GetClipboardData(history);
+    const DWORD *value = h && GlobalSize(h) >= sizeof(DWORD) ? GlobalLock(h) : NULL;
+    bool permitted = value && *value == 1;
+    if (value) GlobalUnlock(h);
+    return permitted;
+}
+
+static DWORD WINAPI w_read_clipboard(void *unused) {
+    (void)unused;
+    if (!OpenClipboard(NULL)) return 0;
+    DWORD sequence = GetClipboardSequenceNumber();
+    AcquireSRWLockShared(&clipboard_lock);
+    clipboard_read.generation = clipboard_generation;
+    bool fresh = !sequence || sequence != clipboard_sequence;
+    ReleaseSRWLockShared(&clipboard_lock);
+    if (fresh && w_history_permitted()) {
+        HANDLE h = GetClipboardData(CF_UNICODETEXT);
+        const wchar_t *s = h ? GlobalLock(h) : NULL;
+        if (s) {
+            size_t bound = min(GlobalSize(h) / sizeof(*s), count_of(clipboard_read.text));
+            const wchar_t *end = wmemchr(s, 0, bound);
+            if (end) {
+                size_t length = (size_t)(end - s);
+                memcpy(clipboard_read.text, s, length * sizeof(*s));
+                clipboard_read.text[length] = L'\0';
+            }
             GlobalUnlock(h);
+        }
     }
+    // Delayed rendering can advance the sequence while we hold the clipboard.
+    AcquireSRWLockExclusive(&clipboard_lock);
+    clipboard_sequence = GetClipboardSequenceNumber();
+    ReleaseSRWLockExclusive(&clipboard_lock);
     CloseClipboard();
+    return 0;
+}
+
+void w_desktop_copy_clip(void) {
+    if (!desk.clipboard_enabled) return;
+    if (desk.clipboard_reader) {
+        clipboard_again = true;
+        return;
+    }
+    DWORD sequence = GetClipboardSequenceNumber();
+    if (sequence && sequence == clipboard_sequence) return;
+    desk.clipboard_reader = CreateThread(NULL, 0, w_read_clipboard, NULL, 0, NULL);
+}
+
+void w_desktop_clipboard_done(void) {
+    CloseHandle(desk.clipboard_reader);
+    desk.clipboard_reader = NULL;
+    bool append = clipboard_read.generation == clipboard_generation && clipboard_read.text[0] &&
+                  (!desk.clip_count || wcscmp(clipboard_read.text, desk.clips[0]));
+    if (append) {
+        int keep = min(desk.clip_count, (int)count_of(desk.clips) - 1);
+        memmove(desk.clips + 1, desk.clips, keep * sizeof(desk.clips[0]));
+        wcscpy(desk.clips[0], clipboard_read.text);
+        desk.clip_count = keep + 1;
+    }
+    SecureZeroMemory(&clipboard_read, sizeof(clipboard_read));
+    if (clipboard_again) {
+        clipboard_again = false;
+        w_desktop_copy_clip();
+    }
+    if (append) w_desktop_clipboard_changed(false);
+}
+
+void w_desktop_clear_clips(void) {
+    AcquireSRWLockExclusive(&clipboard_lock);
+    ++clipboard_generation;
+    clipboard_sequence = GetClipboardSequenceNumber();
+    ReleaseSRWLockExclusive(&clipboard_lock);
+    SecureZeroMemory(desk.clips, sizeof(desk.clips));
+    desk.clip_count = 0;
+    w_desktop_clipboard_changed(true);
 }
 
 void w_desktop_capture(int output) {

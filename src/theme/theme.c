@@ -1,5 +1,6 @@
 #include "theme/theme.h"
 #include "theme/icon_button.h"
+#include "win_platform/material.h"
 #include <dwmapi.h>
 
 ////////////////
@@ -9,6 +10,12 @@ static COLORREF surface = RGB(16, 17, 22), ink = RGB(228, 229, 234), active = RG
 static uint32_t configured_background = 0x101116, configured_foreground = 0xe4e5ea, configured_accent = 0x91aaf7;
 static HBRUSH brush;
 static bool high_contrast;
+static bool configured;
+static w_panel_material panel_material;
+static const wchar_t tool_property[]=L"winwm.theme.tool";
+static const wchar_t colors_property[]=L"winwm.theme.colors";
+static const wchar_t effects_property[]=L"winwm.theme.effects";
+static UINT theme_changed;
 
 ////////////////
 //~ Theme Functions
@@ -50,7 +57,7 @@ COLORREF w_theme_selection(bool foreground) {
     return foreground ? ink : w_tint(surface, active, 24);
 }
 
-void w_theme_colors(uint32_t background, uint32_t foreground, uint32_t accent) {
+static void w_theme_colors(uint32_t background, uint32_t foreground, uint32_t accent) {
     configured_background = background;
     configured_foreground = foreground;
     configured_accent = accent;
@@ -68,11 +75,83 @@ void w_theme_colors(uint32_t background, uint32_t foreground, uint32_t accent) {
     active = contrast ? GetSysColor(COLOR_HIGHLIGHT) : w_color(accent);
 }
 
+void w_theme_material(HWND window) {
+    if (configured && window && !(GetWindowLongPtrW(window,GWL_STYLE)&WS_CHILD))
+        w_material_apply(window,&panel_material,surface);
+}
+
+static BOOL CALLBACK w_refresh_panel(HWND window,LPARAM arg) {
+    (void)arg;
+    if (w_material_attached(window)) {
+        w_theme_material(window);
+        RedrawWindow(window,NULL,NULL,RDW_INVALIDATE|RDW_ALLCHILDREN);
+    }
+    return TRUE;
+}
+
+static void w_set_theme(uint32_t background,uint32_t foreground,uint32_t accent,w_panel_material material) {
+    bool same_material=configured && material.opacity==panel_material.opacity &&
+                       material.blur==panel_material.blur && material.shadow==panel_material.shadow;
+    bool previous_contrast=high_contrast;
+    COLORREF previous_surface=surface,previous_ink=ink,previous_accent=active;
+    w_theme_colors(background,foreground,accent);
+    configured=true;
+    panel_material=material;
+    if (!same_material || previous_contrast!=high_contrast || previous_surface!=surface ||
+        previous_ink!=ink || previous_accent!=active)
+        EnumThreadWindows(GetCurrentThreadId(),w_refresh_panel,0);
+}
+
+void w_theme_configure(const w_desktop_config *config) {
+    w_set_theme(config->background,config->foreground,config->accent,config->panel_material);
+}
+
+static BOOL CALLBACK w_notify_tool(HWND window,LPARAM unused) {
+    (void)unused;
+    if (GetPropW(window,tool_property)) PostMessageW(window,theme_changed,0,0);
+    return TRUE;
+}
+
+// Tools run in separate processes. Publish the accepted theme directly on the
+// session HWND so opening a panel needn't wait for a profile cache write.
+void w_theme_publish(HWND manager) {
+    uint64_t colors=configured_background | ((uint64_t)configured_foreground<<24);
+    uint64_t effects=configured_accent | ((uint64_t)panel_material.opacity<<24) |
+                     ((uint64_t)panel_material.blur<<32) | ((uint64_t)panel_material.shadow<<33);
+    HANDLE palette=(HANDLE)(uintptr_t)(colors+1), material=(HANDLE)(uintptr_t)(effects+1);
+    if (!manager || (GetPropW(manager,colors_property)==palette && GetPropW(manager,effects_property)==material)) return;
+    if (!SetPropW(manager,colors_property,palette) || !SetPropW(manager,effects_property,material)) return;
+    if (!theme_changed) theme_changed=RegisterWindowMessageW(L"winwm.theme.changed");
+    if (theme_changed) EnumWindows(w_notify_tool,0);
+}
+
+static void w_follow_theme(void) {
+    HWND manager=FindWindowW(L"WinwmEvents",NULL);
+    if (!manager) return;
+    uint64_t colors=(uintptr_t)GetPropW(manager,colors_property), effects=(uintptr_t)GetPropW(manager,effects_property);
+    if (!colors || !effects) return;
+    --colors; --effects;
+    w_panel_material material={.opacity=(int)((effects>>24)&255),.blur=(effects>>32)&1,.shadow=(effects>>33)&1};
+    w_set_theme(colors&0xffffff,(colors>>24)&0xffffff,effects&0xffffff,material);
+}
+
+void w_theme_follow(HWND tool) {
+    if (!theme_changed) theme_changed=RegisterWindowMessageW(L"winwm.theme.changed");
+    SetPropW(tool,tool_property,(HANDLE)1);
+    w_follow_theme();
+}
+
 bool w_theme_message(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT *result) {
     *result = 0;
-    if (msg == WM_CREATE) {
+    if (theme_changed && msg==theme_changed && GetPropW(w,tool_property)) {
+        w_follow_theme();
+        return true;
+    } else if (msg == WM_CREATE) {
         BOOL enabled = TRUE;
         DwmSetWindowAttribute(w, 20, &enabled, sizeof(enabled));
+        w_theme_material(w);
+    } else if (msg == WM_NCDESTROY) {
+        RemovePropW(w,tool_property);
     } else if (msg == WM_SYSCOLORCHANGE || (msg == WM_SETTINGCHANGE && (wp == SPI_SETHIGHCONTRAST || !wp))) {
         w_theme_colors(configured_background, configured_foreground, configured_accent);
         RedrawWindow(w,NULL,NULL,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN);

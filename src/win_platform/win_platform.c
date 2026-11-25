@@ -1,5 +1,5 @@
 #include "win_platform/win_platform.h"
-#include "config/language.h"
+#include "lua_config/lua_config.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <wchar.h>
@@ -7,9 +7,6 @@
 ////////////////
 //~ Win Platform
 
-static const char starter[] =
-#include "config/default_conf.inc"
-    ;
 enum { file_limit = 256 * 1024, include_limit = 16, total_limit = 1024 * 1024 };
 
 typedef struct w_file_stack {
@@ -47,22 +44,16 @@ static bool w_make_parent(const wchar_t *path) {
 }
 
 // Publish the complete file with a non-replacing rename so concurrent starts preserve user edits.
-static bool w_publish(const wchar_t *path, const char *bytes, const wchar_t *copy) {
+static bool w_publish(const wchar_t *path, const void *bytes, DWORD length) {
     wchar_t temp[os_path_cap + 72];
     static LONG serial;
     swprintf(temp, count_of(temp), L"%ls.%lu.%ld.tmp", path, GetCurrentProcessId(),
              InterlockedIncrement(&serial));
-    bool ok = false;
-    if (copy)
-        ok = CopyFileW(copy, temp, TRUE) != 0;
-    else {
-        HANDLE file = CreateFileW(temp, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
-        if (file == INVALID_HANDLE_VALUE)
-            return false;
-        DWORD len = (DWORD)strlen(bytes), written = 0;
-        ok = WriteFile(file, bytes, len, &written, NULL) && written == len;
-        CloseHandle(file);
-    }
+    HANDLE file = CreateFileW(temp, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    DWORD written = 0;
+    bool ok = WriteFile(file, bytes, length, &written, NULL) && written == length;
+    CloseHandle(file);
     if (ok) {
         ok = MoveFileExW(temp, path, MOVEFILE_WRITE_THROUGH) != 0;
         if (!ok) {
@@ -77,27 +68,19 @@ static bool w_publish(const wchar_t *path, const char *bytes, const wchar_t *cop
 ////////////////
 //~ Configuration setup
 
-bool w_os_config_seed(bool migrate) {
-    wchar_t path[os_path_cap], old[os_path_cap], local[os_path_cap];
+bool w_os_config_seed(void) {
+    wchar_t path[os_path_cap];
     if (!w_os_config_path(path, count_of(path)))
         return false;
     if (w_present(path))
         return true;
     if (!w_make_parent(path))
         return false;
-    if (migrate) {
-        wcscpy(local, path);
-        wchar_t *name = wcsrchr(local, L'\\') + 1;
-        if ((size_t)(name - local) + wcslen(L"legacy.jsonc") >= count_of(local))
-            return false;
-        wcscpy(name, L"legacy.jsonc");
-        if (!w_present(local) && w_os_legacy_config_path(old, count_of(old)) && w_present(old) &&
-            !w_publish(local, NULL, old))
-            return false;
-        if (w_present(local))
-            return w_publish(path, "source = legacy.jsonc\n", NULL);
-    }
-    return w_publish(path, starter, NULL);
+    HRSRC resource = FindResourceW(NULL,L"WINWM_DEFAULT_CONFIG",MAKEINTRESOURCEW(10));
+    if (!resource) return false;
+    DWORD size = SizeofResource(NULL,resource);
+    const void *bytes = LockResource(LoadResource(NULL,resource));
+    return bytes && size && w_publish(path,bytes,size);
 }
 
 static bool w_parse_file(w_config_language *lang, const wchar_t *path, char *err, size_t cap);
@@ -171,7 +154,7 @@ static bool w_include_file(w_config_language *lang, const char *source, char *er
                (value[0] == L'\\' && value[1] == L'\\'))
         *base = 0;
     else {
-        wcscpy(base, stack->paths[stack->depth - 1]);
+        wcscpy(base, stack->paths[lang->module ? 0 : stack->depth - 1]);
         wcsrchr(base, L'\\')[1] = 0;
     }
     if (wcslen(base) + wcslen(tail) >= count_of(base))
@@ -205,6 +188,11 @@ static bool w_parse_file(w_config_language *lang, const wchar_t *path, char *err
         }
     const wchar_t *name = wcsrchr(path, L'\\');
     name = name ? name + 1 : path;
+    const wchar_t *ext = wcsrchr(name,L'.');
+    if (!ext || _wcsicmp(ext,L".lua")) {
+        snprintf(err,cap,"Expected a .lua configuration file");
+        return false;
+    }
     char label[192] = "configuration";
     w_os_utf8(name, label, sizeof(label));
     FILE *f = _wfopen(!stack->depth && stack->candidate ? stack->candidate : path, L"rb");
@@ -225,11 +213,7 @@ static bool w_parse_file(w_config_language *lang, const wchar_t *path, char *err
         char *body = n >= 3 && !memcmp(text, "\xef\xbb\xbf", 3) ? text + 3 : text;
         stack->bytes += (unsigned)n;
         wcscpy(stack->paths[stack->depth++], path);
-        const wchar_t *extension = wcsrchr(name, L'.');
-        if (extension && (!_wcsicmp(extension, L".jsonc") || !_wcsicmp(extension, L".json")))
-            ok = w_config_merge(lang->config, body, err, cap);
-        else
-            ok = w_config_language_parse(lang, body, err, cap);
+        ok = w_lua_config_parse(lang, body, label, err, cap);
         stack->depth--;
         if (!ok && !strstr(err, " -> ")) {
             char reason[192];
@@ -244,31 +228,39 @@ static bool w_parse_file(w_config_language *lang, const wchar_t *path, char *err
 }
 
 bool w_os_config_load(w_desktop_config *out, char *err, size_t cap) {
-    wchar_t path[os_path_cap];
-    if (!w_os_config_path(path, count_of(path)) || !w_os_config_seed(true)) {
-        snprintf(err, cap, "Cannot create the user profile's .config/winwm/winwm.conf");
+    return w_os_config_load_toolbar(NULL,out,err,cap);
+}
+
+bool w_os_toolbar_path(wchar_t *path, int cap) {
+    if (!w_os_config_path(path,cap)) return false;
+    wchar_t *name = wcsrchr(path,L'\\') + 1;
+    const wchar_t filename[] = L"toolbar-layout.lua";
+    if ((size_t)(name-path) + count_of(filename) > (size_t)cap) return false;
+    wcscpy(name,filename);
+    return true;
+}
+
+bool w_os_config_load_toolbar(const wchar_t *candidate, w_desktop_config *out, char *err, size_t cap) {
+    wchar_t path[os_path_cap], toolbar[os_path_cap];
+    if (!w_os_config_path(path,count_of(path)) || !w_os_toolbar_path(toolbar,count_of(toolbar)) || !w_os_config_seed()) {
+        snprintf(err, cap, "Cannot create the user profile's .config/winwm/winwm.lua");
         return false;
     }
-    return w_os_config_read_path(path, out, err, cap);
-}
-
-bool w_os_config_read_path(const wchar_t *path, w_desktop_config *out, char *err, size_t cap) {
-    return w_os_config_read_candidate(path,NULL,out,err,cap);
-}
-
-bool w_os_config_read_candidate(const wchar_t *path, const wchar_t *candidate, w_desktop_config *out,
-                                char *err, size_t cap) {
     w_file_stack *stack = calloc(1, sizeof(*stack));
     w_config_language *lang = calloc(1, sizeof(*lang));
     w_desktop_config *next = malloc(sizeof(*next));
     bool ok = false;
     if (lang && stack && next) {
-        stack->candidate = candidate;
         w_config_defaults(next);
         lang->config = next;
         lang->source = w_include_file;
         lang->files = stack;
-        ok = w_parse_file(lang, path, err, cap) && w_config_validate_providers(next, err, cap);
+        ok = w_parse_file(lang,path,err,cap);
+        if (ok && (candidate || w_present(toolbar))) {
+            stack->candidate = candidate;
+            ok = w_parse_file(lang,toolbar,err,cap);
+        }
+        if (ok) ok = w_config_validate_providers(next,err,cap);
         if (ok) {
             *out = *next;
             if (cap)

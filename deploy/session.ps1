@@ -7,13 +7,9 @@ param(
 )
 $ErrorActionPreference='Stop'
 $root=Join-Path $env:LOCALAPPDATA 'winwm'
-$legacyRoot=Join-Path $env:LOCALAPPDATA 'native_desktop'
+$configDir=Join-Path $env:USERPROFILE '.config\winwm'
 $journal=Join-Path $root 'activation.json'
-$priorJournal=Join-Path $legacyRoot 'activation.json'
-if (!(Test-Path $journal) -and (Test-Path $priorJournal)) {
-    if ($Action -eq 'Rollback') {$journal=$priorJournal}
-    if ($Action -eq 'Activate') {throw 'Roll back the previous managed shell before activating winwm.'}
-}
+$runKey='Software\Microsoft\Windows\CurrentVersion\Run'
 $manifest=Join-Path $root 'staged.json'
 $sessionSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $version=Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
@@ -54,12 +50,17 @@ function Restore-Entry($entry) {
         Set-RegValue $entry $entry.before
     }
 }
-function Restore-Activation {
-    $record=Get-Content $journal -Raw | ConvertFrom-Json
-    if ($record.sid -ne $sessionSid) {throw 'Activation belongs to a different user'}
+function Get-ActivationEntry {
+    $record=Get-Content -LiteralPath $journal -Raw | ConvertFrom-Json
+    if ($record.sid -ne $sessionSid) {throw 'Activation belongs to a different user.'}
     $entries=@($record.entries)
-    [array]::Reverse($entries)
-    foreach ($entry in $entries) {Restore-Entry $entry}
+    if ($entries.Count -ne 1 -or $entries[0].path -ne $runKey -or $entries[0].name -ne 'winwm') {
+        throw 'The activation journal does not identify this winwm startup entry.'
+    }
+    $entries[0]
+}
+function Restore-Activation {
+    Restore-Entry (Get-ActivationEntry)
     Remove-Item -LiteralPath $journal
 }
 if ($Action -eq 'Rollback') {
@@ -67,7 +68,7 @@ if ($Action -eq 'Rollback') {
     Write-Output 'Activation rollback complete.'
     return
 }
-[pscustomobject]@{Edition=$version.EditionID; Build=$version.CurrentBuild; X64=$x64; Account=$sessionSid; ConfigRoot=$root}
+[pscustomobject]@{Edition=$version.EditionID; Build=$version.CurrentBuild; X64=$x64; Account=$sessionSid; ConfigRoot=$configDir}
 if ($Action -eq 'Preflight') {return}
 if ([int]$version.CurrentBuild -lt 19045 -or !$x64) {
     throw 'A supported x64 Windows installation is required.'
@@ -83,28 +84,21 @@ if ($Action -eq 'Stage') {
         if (!(Test-Path $to)) {Copy-Item -LiteralPath (Join-Path $Bin $name) -Destination $to}
         if ((Get-FileHash $to).Hash -ne (Get-FileHash (Join-Path $Bin $name)).Hash) {throw "Release hash mismatch: $name"}
     }
-    $config=Join-Path $legacyRoot 'config.jsonc'
-    $nativeConfig=Join-Path $env:USERPROFILE '.config\winwm\winwm.conf'
-    $configDir=Split-Path -Parent $nativeConfig
-    $companions=Join-Path $configDir 'companions.jsonc'
-    if (!(Test-Path -LiteralPath $nativeConfig) -and !(Test-Path -LiteralPath $config) -and
-        !(Test-Path -LiteralPath (Join-Path $configDir 'legacy.jsonc'))) {
-        if (!(Test-Path -LiteralPath $companions)) {
-            if (!$FileBrowser -or !$TaskManager) {throw 'Specify -FileBrowser and -TaskManager with the installed executable paths.'}
-            $fb=(Get-Item -LiteralPath $FileBrowser).FullName
-            $tm=(Get-Item -LiteralPath $TaskManager).FullName
-            foreach ($provider in $fb,$tm) {
-                if ([IO.Path]::GetExtension($provider) -ine '.exe') {
-                    throw "Invalid provider: $provider"
-                }
-            }
-            [IO.Directory]::CreateDirectory($configDir) | Out-Null
-            Write-Atomic $companions (@{version=1;file_browser=$fb;task_manager=$tm}|ConvertTo-Json) -IfMissing
+    $configPath=Join-Path $configDir 'winwm.lua'
+    if (($FileBrowser -or $TaskManager) -and !(Test-Path -LiteralPath $configPath)) {
+        $settings=foreach ($provider in @{file_browser=$FileBrowser;task_manager=$TaskManager}.GetEnumerator()) {
+            if (!$provider.Value) {continue}
+            $exe=Get-Item -LiteralPath $provider.Value
+            if ($exe.PSIsContainer -or $exe.Extension -ine '.exe') {throw "Invalid provider: $($exe.FullName)"}
+            $provider.Key+' = "'+$exe.FullName.Replace('\','\\')+'"'
         }
-        Write-Atomic $nativeConfig "source = companions.jsonc`n" -IfMissing
+        $template=[IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\assets\winwm.lua'))
+        $override='hl.config({ programs = { '+($settings -join ', ')+' } })'
+        [IO.Directory]::CreateDirectory((Split-Path -Parent $configPath)) | Out-Null
+        Write-Atomic $configPath ($template+[Environment]::NewLine+$override+[Environment]::NewLine) -IfMissing
     }
-    $check=Start-Process -FilePath (Join-Path $destination 'winwm.exe') -ArgumentList 'ctl','prepare' -PassThru -Wait -WindowStyle Hidden
-    if ($check.ExitCode) {throw 'winwm configuration validation failed.'}
+    $check=Start-Process -FilePath (Join-Path $destination 'winwm.exe') -ArgumentList 'ctl','validate-startup' -PassThru -Wait -WindowStyle Hidden
+    if ($check.ExitCode) {throw 'The staged release failed startup validation.'}
     $previous=$null
     if (Test-Path $manifest) {
         $prior=Get-Content $manifest -Raw|ConvertFrom-Json
@@ -121,39 +115,24 @@ $hostExe=Join-Path $stage.path 'winwm.exe'
 if (!(Test-Path -LiteralPath $hostExe -PathType Leaf)) {throw "Missing $hostExe"}
 $recoveryExe=Join-Path $stage.path 'winwm_recovery.exe'
 if (!(Test-Path -LiteralPath $recoveryExe -PathType Leaf)) {throw "Missing $recoveryExe. Stage the complete release first."}
-$check=Start-Process -FilePath $hostExe -ArgumentList 'ctl','validate-startup' -PassThru -Wait -WindowStyle Hidden
-if ($check.ExitCode) {throw 'The staged release failed startup validation.'}
-$startup=@{path='Software\Microsoft\Windows\CurrentVersion\Run';name='winwm';value=('"'+$hostExe+'"')}
+$check=Start-Process -FilePath $hostExe -ArgumentList 'ctl','validate-activation' -PassThru -Wait -WindowStyle Hidden
+if ($check.ExitCode) {throw 'The release or Windows shell configuration prevents activation.'}
+$startup=@{path=$runKey;name='winwm';value=('"'+$hostExe+'"')}
 $startup.before=Get-RegValue $startup
-$legacy=@()
-if (Test-Path $journal) {
-    $old=Get-Content $journal -Raw|ConvertFrom-Json
-    if ($old.sid -ne $sessionSid) {throw 'Activation journal belongs to a different user.'}
-    $match=@($old.entries|Where-Object {$_.path -eq $startup.path -and $_.name -eq $startup.name})
-    if ($match.Count -gt 1) {throw 'Activation journal mismatch.'}
-    if ($match.Count -eq 1) {
-        $current=$startup.before
-        if ($current.present -and ($current.kind -ne 'String' -or
-            ($current.value -cne $match[0].value -and $current.value -cne $match[0].oldOwned))) {
-            throw 'Startup entry changed independently. Roll back before activating again.'
-        }
-        $startup.before=$match[0].before
-        if ($current.present) {$startup.oldOwned=$current.value}
+if (Test-Path -LiteralPath $journal) {
+    $entry=Get-ActivationEntry
+    $current=$startup.before
+    if ($current.present -and ($current.kind -ne 'String' -or
+        ($current.value -cne $entry.value -and $current.value -cne $entry.oldOwned))) {
+        throw 'Startup entry changed independently. Roll back before activating again.'
     }
-    $legacy=@($old.entries|Where-Object {$_.path -ne $startup.path -or $_.name -ne $startup.name})
-}
-if ($startup.before.present -and !$startup.ContainsKey('oldOwned')) {
+    $startup.before=$entry.before
+    if ($current.present) {$startup.oldOwned=$current.value}
+} elseif ($startup.before.present) {
     throw 'The winwm startup entry already belongs to another deployment.'
 }
-# Journal both sides before migrating an older deployment away from shell replacement.
-Write-Atomic $journal (@{sid=$sessionSid;entries=@($startup)+$legacy}|ConvertTo-Json -Depth 6)
+Write-Atomic $journal (@{sid=$sessionSid;entries=@($startup)}|ConvertTo-Json -Depth 6)
 try {
     Set-RegValue $startup @{present=$true;kind='String';value=$startup.value}
-    if ($legacy.Count) {
-        [array]::Reverse($legacy)
-        foreach ($entry in $legacy) {Restore-Entry $entry}
-        Write-Atomic $journal (@{sid=$sessionSid;entries=@($startup)}|ConvertTo-Json -Depth 6)
-    }
 } catch {Restore-Activation;throw}
 Write-Output 'winwm will start at the next sign-in.'
-

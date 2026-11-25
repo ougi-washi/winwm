@@ -11,13 +11,6 @@
 ////////////////
 //~ App
 
-static int w_shell_result(int result) {
-    if (result == ERROR_REVISION_MISMATCH)
-        MessageBoxW(NULL, L"An earlier desktop manager is running in this session. Close it or sign out "
-                          L"before starting winwm.", L"winwm", MB_OK | MB_ICONINFORMATION);
-    return result;
-}
-
 static int w_run_bar_tool(wchar_t **argv) {
     unsigned long long handle;
     DWORD serial, pid = 0;
@@ -51,9 +44,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR line, int show
     if (!argv)
         return 1;
     if (argc == 1 || (argc == 2 && !wcscmp(argv[1], L"--preview")))
-        result = w_shell_result(w_session_run(instance, argc == 2));
-    else if (argc == 2 && (!wcscmp(argv[1], L"--session") || !wcscmp(argv[1], L"--preview-session")))
-        result = w_shell_result(w_session_run(instance, !wcscmp(argv[1], L"--preview-session")));
+        result = w_session_run(instance, argc == 2);
     else if (argc == 2 && !wcsncmp(argv[1], L"--tool-", 7))
         result = w_tools_run(argv[1] + 7);
     else if (argc == 10 && !wcsncmp(argv[1], L"--tool-", 7) && !wcscmp(argv[2], L"--bar-popup"))

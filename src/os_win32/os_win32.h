@@ -8,25 +8,28 @@ typedef enum { os_host_instance, os_interactive_instance } os_instance_kind;
 ////////////////
 //~ Os Win32
 
-typedef struct w_os_instance_lock {
-    HANDLE current, legacy;
-} w_os_instance_lock;
+typedef HANDLE w_os_instance_lock;
 
 ////////////////
 //~ Os Win32 Interface
 
 DWORD w_os_instance_claim(os_instance_kind kind, w_os_instance_lock *lock);
 DWORD w_os_instance_status(os_instance_kind kind);
+DWORD w_os_startup_shell(void);
 void w_os_instance_release(w_os_instance_lock *lock);
 bool w_os_wide(const char *s, wchar_t *out, int cap);
 bool w_os_utf8(const wchar_t *s, char *out, int cap);
 bool w_os_data_path(wchar_t *out, int cap, const wchar_t *name, bool create);
-bool w_os_legacy_config_path(wchar_t *out, int cap);
 bool w_os_config_path(wchar_t *out, int cap);
 bool w_os_self(wchar_t *out, int cap);
 DWORD w_os_exit_shell(void);
+bool w_os_explorer_tray_present(void);
 DWORD w_os_ensure_shell(void);
 bool w_os_provider(const char *name, wchar_t *out, int cap);
+wchar_t *w_os_path_directories(void);
+wchar_t *w_os_next_directory(wchar_t **cursor);
+void w_os_path_extensions(wchar_t *out, DWORD cap);
+int w_os_extension_order(const wchar_t *ext, const wchar_t *extensions);
 bool w_os_task_manager(const char *name, wchar_t *out, int cap);
 HANDLE w_os_launch(const wchar_t *exe, const wchar_t *arg);
 HANDLE w_os_launch_positioned(const wchar_t *exe, const wchar_t *arg, POINT origin);
@@ -39,6 +42,7 @@ bool w_os_launch_terminal_at(const char *name, const wchar_t *directory, bool ad
 bool w_os_launch_provider(const char *name, const char *arg, bool admin);
 void w_os_mark(const wchar_t *stage);
 void w_os_restore_all(void);
+#define WINWM_TRAY_WINDOW_PROPERTY L"winwm.tray.window"
 void w_os_wait_layer_cleanup(void);
 void w_os_remember_stack(void);
 bool w_os_remember(HWND w, w_rect *original);
@@ -49,12 +53,12 @@ bool w_os_ready_for_focus(HWND window);
 bool w_os_set_visible(HWND w, bool wanted);
 void w_os_window_appearance(HWND w, DWORD border, DWORD corner);
 bool w_os_window_opacity(HWND w, BYTE alpha, bool retain_layer);
-bool w_os_direct_surface(HWND w);
+bool w_os_direct_surface(HWND w, DWORD pid);
 w_rect w_os_bounds(HWND w);
 RECT w_os_to_rect(w_rect r);
 bool w_os_same_process(HWND w);
 bool w_os_desktop_surface(HWND window);
-bool w_os_candidate(HWND w);
+bool w_os_candidate(HWND w, DWORD *pid);
 HWND w_os_app_window(HWND w);
 bool w_os_cloaked(HWND w);
 bool w_os_keyboard_name(HKEY layouts, const wchar_t *key, wchar_t *name, DWORD count);

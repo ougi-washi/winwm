@@ -76,8 +76,9 @@ bool w_layout_grab_splits(const w_desktop_model *m, int output, int slot, int x,
         }
     } else if (ws->layout == layout_tree || ws->layout == layout_alternate) {
         int child = slot >= 0 ? m->windows[slot].leaf : 0;
-        int node = child ? m->nodes[child].parent : 1;
-        while (node && (size_t)node < count_of(m->nodes)) {
+        int node = child ? m->nodes[child].parent : ws->root;
+        int siblings[window_limit], remaining = 0;
+        while (node) {
             const w_tile_node *n = &m->nodes[node];
             if (n->live && n->available > 1 && (inside || w_contains(n->bounds, x, y))) {
                 int axis = n->axis;
@@ -88,18 +89,24 @@ bool w_layout_grab_splits(const w_desktop_model *m, int output, int slot, int x,
                     // Prefer the divider on the grabbed side, falling back to the other edge at an output boundary.
                     score = low == (n->second == child) ? 0 : 1;
                 }
-                int root = node;
-                if (slot < 0)
-                    while (m->nodes[root].parent)
-                        root = m->nodes[root].parent;
-                if (score < best[axis] && (slot >= 0 || root == ws->root)) {
+                if (score < best[axis] ||
+                    (slot < 0 && score == best[axis] && node < grips[axis].node)) {
                     best[axis] = score;
                     grips[axis] = (w_split_grab){.kind=grab_node, .node=node, .generation=n->generation,
                                                  .cut=n->cut, .available=n->available};
                 }
             }
-            child = node;
-            node = slot >= 0 ? n->parent : node+1;
+            if (slot >= 0) {
+                child = node;
+                node = n->parent;
+            } else if (n->slot < 0) {
+                // A gap belongs to this workspace. Other outputs and hidden
+                // workspaces can have dividers at exactly the same coordinates.
+                siblings[remaining++] = n->second;
+                node = n->first;
+            } else {
+                node = remaining ? siblings[--remaining] : 0;
+            }
         }
     }
     if (!inside) {

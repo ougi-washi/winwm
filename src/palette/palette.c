@@ -1,7 +1,7 @@
 #include "theme/theme.h"
 #include "theme/icon_button.h"
 #include "palette/palette.h"
-#include "bar/bar.h"
+#include "win_platform/layer.h"
 #include <commctrl.h>
 #include <dwmapi.h>
 #include <imm.h>
@@ -173,18 +173,22 @@ static int w_query_words(const wchar_t *query, w_query_word *words) {
 }
 
 static bool w_word_start(const wchar_t *text, const wchar_t *position) {
-    return position == text || !IsCharAlphaNumericW(position[-1]);
+    if (position == text) return true;
+    wchar_t ch = position[-1];
+    if (ch < 128)
+        return !(ch >= L'a' && ch <= L'z') && !(ch >= L'A' && ch <= L'Z') && !(ch >= L'0' && ch <= L'9');
+    return !IsCharAlphaNumericW(ch);
 }
 
 static int w_match_tier(const wchar_t *text, const wchar_t *query, const w_query_word *words,
                         int count, int *cost) {
     if (!wcscmp(text, query))
         return 0;
-    *cost = (int)wcslen(text);
     const wchar_t *hit = wcsstr(text, query);
+    if (!hit && (!query[1] || !wcschr(text,*query))) return -1;
+    *cost = (int)wcslen(text);
     if (hit == text)
         return 1;
-    if (!hit && !query[1]) return -1;
     for (const wchar_t *p = hit; p; p = wcsstr(p + 1, query)) {
         if (w_word_start(text, p)) {
             *cost += (int)(p - text);
@@ -195,11 +199,10 @@ static int w_match_tier(const wchar_t *text, const wchar_t *query, const w_query
         bool used[palette_text_capacity] = {0};
         int i;
         for (i = 0; i < count; i++) {
-            const wchar_t *p = text;
-            while (*p && (used[p - text] || !w_word_start(text, p) ||
-                          wcsncmp(p, words[i].start, words[i].length)))
-                p++;
-            if (!*p)
+            const wchar_t *p = wcschr(text,*words[i].start);
+            while (p && (used[p - text] || !w_word_start(text,p) || wcsncmp(p,words[i].start,words[i].length)))
+                p = wcschr(p+1,*words[i].start);
+            if (!p)
                 break;
             used[p - text] = true;
         }
@@ -213,7 +216,7 @@ static int w_match_tier(const wchar_t *text, const wchar_t *query, const w_query
     const wchar_t *initials = query, *fuzzy = query;
     int gaps = 0;
     for (const wchar_t *p = text; *p; p++) {
-        if (*initials && w_word_start(text, p) && *p == *initials)
+        if (*p == *initials && w_word_start(text,p))
             initials++;
         if (*fuzzy) {
             if (*p == *fuzzy) {
@@ -336,15 +339,18 @@ static void w_filter(void) {
             results[result_count++] = (w_result){command_submit,0,0};
         }
     } else if (length < palette_text_capacity) w_search_results();
-    if (ListView_GetItemCount(list)) ListView_SetItemState(list,-1,0,LVIS_SELECTED|LVIS_FOCUSED);
-    ListView_SetItemCountEx(list, result_count, LVSICF_NOSCROLL);
+    int previous = w_selected_index();
+    if (previous >= 0) ListView_SetItemState(list,previous,0,LVIS_SELECTED|LVIS_FOCUSED);
+    if (ListView_GetItemCount(list) != result_count)
+        ListView_SetItemCountEx(list, result_count, LVSICF_NOSCROLL | LVSICF_NOINVALIDATEALL);
     w_select(0);
     SetWindowTextW(empty_text, message);
     ShowWindow(list,result_count ? SW_SHOWNA : SW_HIDE);
     ShowWindow(empty_text, result_count ? SW_HIDE : SW_SHOWNA);
     RECT viewport;
     GetClientRect(list,&viewport);
-    ListView_SetColumnWidth(list,0,max(1,(int)viewport.right));
+    int width = max(1,(int)viewport.right);
+    if (ListView_GetColumnWidth(list,0) != width) ListView_SetColumnWidth(list,0,width);
     InvalidateRect(list, NULL, FALSE);
     filtering = false;
 }
@@ -504,9 +510,9 @@ static void w_dismiss(bool restore_focus) {
     if (placement.anchor.bar && placement.leave.ms && GetForegroundWindow() != panel && IsWindowVisible(panel)) {
         closing = true;
         SetWindowLongPtrW(panel, GWL_EXSTYLE, GetWindowLongPtrW(panel,GWL_EXSTYLE) | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
-        if (w_bar_fade(panel, &fade, 0, placement.leave, true)) return;
+        if (w_layer_fade_to(panel, &fade, 0, placement.leave, true)) return;
     }
-    KillTimer(panel, bar_fade_timer);
+    KillTimer(panel, layer_fade_timer);
     ShowWindow(panel, SW_HIDE);
     if (pending_restore)
         PostMessageW(panel, restore_foreground, 0, 0);
@@ -677,6 +683,11 @@ static LRESULT CALLBACK w_palette_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     LRESULT color_result;
     if (w_theme_message(w, msg, wp, lp, &color_result)) return color_result;
     if (msg == WM_PAINT || msg == WM_PRINTCLIENT) {
+        COLORREF background=w_theme_background();
+        if (list && ListView_GetBkColor(list)!=background) {
+            ListView_SetBkColor(list,background);
+            ListView_SetTextBkColor(list,background);
+        }
         PAINTSTRUCT ps;
         HDC dc = msg == WM_PAINT ? BeginPaint(w, &ps) : (HDC)wp;
         RECT area;
@@ -740,8 +751,8 @@ static LRESULT CALLBACK w_palette_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == WM_CLOSE) { w_dismiss(true); return 0; }
-    if (msg == WM_TIMER && wp == bar_fade_timer) {
-        if (!w_bar_fade_tick(w, &fade, true) && closing) ShowWindow(w, SW_HIDE);
+    if (msg == WM_TIMER && wp == layer_fade_timer) {
+        if (!w_layer_fade_tick(w, &fade, true) && closing) ShowWindow(w, SW_HIDE);
         return 0;
     }
     if ((msg == WM_DISPLAYCHANGE || (msg == WM_SETTINGCHANGE && wp == SPI_SETWORKAREA)) &&
@@ -797,37 +808,53 @@ static bool w_create_palette(void) {
 }
 
 
-static bool w_cache(const w_palette_entry *entries, int count) {
-    if (count < 0 || count > INT_MAX-palette_group_count-1 || (!entries && count)) return false;
-    w_cached_row *next = count ? calloc((size_t)count, sizeof(*next)) : NULL;
-    w_result *slots = calloc((size_t)count+palette_group_count+1, sizeof(*slots));
-    if ((count && !next) || !slots) { free(next); free(slots); return false; }
+static bool w_cache(const w_palette_entry *entries, int count, const w_palette_apps *apps) {
+    int app_count = apps ? apps->count : 0;
+    if (count < 0 || app_count < 0 || (!entries && count) ||
+        (int64_t)count+app_count > INT_MAX-palette_group_count-1) return false;
+    int total = count+app_count;
+    if (!results || total != row_count) {
+        w_result *slots = realloc(results, ((size_t)total+palette_group_count+1)*sizeof(*slots));
+        if (!slots) return false;
+        results = slots;
+        result_count = 0;
+        if (total) {
+            w_cached_row *next = realloc(rows,(size_t)total*sizeof(*next));
+            if (!next) { row_count = 0; return false; }
+            rows = next;
+        } else { free(rows); rows = NULL; }
+    }
     memset(in_group,0,sizeof(in_group));
     grouped = false;
-    for (int i = 0; i < count; ++i) {
-        w_cached_row *r = &next[i];
-        r->entry = entries[i];
+    for (int i = 0; i < total; ++i) {
+        w_cached_row *r = &rows[i];
+        w_palette_entry app = {0};
+        const w_palette_entry *source;
+        if (i < count) source = &entries[i];
+        else {
+            apps->read(i-count,&app);
+            source = &app;
+        }
+        bool same_label = i < row_count && !wcsncmp(r->entry.label,source->label,palette_text_capacity-1);
+        r->entry = *source;
         r->entry.label[palette_text_capacity-1] = 0;
         if ((unsigned)r->entry.group >= palette_group_count) r->entry.group = palette_flat;
         ++in_group[r->entry.group];
         grouped |= r->entry.group != palette_flat;
-        w_search_text(r->normalized, r->entry.label);
+        if (!same_label) w_search_text(r->normalized, r->entry.label);
+        r->alias[0] = 0;
         if (r->entry.command_name) {
             wchar_t alias[palette_text_capacity];
             if (w_os_wide(r->entry.command_name,alias,count_of(alias))) w_search_text(r->alias,alias);
         }
     }
-    free(rows);
-    free(results);
-    rows = next;
-    results = slots;
-    row_count = count;
+    row_count = total;
     result_count = 0;
     return true;
 }
 
 void w_palette_open(const w_palette_site *site, const wchar_t *title, const w_palette_entry *entries, int count,
-                    palette_callback cb, HANDLE app_images, palette_line_callback line_callback) {
+                    palette_callback cb, HANDLE app_images, palette_line_callback line_callback, const w_palette_apps *apps) {
     pending_restore = NULL;
     bool preserve = w_palette_visible(title);
     if (!panel && !w_create_palette()) return;
@@ -841,7 +868,7 @@ void w_palette_open(const w_palette_site *site, const wchar_t *title, const w_pa
         wcscpy(old_label,rows[selected].entry.label);
         wcscpy(old_alias,rows[selected].alias);
     }
-    if (!w_cache(entries,count)) {
+    if (!w_cache(entries,count,apps) && (!apps || !apps->count || !w_cache(entries,count,NULL))) {
         select_entry = NULL;
         run_line = NULL;
         w_dismiss(true);
@@ -922,19 +949,23 @@ void w_palette_position(const w_palette_site *site) {
         bounds.bottom = bounds.top + height;
     }
     bool opening = !w_palette_shown();
+    bool was_attached=placement.anchor.bar!=NULL;
     closing = false;
     placement = *site;
     LONG_PTR style = GetWindowLongPtrW(panel,GWL_STYLE);
-    LONG_PTR ex = GetWindowLongPtrW(panel,GWL_EXSTYLE) & ~(LONG_PTR)(WS_EX_TRANSPARENT|WS_EX_NOACTIVATE);
-    SetWindowLongPtrW(panel, GWL_STYLE, attached ? style & ~(LONG_PTR)WS_THICKFRAME : style | WS_THICKFRAME);
-    SetWindowLongPtrW(panel, GWL_EXSTYLE, attached ? ex | WS_EX_LAYERED : ex & ~(LONG_PTR)WS_EX_LAYERED);
-    KillTimer(panel, bar_fade_timer);
+    LONG_PTR next_style=attached ? style & ~(LONG_PTR)WS_THICKFRAME : style | WS_THICKFRAME;
+    LONG_PTR ex=GetWindowLongPtrW(panel,GWL_EXSTYLE);
+    LONG_PTR next_ex=ex & ~(LONG_PTR)(WS_EX_TRANSPARENT|WS_EX_NOACTIVATE);
+    if (next_style!=style) SetWindowLongPtrW(panel,GWL_STYLE,next_style);
+    if (next_ex!=ex) SetWindowLongPtrW(panel,GWL_EXSTYLE,next_ex);
+    if (attached!=was_attached) w_theme_material(panel);
+    KillTimer(panel, layer_fade_timer);
     if (attached) {
         DWORD corner = DWMWCP_ROUND;
         DwmSetWindowAttribute(panel, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
-        fade.value = opening ? 0 : 255;
-        w_bar_fade(panel, &fade, 255, site->enter, opening && site->enter.ms > 0);
     }
+    fade.value=attached && opening ? 0 : 255;
+    w_layer_fade_to(panel,&fade,255,site->enter,attached && opening && site->enter.ms>0);
     SetWindowPos(panel,HWND_TOPMOST,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,
                  SWP_SHOWWINDOW|SWP_NOACTIVATE|SWP_FRAMECHANGED);
 }

@@ -17,7 +17,7 @@ typedef struct w_window_rule {
     int workspace, output, layout;
     uint32_t border;
     bool colored;
-    bool floating, exclude, exact_match, sets_floating;
+    bool floating, exclude, sets_floating;
 } w_window_rule;
 
 typedef struct w_app_entry {
@@ -57,7 +57,25 @@ typedef struct w_transition { int ms; w_curve curve; enum motion_style style; in
 double w_motion_progress(w_transition timing, uint64_t elapsed);
 typedef struct w_border_gradient { uint32_t end; int angle; bool enabled; } w_border_gradient;
 
+enum w_mouse_action { mouse_unbound, mouse_move, mouse_resize, mouse_inherit };
+
+enum w_notice_corner { notice_top_right, notice_top_left, notice_bottom_right, notice_bottom_left };
+enum w_capture_source { notice_capture_off, notice_capture_windows, notice_capture_visible };
+enum { notice_history_max = 512, notice_visible_max = 8 };
+typedef struct w_notification_config {
+    bool enabled;
+    enum w_capture_source capture;
+    int corner, duration_ms, fade_ms, history_limit, visible_limit, margin, width;
+} w_notification_config;
+
+typedef struct w_panel_material {
+    int opacity;
+    bool blur, shadow;
+} w_panel_material;
+
 typedef struct w_desktop_config {
+    w_notification_config notifications;
+    w_panel_material panel_material;
     w_startup_entry startup[32];
     int startup_count;
     w_module_style styles[48];
@@ -82,8 +100,7 @@ typedef struct w_desktop_config {
     unsigned char inactive_alpha;
     uint32_t inactive_border;
     bool follow_mouse, master_default, resize_on_border;
-    unsigned drag_mods;
-    bool inverse_drag;
+    unsigned char mouse_actions[2][16]; // Left/right button, then modifier mask.
     uint32_t background, foreground, accent;
 } w_desktop_config;
 
@@ -99,6 +116,5 @@ bool w_config_style_option(w_module_style *style, const char *key, const char *v
 bool w_config_bind(w_desktop_config *cfg, const char *chord, const char *action);
 void w_config_defaults(w_desktop_config *cfg);
 bool w_config_chord(const char *text, unsigned *mods, unsigned *key);
-bool w_config_parse(w_desktop_config *out, const char *source, char *error, size_t cap);
-bool w_config_merge(w_desktop_config *out, const char *source, char *error, size_t cap);
 bool w_config_validate_providers(const w_desktop_config *c, char *error, size_t cap);
+bool w_config_notifications_valid(const w_notification_config *config);

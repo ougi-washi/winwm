@@ -1,5 +1,6 @@
 #pragma once
 #include "bar/icons.h"
+#include "win_platform/layer.h"
 #include "win_platform/popup.h"
 
 ////////////////
@@ -13,14 +14,13 @@ typedef struct w_bar_view {
 
 typedef void (*bar_action)(int output, const char *action, const w_popup_anchor *anchor);
 typedef bool (*bar_custom)(const char *name, wchar_t *text, int cap, char *action, size_t action_cap);
-enum { bar_fade_timer = 0x574d, bar_modules_timer, bar_tip_show_timer, bar_tip_hide_timer };
-typedef struct w_layer_fade {
-    uint64_t start;
-    BYTE from, value, target;
-    w_transition timing;
-} w_layer_fade;
-bool w_bar_fade(HWND hwnd, w_layer_fade *fade, BYTE target, w_transition timing, bool enabled);
-bool w_bar_fade_tick(HWND hwnd, w_layer_fade *fade, bool enabled);
+typedef struct w_bar_tray_item {
+    uint64_t key;
+    HICON icon;
+    wchar_t tooltip[256];
+} w_bar_tray_item;
+enum { bar_modules_timer = layer_fade_timer + 1, bar_tip_show_timer, bar_tip_hide_timer, bar_tray_timer };
+enum { bar_tray_slots = 8 };
 typedef struct w_bar_window {
     HWND hwnd;
     struct w_bar_access *access;
@@ -39,7 +39,7 @@ typedef struct w_bar_window {
         HWND window;
         int index, workspace;
         char instance[56];
-        wchar_t heading[96], body[512], help[320];
+        wchar_t heading[256], body[512], help[320];
         HKL keyboard_layout;
         wchar_t keyboard_name[208];
         RECT parts[3];
@@ -64,6 +64,9 @@ typedef struct w_bar_window {
         const w_module_style *style;
         int workspace, source;
         bar_icon icon;
+        uint64_t tray_key;
+        int tray_index;
+        bool tray_more, tray_hide_tip;
         bool active, empty, label, painted;
         uint64_t start;
         COLORREF paper, ink, from_paper, from_ink, target_paper, target_ink;
@@ -73,6 +76,18 @@ typedef struct w_bar_window {
     bar_action invoke;
     bar_custom custom;
     bool (*detail)(const char *module, wchar_t *text, int cap);
+    int (*tray_count)(void);
+    bool (*tray_read)(int index, w_bar_tray_item *item);
+    void (*tray_activate)(uint64_t key, UINT event, POINT screen_point);
+    struct {
+        int source, suppressed, first, page, total;
+        bool open;
+        double position, from;
+        ULONGLONG start;
+        uint64_t context_key;
+        UINT context_button;
+        RECT strip;
+    } tray;
 } w_bar_window;
 
 ////////////////
@@ -85,6 +100,7 @@ void w_bar_set_audio(w_bar_window *b, int percent, bool muted);
 void w_bar_update(w_bar_window *b, const w_bar_view *v);
 bool w_bar_activate_hit(w_bar_window *bar, int hit);
 bool w_bar_anchor(const w_bar_window *bar, int hit, w_popup_anchor *anchor);
+bool w_bar_tray_bounds(const w_bar_window *bar, uint64_t key, RECT *screen);
 void w_bar_invoke(w_bar_window *bar, int hit, const char *action);
 
 bool w_bar_menu_active(void);

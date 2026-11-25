@@ -5,6 +5,9 @@
 //~ Catalog
 
 void w_catalog_begin(HWND target, UINT updated);
+void w_catalog_invalidate(void);
+bool w_catalog_shell_event(WPARAM notification, LPARAM process);
+void w_catalog_end(void);
 typedef struct w_catalog_state w_catalog_state;
 w_catalog_state *w_catalog_acquire(void);
 void w_catalog_release(w_catalog_state *snapshot);

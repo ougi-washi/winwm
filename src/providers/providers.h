@@ -14,7 +14,7 @@ typedef struct w_provider_value {
 //~ Providers Interface
 
 void w_providers_configure(HWND owner, UINT message, const w_desktop_config *config);
-void w_providers_tick(void);
+bool w_providers_tick(void);
 bool w_providers_value(const char *name, w_provider_value *out, char *action, size_t cap);
 void w_providers_refresh(void);
 void w_providers_stop(void);

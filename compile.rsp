@@ -7,6 +7,7 @@
 -D_WIN32_WINNT=0x0a00
 -D_CRT_SECURE_NO_WARNINGS
 -Isrc
+-Ithird_party/lua
 -ffunction-sections
 -municode
 -mwindows

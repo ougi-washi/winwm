@@ -50,6 +50,9 @@ static const w_vertex clipboard[]={{9,4},{9,2},{15,2},{15,6},{9,6},{9,4},{-1,0},
     {8,4},{5,4},{5,21},{19,21},{19,4},{16,4},{-1,0},{9,11},{15,11},{-1,0},{9,15},{13,15}};
 static const w_vertex bell[]={{4,17},{6,14},{6,10},{7,6},{9,4},{12,3},{15,4},{17,6},
     {18,10},{18,14},{20,17},{4,17},{-1,0},{9,20},{11,21},{13,21},{15,20}};
+static const w_vertex left[]={{15,5},{8,12},{15,19}},right[]={{9,5},{16,12},{9,19}};
+static const w_vertex up[]={{5,15},{12,8},{19,15}},down[]={{5,9},{12,16},{19,9}};
+static const w_vertex more[]={{4,12},{6,12},{-1,0},{11,12},{13,12},{-1,0},{18,12},{20,12}};
 static const w_vertex plug[] = {{8, 3}, {8, 8}, {-1,0}, {16, 3}, {16, 8}, {-1,0}, {5, 8}, {19, 8},
                                 {18, 14}, {15, 17}, {9, 17}, {6, 14}, {5, 8}, {-1,0}, {12,17}, {12,22}};
 static const w_vertex ethernet[] = {{3,5},{21,5},{21,16},{17,16},{17,20},{7,20},{7,16},{3,16},{3,5},
@@ -130,7 +133,10 @@ void w_icons_resize(w_icon_atlas *atlas, int dpi) {
                       [icon_plug] = {plug, count_of(plug)},
                       [icon_quiet] = {speaker, count_of(speaker)},
                       [icon_ethernet] = {ethernet, count_of(ethernet)},
-                      [icon_offline] = {offline, count_of(offline)}};
+                      [icon_offline] = {offline, count_of(offline)},
+                      [icon_left] = {left,count_of(left)}, [icon_right] = {right,count_of(right)},
+                      [icon_up] = {up,count_of(up)}, [icon_down] = {down,count_of(down)},
+                      [icon_more] = {more,count_of(more)}};
         for (int i = 1; i < icon_count; ++i) {
             PatBlt(dc, 0, 0, width, width, BLACKNESS);
             w_stroke(dc, shapes[i].path, shapes[i].count, width);
@@ -176,9 +182,13 @@ void w_icons_draw(const w_icon_atlas *atlas, HDC dc, bar_icon icon, RECT box, CO
                                      .biPlanes = 1,
                                      .biBitCount = 32,
                                      .biCompression = BI_RGB}};
-    int saved = SaveDC(dc);
-    IntersectClipRect(dc, box.left, box.top, box.right, box.bottom);
+    int saved = 0;
+    if (box.right - box.left < n || box.bottom - box.top < n) {
+        saved = SaveDC(dc);
+        if (!saved) return;
+        IntersectClipRect(dc, box.left, box.top, box.right, box.bottom);
+    }
     SetDIBitsToDevice(dc, (box.left + box.right - n) / 2, (box.top + box.bottom - n) / 2, n, n, 0, 0, 0, n,
                       atlas->pixels, &info, DIB_RGB_COLORS);
-    RestoreDC(dc, saved);
+    if (saved) RestoreDC(dc, saved);
 }

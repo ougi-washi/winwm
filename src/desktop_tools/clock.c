@@ -10,6 +10,15 @@ static DYNAMIC_TIME_ZONE_INFORMATION *zones;
 static DWORD zone_count;
 static HFONT font, time_font;
 
+enum { zone_list_ready = WM_APP + 1 };
+typedef struct {
+    LONG refs, cancelled;
+    HWND window;
+    DYNAMIC_TIME_ZONE_INFORMATION *rows;
+    DWORD count;
+} w_zone_query;
+static w_zone_query *zone_query;
+
 static void w_calendar_colors(void) {
     HIGHCONTRASTW hc = {.cbSize=sizeof(hc)};
     bool contrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(hc),&hc,0) && (hc.dwFlags&HCF_HIGHCONTRASTON);
@@ -69,26 +78,84 @@ static void w_clock_layout(HWND window) {
                  SWP_NOACTIVATE|SWP_NOMOVE|SWP_NOZORDER);
 }
 
-static void w_zone_choices(void) {
-    if (zone_count) return;
+static void w_release_zone_query(w_zone_query *query) {
+    if (!InterlockedDecrement(&query->refs)) {
+        free(query->rows);
+        free(query);
+    }
+}
+
+static DWORD WINAPI w_enumerate_zones(void *arg) {
+    w_zone_query *query = arg;
+    DWORD capacity = 0;
+    while (!InterlockedCompareExchange(&query->cancelled,0,0)) {
+        DYNAMIC_TIME_ZONE_INFORMATION entry;
+        DWORD error = EnumDynamicTimeZoneInformation(query->count,&entry);
+        if (error != ERROR_SUCCESS) {
+            if (error != ERROR_NO_MORE_ITEMS) query->count = 0;
+            break;
+        }
+        if (query->count == capacity) {
+            capacity = capacity ? capacity * 2 : 64;
+            void *rows = realloc(query->rows,(size_t)capacity * sizeof(entry));
+            if (!rows) { query->count = 0; break; }
+            query->rows = rows;
+        }
+        query->rows[query->count++] = entry;
+    }
+    if (!InterlockedCompareExchange(&query->cancelled,0,0))
+        PostMessageW(query->window,zone_list_ready,0,(LPARAM)query);
+    w_release_zone_query(query);
+    return 0;
+}
+
+static void w_load_zones(HWND window) {
+    if (zone_count || zone_query) return;
+    w_zone_query *query = calloc(1,sizeof(*query));
+    if (query) {
+        query->refs = 2;
+        query->window = window;
+        if (QueueUserWorkItem(w_enumerate_zones,query,WT_EXECUTEDEFAULT)) {
+            zone_query = query;
+            SetWindowTextW(zone_label,L"Loading time zones…");
+            return;
+        }
+        free(query);
+    }
+    SetWindowTextW(zone_label,L"Time zones unavailable");
+}
+
+static void w_zone_choices(w_zone_query *query) {
+    zone_query = NULL;
+    zone_count = query->count;
+    zones = query->rows;
+    query->rows = NULL;
+    w_release_zone_query(query);
+    if (!zone_count) {
+        free(zones);
+        zones = NULL;
+        SetWindowTextW(zone_label,L"Time zones unavailable");
+        return;
+    }
+    SetWindowTextW(zone_label,L"Time zone");
     DYNAMIC_TIME_ZONE_INFORMATION current = {0};
     GetDynamicTimeZoneInformation(&current);
+    // The native list fixes its height when opened (often with just the
+    // current zone). Reopen it at the new item count for the first click.
+    bool dropped = SendMessageW(zone,CB_GETDROPPEDSTATE,0,0) != 0;
+    if (dropped) SendMessageW(zone,CB_SHOWDROPDOWN,FALSE,0);
     SendMessageW(zone, WM_SETREDRAW, FALSE, 0);
-    for (DWORD i = 0; ; ++i) {
-        DYNAMIC_TIME_ZONE_INFORMATION entry;
-        if (EnumDynamicTimeZoneInformation(i, &entry) != ERROR_SUCCESS) break;
-        DYNAMIC_TIME_ZONE_INFORMATION *next = realloc(zones, (zone_count + 1) * sizeof(*zones));
-        if (!next) break;
-        zones = next;
-        if (!zone_count) SendMessageW(zone, CB_RESETCONTENT, 0, 0);
-        LRESULT row = SendMessageW(zone, CB_ADDSTRING, 0, (LPARAM)entry.StandardName);
+    SendMessageW(zone, CB_RESETCONTENT, 0, 0);
+    SendMessageW(zone, CB_INITSTORAGE, zone_count, zone_count * sizeof(current.StandardName));
+    for (DWORD i = 0; i < zone_count; ++i) {
+        LRESULT row = SendMessageW(zone, CB_ADDSTRING, 0, (LPARAM)zones[i].StandardName);
         if (row < 0) continue;
-        zones[zone_count] = entry;
-        SendMessageW(zone, CB_SETITEMDATA, row, zone_count++);
-        if (!wcscmp(current.TimeZoneKeyName, entry.TimeZoneKeyName))
+        SendMessageW(zone, CB_SETITEMDATA, row, i);
+        if (!wcscmp(current.TimeZoneKeyName, zones[i].TimeZoneKeyName))
             SendMessageW(zone, CB_SETCURSEL, row, 0);
     }
     SendMessageW(zone, WM_SETREDRAW, TRUE, 0);
+    if (dropped) SendMessageW(zone,CB_SHOWDROPDOWN,TRUE,0);
     InvalidateRect(zone, NULL, TRUE);
     EnableWindow(save_zone, FALSE);
 }
@@ -113,6 +180,10 @@ static BOOL w_zone_apply(const DYNAMIC_TIME_ZONE_INFORMATION *value) {
 static LRESULT CALLBACK w_clock_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     LRESULT result;
     if (w_theme_message(w, msg, wp, lp, &result)) return result;
+    if (msg == zone_list_ready) {
+        if (zone_query && zone_query == (w_zone_query *)lp) w_zone_choices(zone_query);
+        return 0;
+    }
     if (msg == WM_COMMAND && today && (HWND)lp == today && HIWORD(wp) == BN_CLICKED) {
         SYSTEMTIME now;
         GetLocalTime(&now);
@@ -120,12 +191,12 @@ static LRESULT CALLBACK w_clock_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == WM_COMMAND && (HWND)lp == zone && HIWORD(wp) == CBN_SELCHANGE) {
-        EnableWindow(save_zone, TRUE);
+        EnableWindow(save_zone, zone_count != 0);
         return 0;
     }
     if (msg == WM_COMMAND && zone && (HWND)lp == zone &&
         (HIWORD(wp) == CBN_SETFOCUS || HIWORD(wp) == CBN_DROPDOWN)) {
-        w_zone_choices();
+        w_load_zones(w);
         return 0;
     }
     if (msg == WM_COMMAND && LOWORD(wp) == IDCANCEL && !lp) {
@@ -152,7 +223,15 @@ static LRESULT CALLBACK w_clock_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         w_clock_layout(w);
         return 0;
     }
-    if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
+    if (msg == WM_DESTROY) {
+        if (zone_query) {
+            InterlockedExchange(&zone_query->cancelled,1);
+            w_release_zone_query(zone_query);
+            zone_query = NULL;
+        }
+        PostQuitMessage(0);
+        return 0;
+    }
     return DefWindowProcW(w, msg, wp, lp);
 }
 

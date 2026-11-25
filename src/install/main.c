@@ -1,5 +1,5 @@
 #define WIN32_LEAN_AND_MEAN
-#include <windows.h>
+#include "os_win32/os_win32.h"
 #include <shlobj.h>
 #include <shellapi.h>
 #include <stdbool.h>
@@ -16,13 +16,11 @@ enum operation { op_install, op_uninstall, op_rollback };
 
 static const wchar_t *const slot_dirs[slot_count] = {L"shell-a", L"shell-b", L"shell-c"};
 static const wchar_t *const previous_values[slot_count] = {L"StartupPreviousA", L"StartupPreviousB", L"StartupPreviousC"};
-static const wchar_t *const legacy_previous[slot_count] = {L"PreviousA", L"PreviousB", L"PreviousC"};
 static const wchar_t install_key[] = L"Software\\winwm\\Install";
 static const wchar_t run_key[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 static const wchar_t run_name[] = L"winwm";
 typedef wchar_t path_string[path_cap];
 
-static const wchar_t policy_key[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System";
 typedef struct w_install_paths {
     path_string root, source_shell, source_setup, source_recovery;
     path_string slot[slot_count], shell[slot_count], command[slot_count], setup[slot_count], recovery[slot_count];
@@ -203,64 +201,61 @@ static DWORD w_validate(const wchar_t *exe, const wchar_t *directory) {
 //~ Release activation and rollback
 
 // The live slot and its predecessor remain readable throughout an interrupted update.
-static DWORD w_previous_slot(int current, const wchar_t *const names[], int *previous) {
-    *previous = -1;
-    if (current < 0)
-        return ERROR_SUCCESS;
-    DWORD value, bytes = sizeof(value);
-    LSTATUS error = RegGetValueW(HKEY_CURRENT_USER, install_key, names[current], RRF_RT_REG_DWORD,
-                                 NULL, &value, &bytes);
-    if (w_absent(error))
-        return ERROR_SUCCESS;
-    if (error)
-        return error;
-    if (value >= slot_count || (int)value == current)
-        return ERROR_INVALID_DATA;
-    *previous = (int)value;
+static DWORD w_release_history(int current, bool owned[slot_count], int *previous) {
+    *previous = absent_slot;
+    if (current >= 0) owned[current] = true;
+    for (int i = 0; i < slot_count; ++i) {
+        DWORD value, bytes = sizeof(value);
+        LSTATUS error = RegGetValueW(HKEY_CURRENT_USER,install_key,previous_values[i],RRF_RT_REG_DWORD,
+                                     NULL,&value,&bytes);
+        if (w_absent(error)) continue;
+        if (error) return error;
+        // slot_count identifies an installed release with no predecessor.
+        if (value > slot_count || (int)value == i) return ERROR_INVALID_DATA;
+        owned[i] = true;
+        if (value < slot_count) {
+            owned[value] = true;
+            if (i == current) *previous = (int)value;
+        }
+    }
     return ERROR_SUCCESS;
 }
 
-static DWORD w_activate(const w_install_paths *p, int current, int slot, bool migrate) {
-    int observed;
-    DWORD error = w_registered_slot(p,run_key,run_name,&observed);
-    if (error || observed != current)
-        return error ? error : ERROR_REVISION_MISMATCH;
-    if (wcslen(p->command[slot]) > 260) return ERROR_FILENAME_EXCED_RANGE;
-    if (current >= 0 && current != slot) {
-        DWORD previous = (DWORD)current;
-        error = RegSetKeyValueW(HKEY_CURRENT_USER, install_key, previous_values[slot], REG_DWORD, &previous,
-                                sizeof(previous));
-    } else if (current < 0) {
-        error = RegDeleteKeyValueW(HKEY_CURRENT_USER, install_key, previous_values[slot]);
-        if (w_absent(error))
-            error = ERROR_SUCCESS;
+static bool w_slot_empty(const w_install_paths *p, int slot) {
+    const wchar_t *files[] = {p->shell[slot],p->setup[slot],p->recovery[slot]};
+    for (size_t i = 0; i < length_of(files); ++i) {
+        if (GetFileAttributesW(files[i]) != INVALID_FILE_ATTRIBUTES || !w_absent(GetLastError())) return false;
     }
-    if (error)
-        return error;
-    // Retire a legacy shell before enabling startup. An interrupted migration
-    // leaves Explorer as the desktop at the next sign-in.
-    if (migrate) error = w_remove_owned(p,policy_key,L"Shell");
-    if (error || current == slot) return error;
-    return RegSetKeyValueW(HKEY_CURRENT_USER, run_key, run_name, REG_SZ, p->command[slot],
-                           (DWORD)((wcslen(p->command[slot]) + 1) * sizeof(wchar_t)));
+    return true;
 }
 
+static DWORD w_activate(const w_install_paths *p, int current, int slot) {
+    DWORD error = w_os_startup_shell();
+    if (error) return error;
+    int observed;
+    error = w_registered_slot(p,run_key,run_name,&observed);
+    if (error || observed != current) return error ? error : ERROR_REVISION_MISMATCH;
+    if (current == slot) return ERROR_SUCCESS;
+    if (wcslen(p->command[slot]) > 260) return ERROR_FILENAME_EXCED_RANGE;
+    DWORD previous = current < 0 ? slot_count : (DWORD)current;
+    error = RegSetKeyValueW(HKEY_CURRENT_USER,install_key,previous_values[slot],REG_DWORD,&previous,sizeof(previous));
+    if (error) return error;
+    return RegSetKeyValueW(HKEY_CURRENT_USER,run_key,run_name,REG_SZ,p->command[slot],
+                           (DWORD)((wcslen(p->command[slot])+1)*sizeof(wchar_t)));
+}
 static DWORD w_select_release(const w_install_paths *p, int current, bool rollback) {
     if (current == foreign_slot) return ERROR_ALREADY_ASSIGNED;
-    int previous = -1;
-    DWORD error = w_previous_slot(current,previous_values,&previous);
-    if (error)
-        return error;
+    DWORD error = w_os_startup_shell();
+    if (error) return error;
+    bool owned[slot_count] = {false};
+    int previous;
+    error = w_release_history(current,owned,&previous);
+    if (error) return error;
     int slot = previous;
     if (rollback) {
         if (previous < 0)
             return ERROR_NOT_FOUND;
     } else {
-        int legacy, keep_legacy = -1;
-        error = w_registered_slot(p,policy_key,L"Shell",&legacy);
-        if (!error && current < 0 && legacy >= 0)
-            error = w_previous_slot(legacy,legacy_previous,&keep_legacy);
-        if (error) return error;
         bool identical = false;
         if (current >= 0) {
             error = w_files_equal(p->source_shell, p->shell[current], &identical);
@@ -272,8 +267,16 @@ static DWORD w_select_release(const w_install_paths *p, int current, bool rollba
         slot = current;
         if (!identical) {
             slot = 0;
-            while (slot < slot_count && (slot == current || slot == previous || slot == legacy || slot == keep_legacy)) ++slot;
+            while (slot < slot_count && (slot == current || slot == previous ||
+                                         (!owned[slot] && !w_slot_empty(p,slot)))) ++slot;
             if (slot == slot_count) return ERROR_BUSY;
+        }
+        if (!owned[slot]) {
+            // Record the empty slot before copying. A partial stage remains retryable.
+            DWORD none = slot_count;
+            error = RegSetKeyValueW(HKEY_CURRENT_USER,install_key,previous_values[slot],
+                                    REG_DWORD,&none,sizeof(none));
+            if (error) return error;
         }
         error = w_create_directory(p->slot[slot]);
         if (!error)
@@ -285,26 +288,37 @@ static DWORD w_select_release(const w_install_paths *p, int current, bool rollba
     }
     if (!error)
         error = w_validate(p->shell[slot], p->slot[slot]);
-    return error ? error : w_activate(p, current, slot,!rollback);
+    return error ? error : w_activate(p,current,slot);
 }
 
-static DWORD w_uninstall(const w_install_paths *p, bool *files_busy) {
-    DWORD error = w_remove_owned(p,policy_key,L"Shell");
-    if (!error) error = w_remove_owned(p,run_key,run_name);
+static DWORD w_uninstall(const w_install_paths *p, int current, bool *files_busy) {
+    bool owned[slot_count] = {false};
+    int previous;
+    DWORD error = w_release_history(current,owned,&previous);
     if (error) return error;
-    for (int i = 0; i < slot_count; i++) {
-        const wchar_t *owned[] = {p->shell[i], p->setup[i], p->recovery[i]};
-        for (size_t j = 0; j < length_of(owned); j++) {
-            if (!DeleteFileW(owned[j]) && !w_absent(GetLastError()))
-                *files_busy = true;
+    error = w_remove_owned(p,run_key,run_name);
+    if (error) return error;
+    for (int i = 0; i < slot_count; ++i) {
+        if (!owned[i]) continue;
+        const wchar_t *files[] = {p->shell[i],p->setup[i],p->recovery[i]};
+        bool busy = false;
+        for (size_t j = 0; j < length_of(files); ++j) {
+            if (!DeleteFileW(files[j]) && !w_absent(GetLastError())) busy = true;
         }
-        RemoveDirectoryW(p->slot[i]);
-        RegDeleteKeyValueW(HKEY_CURRENT_USER, install_key, previous_values[i]);
-        RegDeleteKeyValueW(HKEY_CURRENT_USER, install_key, legacy_previous[i]);
+        if (busy) {
+            // Keep ownership after removing Run so a later uninstall can finish.
+            DWORD none = slot_count;
+            error = RegSetKeyValueW(HKEY_CURRENT_USER,install_key,previous_values[i],REG_DWORD,&none,sizeof(none));
+            if (error) return error;
+            *files_busy = true;
+        } else {
+            RemoveDirectoryW(p->slot[i]);
+            error = RegDeleteKeyValueW(HKEY_CURRENT_USER,install_key,previous_values[i]);
+            if (error && !w_absent(error)) return error;
+        }
     }
     return ERROR_SUCCESS;
 }
-
 static DWORD w_change_installation(enum operation op, bool *files_busy) {
     w_install_paths p;
     DWORD error = w_get_paths(&p);
@@ -323,7 +337,7 @@ static DWORD w_change_installation(enum operation op, bool *files_busy) {
     int slot;
     error = w_registered_slot(&p,run_key,run_name,&slot);
     if (!error)
-        error = op == op_uninstall ? w_uninstall(&p, files_busy)
+        error = op == op_uninstall ? w_uninstall(&p,slot,files_busy)
                                    : w_select_release(&p, slot, op == op_rollback);
     CloseHandle(lock);
     return error;
@@ -345,11 +359,14 @@ static void w_report(bool interactive, enum operation op, bool files_busy, DWORD
     case ERROR_NOT_FOUND:
         detail = L"This installation has no previous release to restore.";
         break;
+    case ERROR_BUSY:
+        detail = L"No release slot is free. The current release, its rollback copy, and files outside this installation occupy the available slots.";
+        break;
     case ERROR_ACCESS_DENIED:
         detail = L"Windows denied access to the install directory or this account's startup settings.";
         break;
     case ERROR_ALREADY_ASSIGNED:
-        detail = L"The winwm startup entry belongs to another installation.";
+        detail = L"Another installation controls the startup entry or Windows logon shell.";
         break;
     case ERROR_FILE_NOT_FOUND:
         detail = L"Place winwm.exe and winwm_recovery.exe beside winwm_install.exe and retry.";

@@ -1,6 +1,7 @@
 #include "desktop_tools/entry.h"
 #include "desktop_tools/tools.h"
-#include "bar/bar.h"
+#include "win_platform/layer.h"
+#include "win_platform/popup.h"
 #include "theme/theme.h"
 #include <commctrl.h>
 #include <dwmapi.h>
@@ -204,7 +205,7 @@ static LRESULT CALLBACK w_popup_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UIN
             closing = true;
             if (framed && IsWindowVisible(w)) {
                 SetWindowLongPtrW(w,GWL_EXSTYLE,GetWindowLongPtrW(w,GWL_EXSTYLE)|WS_EX_TRANSPARENT);
-                if (w_bar_fade(w,&fade,0,leave,motion)) return 0;
+                if (w_layer_fade_to(w,&fade,0,leave,motion)) return 0;
             }
         }
         LRESULT result = DefSubclassProc(w,msg,wp,lp);
@@ -212,12 +213,12 @@ static LRESULT CALLBACK w_popup_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UIN
             closing = false;
             if (framed) {
                 SetWindowLongPtrW(w,GWL_EXSTYLE,GetWindowLongPtrW(w,GWL_EXSTYLE)&~(LONG_PTR)WS_EX_TRANSPARENT);
-                w_bar_fade(w,&fade,255,enter,motion);
+                w_layer_fade_to(w,&fade,255,enter,motion);
             }
         } else w_release_popup();
         return result;
-    } else if (msg == WM_TIMER && wp == bar_fade_timer) {
-        if (!w_bar_fade_tick(w,&fade,motion) && closing) PostMessageW(w,WM_CLOSE,0,0);
+    } else if (msg == WM_TIMER && wp == layer_fade_timer) {
+        if (!w_layer_fade_tick(w,&fade,motion) && closing) PostMessageW(w,WM_CLOSE,0,0);
         return 0;
     } else if (msg == WM_NCDESTROY) {
         if (modal_hook) UnhookWinEvent(modal_hook);
@@ -259,12 +260,14 @@ static bool w_attach(HWND w, bool tool_frame) {
 }
 
 bool w_tool_show(HWND w) {
+    w_theme_follow(w);
     if (anchor.bar) {
         if (!w_attach(w,true)) {
             PostMessageW(w,WM_CLOSE,0,0);
             return false;
         }
-        w_bar_fade(w,&fade,255,enter,motion);
+        w_theme_material(w);
+        w_layer_fade_to(w,&fade,255,enter,motion);
     }
     ShowWindow(w,SW_SHOW);
     if (anchor.bar) SetForegroundWindow(w);

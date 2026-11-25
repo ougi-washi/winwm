@@ -64,8 +64,7 @@ static int w_scale(const w_bar_window *bar, int pixels) {
 
 static void w_menu_colors(w_flyout *menu) {
     const w_desktop_config *cfg = menu->bar->config;
-    HIGHCONTRASTW hc = {.cbSize = sizeof(hc)};
-    bool contrast = SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(hc),&hc,0) && (hc.dwFlags & HCF_HIGHCONTRASTON);
+    bool contrast = menu->bar->high_contrast;
     menu->surface = contrast ? GetSysColor(COLOR_WINDOW) : w_color(cfg->background);
     menu->ink = contrast ? GetSysColor(COLOR_WINDOWTEXT) : w_color(cfg->foreground);
     menu->accent = contrast ? menu->ink : w_color(cfg->accent);
@@ -123,7 +122,7 @@ static void w_dismiss(w_flyout *menu, bool restore) {
     if (restore && had_focus && target && IsWindowVisible(target))
         SetForegroundWindow(target);
     if (GetForegroundWindow() == hwnd ||
-        !w_bar_fade(hwnd,&menu->fade,0,menu->bar->config->motion[motion_layers_out],menu->bar->motion_allowed))
+        !w_layer_fade_to(hwnd,&menu->fade,0,menu->bar->config->motion[motion_layers_out],menu->bar->motion_allowed))
         DestroyWindow(hwnd);
 }
 
@@ -308,8 +307,8 @@ static LRESULT CALLBACK w_flyout_proc(HWND w, UINT message, WPARAM wp, LPARAM lp
         RedrawWindow(w,NULL,NULL,RDW_INVALIDATE|RDW_ALLCHILDREN);
         break;
     case WM_TIMER:
-        if (wp == bar_fade_timer && menu->fade.start &&
-            !w_bar_fade_tick(w,&menu->fade,bar->motion_allowed) && menu->closing)
+        if (wp == layer_fade_timer && menu->fade.start &&
+            !w_layer_fade_tick(w,&menu->fade,bar->motion_allowed) && menu->closing)
             DestroyWindow(w);
         return 0;
     case WM_CLOSE:
@@ -335,6 +334,7 @@ static LRESULT CALLBACK w_flyout_proc(HWND w, UINT message, WPARAM wp, LPARAM lp
         return TRUE;
     case WM_PAINT:
     case WM_PRINTCLIENT: {
+        w_menu_colors(menu);
         PAINTSTRUCT ps;
         HDC dc = message == WM_PAINT ? BeginPaint(w,&ps) : (HDC)wp;
         RECT r;
@@ -492,6 +492,7 @@ static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count
         HRGN shape = CreateRoundRectRgn(0,0,width+1,height+1,2*radius,2*radius);
         if (shape && !SetWindowRgn(popup,shape,FALSE)) DeleteObject(shape);
     }
+    w_theme_material(popup);
     menu->heading = CreateFontW(-w_scale(bar, 15), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     menu->symbols = CreateFontW(-w_scale(bar,15),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
@@ -549,7 +550,7 @@ static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count
     SendMessageW(menu->list, LB_SETCURSEL, selected, 0);
     open_menu = menu;
     InvalidateRect(bar->hwnd,&bar->hits[hit].box,FALSE);
-    w_bar_fade(popup,&menu->fade,255,bar->config->motion[motion_layers_in],bar->motion_allowed);
+    w_layer_fade_to(popup,&menu->fade,255,bar->config->motion[motion_layers_in],bar->motion_allowed);
     ShowWindow(popup, SW_SHOW);
     SetForegroundWindow(popup);
     if (open_menu == menu && IsWindow(popup))

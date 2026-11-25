@@ -19,6 +19,7 @@
 #include <commctrl.h>
 #include <commdlg.h>
 #include <stdio.h>
+#include <string.h>
 #include <wchar.h>
 enum page { page_audio, page_wifi, page_bluetooth, page_display, page_power, page_network };
 
@@ -167,47 +168,51 @@ static LRESULT CALLBACK w_sound_tab_proc(HWND tab, UINT msg, WPARAM wp, LPARAM l
     return DefSubclassProc(tab,msg,wp,lp);
 }
 
+// Some Windows editions omit WLAN AutoConfig. Resolve the system DLL only when Wi-Fi is opened.
+#define WIFI_FUNCTIONS(X) \
+    X(open, WlanOpenHandle) \
+    X(close, WlanCloseHandle) \
+    X(interfaces, WlanEnumInterfaces) \
+    X(profiles, WlanGetProfileList) \
+    X(available, WlanGetAvailableNetworkList) \
+    X(scan, WlanScan) \
+    X(disconnect, WlanDisconnect) \
+    X(notify, WlanRegisterNotification) \
+    X(connect, WlanConnect) \
+    X(save, WlanSaveTemporaryProfile) \
+    X(forget, WlanDeleteProfile) \
+    X(query, WlanQueryInterface) \
+    X(free_memory, WlanFreeMemory)
+
 static struct w_wifi_api {
-    DWORD(WINAPI *open)(DWORD, PVOID, PDWORD, PHANDLE);
-    DWORD(WINAPI *close)(HANDLE, PVOID);
-    DWORD(WINAPI *interfaces)(HANDLE, PVOID, PWLAN_INTERFACE_INFO_LIST *);
-    DWORD(WINAPI *profiles)(HANDLE, const GUID *, PVOID, PWLAN_PROFILE_INFO_LIST *);
-    DWORD(WINAPI *available)(HANDLE, const GUID *, DWORD, PVOID, PWLAN_AVAILABLE_NETWORK_LIST *);
-    DWORD(WINAPI *scan)(HANDLE, const GUID *, const DOT11_SSID *, const WLAN_RAW_DATA *, PVOID);
-    DWORD(WINAPI *disconnect)(HANDLE, const GUID *, PVOID);
-    DWORD(WINAPI *notify)(HANDLE, DWORD, BOOL, WLAN_NOTIFICATION_CALLBACK, PVOID, PVOID, PDWORD);
-    DWORD(WINAPI *connect)(HANDLE, const GUID *, const WLAN_CONNECTION_PARAMETERS *, PVOID);
-    __typeof__(&WlanSaveTemporaryProfile) save;
-    __typeof__(&WlanDeleteProfile) forget;
-    __typeof__(&WlanQueryInterface) query;
-    void(WINAPI *free_memory)(PVOID);
+#define WIFI_MEMBER(field, api) __typeof__(&api) field;
+    WIFI_FUNCTIONS(WIFI_MEMBER)
+#undef WIFI_MEMBER
 } wifi;
 
 ////////////////
 //~ Wireless networks
 
 static bool w_load_wifi(void) {
+    if (wifi.open) return true;
     HMODULE lib = LoadLibraryExW(L"wlanapi.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
-    if (!lib)
+    if (!lib) return false;
+    struct w_wifi_api next;
+#define WIFI_RESOLVE(field, api) { \
+        FARPROC address = GetProcAddress(lib, #api); \
+        _Static_assert(sizeof(next.field) == sizeof(address), "Win32 procedure pointer size"); \
+        memcpy(&next.field, &address, sizeof(address)); \
+    }
+    WIFI_FUNCTIONS(WIFI_RESOLVE)
+#undef WIFI_RESOLVE
+    if (!next.open || !next.close || !next.interfaces || !next.profiles || !next.connect || !next.free_memory) {
+        FreeLibrary(lib);
         return false;
-    wifi.open = (DWORD(WINAPI *)(DWORD, PVOID, PDWORD, PHANDLE))GetProcAddress(lib, "WlanOpenHandle");
-    wifi.close = (DWORD(WINAPI *)(HANDLE, PVOID))GetProcAddress(lib, "WlanCloseHandle");
-    wifi.interfaces = (DWORD(WINAPI *)(HANDLE, PVOID, PWLAN_INTERFACE_INFO_LIST *))GetProcAddress(
-        lib, "WlanEnumInterfaces");
-    wifi.profiles = (DWORD(WINAPI *)(HANDLE, const GUID *, PVOID, PWLAN_PROFILE_INFO_LIST *))GetProcAddress(
-        lib, "WlanGetProfileList");
-    wifi.available = (__typeof__(wifi.available))GetProcAddress(lib, "WlanGetAvailableNetworkList");
-    wifi.scan = (__typeof__(wifi.scan))GetProcAddress(lib, "WlanScan");
-    wifi.disconnect = (__typeof__(wifi.disconnect))GetProcAddress(lib, "WlanDisconnect");
-    wifi.notify = (__typeof__(wifi.notify))GetProcAddress(lib, "WlanRegisterNotification");
-    wifi.connect = (DWORD(WINAPI *)(HANDLE, const GUID *, const WLAN_CONNECTION_PARAMETERS *,
-                                    PVOID))GetProcAddress(lib, "WlanConnect");
-    wifi.save = (__typeof__(wifi.save))GetProcAddress(lib, "WlanSaveTemporaryProfile");
-    wifi.forget = (__typeof__(wifi.forget))GetProcAddress(lib, "WlanDeleteProfile");
-    wifi.query = (__typeof__(wifi.query))GetProcAddress(lib, "WlanQueryInterface");
-    wifi.free_memory = (void(WINAPI *)(PVOID))GetProcAddress(lib, "WlanFreeMemory");
-    return wifi.open && wifi.close && wifi.interfaces && wifi.profiles && wifi.connect && wifi.free_memory;
+    }
+    wifi = next;
+    return true;
 }
+#undef WIFI_FUNCTIONS
 
 enum { wifi_result = WM_APP + 1, wifi_scan_done };
 
@@ -241,7 +246,7 @@ static void w_wifi_items(bool scan) {
     if (!wlan) {
         DWORD version = 0;
         DWORD error = ERROR_NOT_SUPPORTED;
-        if ((wifi.open || w_load_wifi()) && wifi.close && wifi.interfaces && wifi.profiles && wifi.connect && wifi.free_memory)
+        if (w_load_wifi())
             error = wifi.open(2, NULL, &version, &wlan);
         if (error != ERROR_SUCCESS) {
             w_show_network_problems(true);
@@ -852,6 +857,8 @@ int w_settings_run(const wchar_t *name) {
             SetTimer(window, 2, 1000, NULL);
         } else if (page == page_wifi || page == page_network)
             w_open_network_page(page);
+        else if (page == page_display) w_display_start();
+        else if (page == page_power) w_power_start();
         else if (page == page_bluetooth) {
             w_bluetooth_open(window, list, status, apply, lower);
             SendMessageW(list, LB_SETCURSEL, 0, 0);
@@ -861,12 +868,22 @@ int w_settings_run(const wchar_t *name) {
     }
     MSG m;
     for (;;) {
-        HANDLE inquiry = w_bluetooth_pending();
-        if (inquiry) {
-            DWORD wait = MsgWaitForMultipleObjectsEx(1, &inquiry, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
-            if (wait == WAIT_OBJECT_0) {
-                w_bluetooth_finish();
-                w_size_controls(false);
+        HANDLE jobs[2];
+        int count = 0;
+        if (page == page_display) count = w_display_pending(jobs);
+        else {
+            jobs[0] = page == page_power ? w_power_pending() : w_bluetooth_pending();
+            count = jobs[0] != NULL;
+        }
+        if (count) {
+            DWORD wait = MsgWaitForMultipleObjectsEx(count,jobs,INFINITE,QS_ALLINPUT,MWMO_INPUTAVAILABLE);
+            if (wait < WAIT_OBJECT_0+(DWORD)count) {
+                if (page == page_display) w_display_finish(jobs[wait-WAIT_OBJECT_0]);
+                else if (page == page_power) w_power_finish();
+                else {
+                    w_bluetooth_finish();
+                    w_size_controls(false);
+                }
                 continue;
             }
             if (wait == WAIT_FAILED) break;
@@ -878,7 +895,7 @@ int w_settings_run(const wchar_t *name) {
             for (size_t i = 0; i < position_count && !dropped; ++i)
                 dropped = positions[i].dropdown_height && SendMessageW(positions[i].control, CB_GETDROPPEDSTATE, 0, 0);
             if (dropped) DispatchMessageW(&m);
-            else DestroyWindow(window);
+            else SendMessageW(window,WM_CLOSE,0,0);
             continue;
         }
         if (m.message == WM_KEYDOWN && m.wParam == VK_RETURN && m.hwnd == list) {

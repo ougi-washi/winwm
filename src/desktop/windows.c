@@ -1,4 +1,5 @@
 #include "desktop/desktop.h"
+#include "desktop/tray.h"
 #include "providers/audio.h"
 #include <dwmapi.h>
 #include <shellscalingapi.h>
@@ -9,15 +10,30 @@
 //~ Windows
 
 static bool owned_visibility_dirty;
+static unsigned title_outputs;
+static struct w_hwnd_slot {
+    HWND hwnd;
+    int slot;
+} by_handle[window_limit];
+static int handle_count;
 
 ////////////////
 //~ Windows Functions
 
+// Keep lookups entirely local, including destroy notifications after HWND teardown.
+static int w_handle_position(HWND w) {
+    int low = 0, high = handle_count;
+    while (low < high) {
+        int mid = low + (high - low) / 2;
+        if ((uintptr_t)by_handle[mid].hwnd < (uintptr_t)w) low = mid + 1;
+        else high = mid;
+    }
+    return low;
+}
+
 int w_desktop_find(HWND w) {
-    for (int i = 0; i < window_limit; i++)
-        if (desk.windows[i].hwnd == w && desk.model.windows[i].live)
-            return i;
-    return -1;
+    int pos = w_handle_position(w);
+    return pos < handle_count && by_handle[pos].hwnd == w ? by_handle[pos].slot : -1;
 }
 
 static int w_output_for(HWND w) {
@@ -50,6 +66,10 @@ static bool w_custom_text(const char *name, wchar_t *s, int cap, char *action, s
 }
 
 static bool w_module_detail(const char *name, wchar_t *text, int cap) {
+    if (!strcmp(name,"notifications")) {
+        int count = w_notice_count();
+        return swprintf(text,cap,L"%d notification%ls in history",count,count == 1 ? L"" : L"s") >= 0;
+    }
     if (strncmp(name, "custom/", 7))
         return w_desktop_status_detail(name, text, cap);
     w_provider_value v;
@@ -62,6 +82,7 @@ static bool w_module_detail(const char *name, wchar_t *text, int cap) {
 static void w_dock_bar(int output) {
     w_output_state *o = &desk.outputs[output];
     o->work = w_bar_position(&o->bar, o->screen, o->available, o->dpi, o->bar_hidden);
+    w_notice_reposition();
     InvalidateRect(o->bar.hwnd, NULL, FALSE);
     w_desktop_schedule();
 }
@@ -103,6 +124,7 @@ static BOOL CALLBACK w_visit_monitor(HMONITOR mon, HDC dc, LPRECT bounds, LPARAM
     o->bar.custom = w_custom_text;
     o->bar.detail = w_module_detail;
     o->bar.dock = w_dock_bar;
+    w_desktop_tray_bind(&o->bar);
     o->bar_hidden = desk.hide_bars;
     o->work = w_bar_position(&o->bar, o->screen, o->available, o->dpi, desk.hide_bars);
     return TRUE;
@@ -186,6 +208,7 @@ void w_desktop_outputs(void) {
         else
             m->focus = w_model_recent(m, m->output, m->selected[m->output]);
     }
+    w_notice_reposition();
     w_desktop_schedule();
 }
 
@@ -201,6 +224,9 @@ static bool w_matches(const char *needle, const wchar_t *s, bool exact) {
 
 static void w_forget(int i) {
     bool selected = desk.model.focus == i;
+    int pos = w_handle_position(desk.windows[i].hwnd);
+    --handle_count;
+    memmove(by_handle + pos, by_handle + pos + 1, (size_t)(handle_count - pos) * sizeof(*by_handle));
     w_effects_hide(i);
     w_model_remove(&desk.model, (w_window_id){i, desk.model.windows[i].generation});
     desk.windows[i] = (w_window_state){0};
@@ -214,13 +240,13 @@ static void w_forget(int i) {
 static int w_discover(HWND w, bool *focus_new) {
     int i = w_desktop_find(w);
     DWORD pid = 0;
-    GetWindowThreadProcessId(w, &pid);
     if (i >= 0) {
+        GetWindowThreadProcessId(w, &pid);
         if (pid == desk.windows[i].pid && GetPropW(w, L"winwm.managed"))
             return i;
         w_forget(i);
     }
-    if (!w_os_candidate(w) || IsIconic(w))
+    if (!w_os_candidate(w, &pid) || IsIconic(w))
         return -1;
     int initial_output = w_output_for(w), output = initial_output, ws = -1;
     bool floating = false, colored = false;
@@ -230,16 +256,21 @@ static int w_discover(HWND w, bool *focus_new) {
         wchar_t cls[128] = {0}, title[256] = {0}, path[1024] = {0};
         GetClassNameW(w, cls, count_of(cls));
         GetWindowTextW(w, title, count_of(title));
-        HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
-        if (p) {
-            DWORD n = count_of(path);
-            QueryFullProcessImageNameW(p, 0, path, &n);
-            CloseHandle(p);
-        }
+        bool read_path = false;
         for (int j = 0; j < desk.config.rule_count; j++) {
             const w_window_rule *r = &desk.config.rules[j];
-            if (!w_matches(r->class_name, cls, r->exact_match) || !w_matches(r->title, title, r->exact_match) ||
-                !w_matches(r->executable, path, false))
+            if (!w_matches(r->class_name, cls, true) || !w_matches(r->title, title, true))
+                continue;
+            if (*r->executable && !read_path) {
+                HANDLE p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+                if (p) {
+                    DWORD n = count_of(path);
+                    QueryFullProcessImageNameW(p, 0, path, &n);
+                    CloseHandle(p);
+                }
+                read_path = true;
+            }
+            if (!w_matches(r->executable, path, false))
                 continue;
             if (r->exclude)
                 return -1;
@@ -276,7 +307,11 @@ static int w_discover(HWND w, bool *focus_new) {
     w_output_state *saved = &desk.outputs[saved_output];
     desk.windows[id.slot] = (w_window_state){.hwnd = w, .pid = pid, .custom_border = colored,
         .border = RGB(border >> 16, border >> 8, border), .saved_float_work = saved->work, .saved_float_dpi = saved->dpi,
-        .direct_surface = w_os_direct_surface(w)};
+        .direct_surface = w_os_direct_surface(w, pid)};
+    int pos = w_handle_position(w);
+    memmove(by_handle + pos + 1, by_handle + pos, (size_t)(handle_count - pos) * sizeof(*by_handle));
+    by_handle[pos] = (struct w_hwnd_slot){w, id.slot};
+    ++handle_count;
     w_model_window *window = &desk.model.windows[id.slot];
     window->floating = floating;
     if (!floating)
@@ -388,6 +423,7 @@ void w_desktop_set_floating(int slot, bool floating) {
 
 static BOOL CALLBACK w_enumerate(HWND w, LPARAM focus_new) {
     int slot = w_discover(w, (bool *)focus_new);
+    w_desktop_tray_observe(w,0);
     if (slot >= 0) {
         w_window_state *state = &desk.windows[slot];
         state->tab_title_dirty = true;
@@ -412,7 +448,9 @@ static BOOL CALLBACK w_enumerate(HWND w, LPARAM focus_new) {
 void w_desktop_scan(bool focus_new) {
     // Enumeration is in z-order. When recovering missed events, give at most
     // one newly eligible window the same activation as a normal first map.
+    w_desktop_tray_scan(true);
     EnumWindows(w_enumerate, (LPARAM)&focus_new);
+    w_desktop_tray_scan(false);
     for (int i = 0; i < window_limit; i++)
         if (desk.model.windows[i].live && !IsWindow(desk.windows[i].hwnd))
             w_forget(i);
@@ -424,9 +462,10 @@ void w_desktop_scan(bool focus_new) {
 static void w_follow_native_activation(HWND foreground, HWND owner, bool activated);
 
 void w_desktop_event(HWND w, DWORD event, DWORD event_tick) {
+    w_desktop_tray_observe(w,event);
     HWND event_window = w;
-    int i = w_desktop_find(w);
     if (event == EVENT_OBJECT_DESTROY || !IsWindow(w)) {
+        int i = w_desktop_find(w);
         if (i >= 0)
             w_forget(i);
         return;
@@ -435,7 +474,7 @@ void w_desktop_event(HWND w, DWORD event, DWORD event_tick) {
         w = w_os_app_window(w);
     bool focus_new = event != EVENT_OBJECT_HIDE && event != EVENT_OBJECT_CLOAKED &&
                      event != EVENT_SYSTEM_MINIMIZESTART;
-    i = w_discover(w, &focus_new);
+    int i = w_discover(w, &focus_new);
     if (i < 0) {
         if (event == EVENT_SYSTEM_FOREGROUND) {
             w_desktop_focus_observe(w);
@@ -450,8 +489,6 @@ void w_desktop_event(HWND w, DWORD event, DWORD event_tick) {
     }
     w_model_window *mw = &desk.model.windows[i];
     w_window_state *state = &desk.windows[i];
-    if (event == EVENT_OBJECT_NAMECHANGE)
-        state->tab_title_dirty = true;
     if (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_HIDE ||
         event == EVENT_OBJECT_CLOAKED || event == EVENT_OBJECT_UNCLOAKED) {
         owned_visibility_dirty = true;
@@ -463,6 +500,18 @@ void w_desktop_event(HWND w, DWORD event, DWORD event_tick) {
         state->restoring = false;
         state->has_issued = false;
         w_desktop_schedule();
+    }
+    if (event == EVENT_OBJECT_NAMECHANGE) {
+        state->tab_title_dirty = true;
+        int output = mw->output;
+        if (!desk.refresh_pending && w_model_visible(&desk.model, i) &&
+            (desk.outputs[output].tabs || w_config_has_module(&desk.config, "title"))) {
+            if (title_outputs || PostMessageW(desk.root, msg_titles, 0, 0))
+                title_outputs |= 1u << output;
+            else
+                w_desktop_schedule();
+        }
+        return;
     }
     if (event == EVENT_SYSTEM_FOREGROUND) {
         ULONGLONG now = GetTickCount64();
@@ -619,6 +668,34 @@ static void w_update_tab_title(w_window_state *state) {
     state->tab_title_dirty = false;
 }
 
+static void w_update_tabs(int output) {
+    w_output_state *o = &desk.outputs[output];
+    const w_tab_layout *tabs = &o->tab_layout;
+    if (tabs->bounds.h > 0)
+        for (int j = 0; j < tabs->count; ++j)
+            w_update_tab_title(&desk.windows[tabs->slots[j]]);
+    o->tabs = w_desktop_tabs_update(output, tabs->slots, tabs->count, tabs->selected, tabs->bounds);
+}
+
+void w_desktop_titles(void) {
+    unsigned outputs = title_outputs;
+    title_outputs = 0;
+    if (desk.refresh_pending) return;
+    bool bar_title = w_config_has_module(&desk.config, "title");
+    for (int i = 0; i < output_limit; ++i) {
+        w_output_state *o = &desk.outputs[i];
+        if (!(outputs & (1u << i)) || !o->live) continue;
+        if (o->tabs) w_update_tabs(i);
+        if (bar_title && o->bar.hwnd) {
+            int recent = w_model_recent(&desk.model, i, desk.model.selected[i]);
+            w_bar_view view = o->bar.view;
+            memset(view.title, 0, sizeof(view.title));
+            if (recent >= 0) GetWindowTextW(desk.windows[recent].hwnd, view.title, count_of(view.title));
+            w_bar_update(&o->bar, &view);
+        }
+    }
+}
+
 void w_desktop_apply(void) {
     static int previous_workspace[output_limit];
     static HWND previous_foreground;
@@ -626,6 +703,7 @@ void w_desktop_apply(void) {
     HWND outgoing = NULL;
     HWND foreground = GetForegroundWindow();
     HWND active = w_os_app_window(foreground);
+    bool bar_title = w_config_has_module(&desk.config, "title");
     w_follow_native_activation(foreground, active, foreground != previous_foreground);
     previous_foreground = foreground;
     for (int o = 0; o < output_limit; o++)
@@ -643,12 +721,9 @@ void w_desktop_apply(void) {
             }
             w_desktop_measure_output(o);
             const w_tab_layout *tabs = &output->tab_layout;
-            if (tabs->bounds.h > 0)
-                for (int j = 0; j < tabs->count; ++j)
-                    w_update_tab_title(&desk.windows[tabs->slots[j]]);
-            output->tabs = w_desktop_tabs_update(o, tabs->slots, tabs->count, tabs->selected, tabs->bounds);
+            w_update_tabs(o);
             w_bar_view view = {.selected = ws, .resize_mode = desk.resize, .inhibit = desk.inhibit};
-            if (recent >= 0)
+            if (bar_title && recent >= 0)
                 GetWindowTextW(desk.windows[recent].hwnd, view.title, count_of(view.title));
             HDWP batch = NULL;
             bool batch_failed = false;

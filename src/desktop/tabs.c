@@ -42,6 +42,15 @@ static void w_activate_tab(w_tab_strip *strip) {
         w_desktop_activate(id.slot);
 }
 
+static void w_invalidate_item(w_tab_strip *strip, int index) {
+    RECT box;
+    if (index >= 0 && TabCtrl_GetItemRect(strip->control, index, &box)) {
+        box.top = 0;
+        box.bottom = strip->height;
+        InvalidateRect(strip->control, &box, FALSE);
+    }
+}
+
 static void w_paint_tabs(w_tab_strip *strip, HDC dc) {
     RECT client, clip;
     GetClientRect(strip->control, &client);
@@ -109,16 +118,17 @@ static LRESULT CALLBACK w_tab_control(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp,
         TCHITTESTINFO hit = {.pt = {GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}};
         int index = TabCtrl_HitTest(hwnd, &hit);
         if (index != strip->hot) {
+            w_invalidate_item(strip, strip->hot);
             strip->hot = index;
             TRACKMOUSEEVENT leave = {.cbSize = sizeof(leave), .dwFlags = TME_LEAVE, .hwndTrack = hwnd};
             TrackMouseEvent(&leave);
-            InvalidateRect(hwnd, NULL, FALSE);
+            w_invalidate_item(strip, index);
         }
         break;
     }
     case WM_MOUSELEAVE:
+        w_invalidate_item(strip, strip->hot);
         strip->hot = -1;
-        InvalidateRect(hwnd, NULL, FALSE);
         break;
     }
     return DefSubclassProc(hwnd, msg, wp, lp);
@@ -141,6 +151,9 @@ static LRESULT CALLBACK w_tab_host(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
             0, 0, create->cx, create->cy, hwnd, NULL, create->hInstance, NULL);
         if (!strip->control || !SetWindowSubclass(strip->control, w_tab_control, 1, (DWORD_PTR)strip))
             return -1;
+        w_theme_material(hwnd);
+        HWND tip=TabCtrl_GetToolTips(strip->control);
+        if (tip) w_theme_material(tip);
         return 0;
     }
     case WM_MOUSEACTIVATE:
@@ -256,7 +269,7 @@ HWND w_desktop_tabs_update(int output, const int *slots, int count, int selected
             TabCtrl_SetItem(control, i, &tab);
         }
         *item = (w_tab_item){id, revision};
-        repaint = true;
+        if (!repaint) w_invalidate_item(strip, i);
     }
     bool shown = IsWindowVisible(host) != 0;
     RECT rect;

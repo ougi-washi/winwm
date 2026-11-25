@@ -1,5 +1,6 @@
 #include "bar/tooltip.h"
 #include "bar/menu.h"
+#include "theme/theme.h"
 #include <stdio.h>
 
 static const w_bar_description descriptions[] = {
@@ -21,6 +22,7 @@ static const w_bar_description descriptions[] = {
     {"project", L"Projects", L"Open project folder", NULL, NULL},
     {"clipboard", L"Clipboard history", L"Browse clipboard history", NULL, NULL},
     {"notifications", L"Desktop notifications", L"View notifications", NULL, NULL},
+    {"tray", L"System tray", L"Toggle drawer", NULL, L"Browse applications"},
 };
 
 const w_bar_description *w_bar_describe(const char *module) {
@@ -50,6 +52,29 @@ static void w_tip_text(w_bar_window *b, wchar_t *heading, wchar_t *body, wchar_t
         right = info->right;
         wheel = info->wheel;
     }
+    if (!strcmp(hit->module,"tray")) {
+        if (hit->tray_key) {
+            size_t first=wcscspn(hit->tooltip,L"\r\n");
+            wmemcpy(heading,hit->tooltip,first);
+            heading[first]=0;
+            if (!first) wcscpy(heading,L"Application");
+            const wchar_t *detail=hit->tooltip+first;
+            detail+=wcsspn(detail,L"\r\n");
+            wcscpy(body,detail);
+            w_hint(help,320,L"Click",L"Activate application",NULL);
+            w_hint(help,320,L"Right-click",L"Application menu",NULL);
+        } else if (hit->tray_more) {
+            wcscpy(heading,L"More applications");
+            wcscpy(body,hit->tooltip);
+            w_hint(help,320,L"Click",L"Next page",NULL);
+        } else {
+            wcscpy(body,hit->tooltip);
+            if (b->tray.total) w_hint(help,320,L"Hover",L"Show applications",NULL);
+        }
+        if (b->tray.total>b->tray.page && b->tray.open)
+            w_hint(help,320,L"Scroll",L"Browse applications",NULL);
+        return;
+    }
     if (!*heading) {
         const char *name = !strncmp(hit->module,"custom/",7) ? hit->module+7 : hit->module;
         w_os_wide(name,heading,96);
@@ -57,7 +82,7 @@ static void w_tip_text(w_bar_window *b, wchar_t *heading, wchar_t *body, wchar_t
     if (hit->workspace)
         swprintf(heading,96,L"Workspace %d",hit->workspace);
     if (!s || !*s->tooltip) {
-        if (b->detail && strcmp(hit->module,"clipboard") && strcmp(hit->module,"notifications"))
+        if (b->detail && strcmp(hit->module,"clipboard"))
             b->detail(hit->module,body,512);
         if (!*body && !strcmp(hit->module,"display")) {
             swprintf(body,512,L"%d × %d pixels  ·  %d%% scaling",b->screen.w,b->screen.h,MulDiv(b->dpi,100,96));
@@ -157,8 +182,10 @@ static HWND w_tip_create(w_bar_window *b) {
     HINSTANCE inst = GetModuleHandleW(NULL);
     WNDCLASSW cls = {.lpszClassName=L"WinwmBarTooltip",.hInstance=inst,.lpfnWndProc=w_tip_proc};
     RegisterClassW(&cls);
-    return CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TRANSPARENT|WS_EX_TOOLWINDOW|WS_EX_TOPMOST,
-                           cls.lpszClassName,L"",WS_POPUP,0,0,0,0,b->hwnd,NULL,inst,b);
+    HWND tip=CreateWindowExW(WS_EX_NOACTIVATE|WS_EX_TRANSPARENT|WS_EX_TOOLWINDOW|WS_EX_TOPMOST,
+                            cls.lpszClassName,L"",WS_POPUP,0,0,0,0,b->hwnd,NULL,inst,b);
+    if (tip) w_theme_material(tip);
+    return tip;
 }
 
 static POINT w_tip_position(w_bar_window *b, POINT anchor, RECT area, int width, int height) {
@@ -192,7 +219,7 @@ void w_bar_tip_move(w_bar_window *b) {
 }
 
 static void w_tip_present(w_bar_window *b, bool first) {
-    wchar_t heading[96]={0},body[512]={0},help[320]={0};
+    wchar_t heading[count_of(b->tip.heading)]={0},body[512]={0},help[320]={0};
     w_tip_text(b,heading,body,help);
     if (!first && !wcscmp(heading,b->tip.heading) && !wcscmp(body,b->tip.body) && !wcscmp(help,b->tip.help))
         return;
@@ -228,7 +255,7 @@ static void w_tip_present(w_bar_window *b, bool first) {
     height=min(height-gap+pad,area.bottom-area.top);
     for (int i=0;i<3;i++) b->tip.parts[i].right=width-pad;
     POINT pos=w_tip_position(b,anchor,area,width,height);
-    wchar_t accessible[960];
+    wchar_t accessible[count_of(heading)+count_of(body)+count_of(help)+2];
     swprintf(accessible,count_of(accessible),L"%ls\n%ls\n%ls",heading,body,help);
     SetWindowTextW(b->tip.window,accessible);
     SetWindowPos(b->tip.window,HWND_TOPMOST,pos.x,pos.y,width,height,SWP_SHOWWINDOW|SWP_NOACTIVATE);
@@ -246,7 +273,7 @@ void w_bar_tip_hide(w_bar_window *b) {
 }
 
 void w_bar_tip_track(w_bar_window *b, int index) {
-    if (index < 0 || index >= b->hit_count || !b->config->bar_tooltip_duration ||
+    if (index < 0 || index >= b->hit_count || !b->config->bar_tooltip_duration || b->hits[index].tray_hide_tip ||
         (b->hits[index].style && b->hits[index].style->hide_tooltip)) {
         w_bar_tip_hide(b);
         b->tip.index = -1;

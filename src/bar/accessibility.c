@@ -239,6 +239,11 @@ static HRESULT STDMETHODCALLTYPE w_name(IAccessible *iface,VARIANT child,BSTR *o
     if (!hit) swprintf(name,count_of(name),L"winwm toolbar, monitor %d",((w_bar_access *)iface)->bar->output+1);
     else {
         const w_bar_description *info=w_bar_describe(hit->module);
+        if (hit->tray_more) return w_string(out,hit->tooltip);
+        if (hit->tray_key) {
+            *out=SysAllocStringLen(hit->tooltip,(UINT)wcscspn(hit->tooltip,L"\r\n"));
+            return *out ? S_OK : E_OUTOFMEMORY;
+        }
         if (hit->workspace) swprintf(name,count_of(name),L"Workspace %d",hit->workspace);
         else if (info) wcscpy(name,info->heading);
         else if (!w_os_wide(!strncmp(hit->module,"custom/",7) ? hit->module+7 : hit->module,name,count_of(name)))
@@ -257,7 +262,7 @@ static HRESULT STDMETHODCALLTYPE w_value(IAccessible *iface,VARIANT child,BSTR *
     return FAILED(hr) ? hr : hit ? w_string(out,hit->tooltip) : S_FALSE;
 }
 static bool w_actionable(const struct w_bar_hit *hit) {
-    return *hit->action || !strcmp(hit->module,"audio");
+    return *hit->action || !strcmp(hit->module,"audio") || !strcmp(hit->module,"tray");
 }
 static HRESULT STDMETHODCALLTYPE w_role(IAccessible *iface,VARIANT child,VARIANT *out) {
     if (!out) return E_POINTER;
@@ -282,6 +287,11 @@ static HRESULT STDMETHODCALLTYPE w_acc_state(IAccessible *iface,VARIANT child,VA
     if ((GetWindowLongPtrW(hwnd,GWL_EXSTYLE)&WS_EX_TRANSPARENT) || !IsWindowEnabled(hwnd))
         out->lVal|=STATE_SYSTEM_UNAVAILABLE;
     if (hit && hit->workspace && hit->active) out->lVal|=STATE_SYSTEM_CHECKED;
+    if (hit && !hit->tray_key && !hit->tray_more && !strcmp(hit->module,"tray")) {
+        w_bar_window *b=((w_bar_access *)iface)->bar;
+        out->lVal|=b->tray.open && b->tray.source==hit->source ? STATE_SYSTEM_EXPANDED : STATE_SYSTEM_COLLAPSED;
+        if (!b->tray.total) out->lVal|=STATE_SYSTEM_UNAVAILABLE;
+    }
     return S_OK;
 }
 static HRESULT STDMETHODCALLTYPE w_no_text(IAccessible *iface,VARIANT child,BSTR *out) {
@@ -307,6 +317,8 @@ static HRESULT STDMETHODCALLTYPE w_default(IAccessible *iface,VARIANT child,BSTR
     struct w_bar_hit *hit;
     HRESULT hr=w_find(iface,child,&hit);
     if (FAILED(hr) || !hit || !w_actionable(hit)) return FAILED(hr) ? hr : S_FALSE;
+    if (hit->tray_key) return w_string(out,L"Activate application");
+    if (hit->tray_more) return w_string(out,L"Next applications");
     const w_bar_description *info=w_bar_describe(hit->module);
     if (!(hit->style && *hit->style->action) && info && info->click) return w_string(out,info->click);
     wchar_t command[128];

@@ -161,7 +161,7 @@ static DWORD WINAPI w_project_launch(void *arg) {
         }
         if (job.launched) job.saved = w_update_recent(job.folder,false);
         else if (job.action != choose_document)
-            job.error = L"Could not open the configured program. Check its executable in winwm.conf.";
+            job.error = L"Could not open the configured program. Check its executable in winwm.lua.";
     }
     PostMessageW(receiver,launch_result,0,0);
     return 0;

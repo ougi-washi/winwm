@@ -1,4 +1,5 @@
 #include "os_win32/os_win32.h"
+#include "os_win32/environment.h"
 #include <dwmapi.h>
 #include <shellapi.h>
 #include <shlwapi.h>
@@ -11,58 +12,35 @@
 ////////////////
 //~ Os Win32
 
-// The second name is also claimed by older builds. Holding both prevents two
-// generations of the window manager from applying incompatible HWND state.
-static const struct w_instance_names {
-    const wchar_t *current, *legacy;
-} instance_names[] = {
-    [os_host_instance] = {L"Local\\winwm.host.v1", L"Local\\native_desktop.host.v1"},
-    [os_interactive_instance] = {L"Local\\winwm.interactive.v1", L"Local\\native_desktop.interactive.v1"},
+static const wchar_t *const instance_names[] = {
+    [os_host_instance] = L"Local\\winwm.host.v1",
+    [os_interactive_instance] = L"Local\\winwm.interactive.v1",
 };
-
 ////////////////
 //~ Os Win32 Functions
 
 void w_os_instance_release(w_os_instance_lock *lock) {
-    if (lock->legacy)
-        CloseHandle(lock->legacy);
-    if (lock->current)
-        CloseHandle(lock->current);
-    *lock = (w_os_instance_lock){0};
-}
-
-static DWORD w_claim_mutex(const wchar_t *name, HANDLE *out, DWORD occupied) {
-    *out = CreateMutexW(NULL, FALSE, name);
-    if (!*out)
-        return GetLastError();
-    return GetLastError() == ERROR_ALREADY_EXISTS ? occupied : ERROR_SUCCESS;
+    if (*lock) CloseHandle(*lock);
+    *lock = NULL;
 }
 
 DWORD w_os_instance_claim(os_instance_kind kind, w_os_instance_lock *lock) {
-    *lock = (w_os_instance_lock){0};
-    DWORD error = w_claim_mutex(instance_names[kind].current, &lock->current, ERROR_ALREADY_EXISTS);
-    if (!error)
-        error = w_claim_mutex(instance_names[kind].legacy, &lock->legacy, ERROR_REVISION_MISMATCH);
-    if (error)
-        w_os_instance_release(lock);
-    return error;
+    *lock = CreateMutexW(NULL,FALSE,instance_names[kind]);
+    if (!*lock) return GetLastError();
+    if (GetLastError() != ERROR_ALREADY_EXISTS) return ERROR_SUCCESS;
+    w_os_instance_release(lock);
+    return ERROR_ALREADY_EXISTS;
 }
 
-static DWORD w_mutex_status(const wchar_t *name, DWORD occupied) {
-    HANDLE mutex = OpenMutexW(SYNCHRONIZE, FALSE, name);
+DWORD w_os_instance_status(os_instance_kind kind) {
+    HANDLE mutex = OpenMutexW(SYNCHRONIZE,FALSE,instance_names[kind]);
     if (mutex) {
         CloseHandle(mutex);
-        return occupied;
+        return ERROR_ALREADY_EXISTS;
     }
     DWORD error = GetLastError();
     return error == ERROR_FILE_NOT_FOUND ? ERROR_SUCCESS : error;
 }
-
-DWORD w_os_instance_status(os_instance_kind kind) {
-    DWORD result = w_mutex_status(instance_names[kind].current, ERROR_ALREADY_EXISTS);
-    return result ? result : w_mutex_status(instance_names[kind].legacy, ERROR_REVISION_MISMATCH);
-}
-
 ////////////////
 //~ Strings and paths
 
@@ -76,7 +54,7 @@ bool w_os_utf8(const wchar_t *s, char *out, int cap) {
 
 bool w_os_config_path(wchar_t *out, int cap) {
     DWORD n = GetEnvironmentVariableW(L"USERPROFILE", out, cap);
-    const wchar_t *tail = L"\\.config\\winwm\\winwm.conf";
+    const wchar_t *tail = L"\\.config\\winwm\\winwm.lua";
     if (!n || n + wcslen(tail) >= (size_t)cap)
         return false;
     wcscat(out, tail);
@@ -97,10 +75,6 @@ static bool w_local_path(wchar_t *out, int cap, const wchar_t *directory, const 
 
 bool w_os_data_path(wchar_t *out, int cap, const wchar_t *name, bool create) {
     return w_local_path(out, cap, L"\\winwm", name, create);
-}
-
-bool w_os_legacy_config_path(wchar_t *out, int cap) {
-    return w_local_path(out, cap, L"\\native_desktop", L"config.jsonc", false);
 }
 
 bool w_os_self(wchar_t *out, int cap) {
@@ -129,11 +103,9 @@ static bool w_absolute_executable(const wchar_t *path, wchar_t *out, int cap) {
 
 static bool w_registered_executable(const wchar_t *name, wchar_t *out, int cap) {
     const wchar_t *ext = wcsrchr(name,L'.');
-    if (ext && _wcsicmp(ext,L".exe"))
-        return false;
     wchar_t key[320];
     int len = swprintf(key,count_of(key),L"Software\\Microsoft\\Windows\\CurrentVersion\\App Paths\\%ls%ls",
-                       name,ext ? L"" : L".exe");
+                       name,ext && !_wcsicmp(ext,L".exe") ? L"" : L".exe");
     if (len < 0 || (size_t)len >= count_of(key))
         return false;
     const HKEY roots[] = {HKEY_CURRENT_USER,HKEY_LOCAL_MACHINE};
@@ -154,26 +126,91 @@ static bool w_registered_executable(const wchar_t *name, wchar_t *out, int cap) 
     return false;
 }
 
-bool w_os_provider(const char *name, wchar_t *out, int cap) {
-    wchar_t raw[os_path_cap], path[os_path_cap];
-    if (!w_os_wide(name, raw, count_of(raw)))
-        return false;
-    DWORD n = ExpandEnvironmentStringsW(raw, path, count_of(path));
-    if (!n || n > count_of(path))
-        return false;
-    if (wcspbrk(path,L"\\/:"))
-        return w_absolute_executable(path,out,cap);
-    if (!*path)
-        return false;
-    wchar_t *env = calloc(32768, sizeof(wchar_t));
-    if (env) {
-        DWORD len = GetEnvironmentVariableW(L"PATH", env, 32768);
-        n = len && len < 32768 ? SearchPathW(env, path, L".exe", cap, out, NULL) : 0;
-        free(env);
-        if (n && n < (DWORD)cap && w_launchable(out))
-            return true;
+wchar_t *w_os_path_directories(void) {
+    DWORD capacity = GetEnvironmentVariableW(L"PATH",NULL,0);
+    while (capacity) {
+        wchar_t *value = malloc((size_t)capacity * sizeof(*value));
+        if (!value) break;
+        DWORD length = GetEnvironmentVariableW(L"PATH",value,capacity);
+        if (length && length < capacity) return value;
+        free(value);
+        capacity = length;
     }
-    return w_registered_executable(path,out,cap);
+    return NULL;
+}
+
+wchar_t *w_os_next_directory(wchar_t **cursor) {
+    while (*cursor && **cursor) {
+        wchar_t *start = *cursor;
+        start += wcsspn(start,L" \t");
+        wchar_t *end = (wchar_t *)w_environment_path_end(start);
+        *cursor = *end ? end + 1 : end;
+        while (end > start && (end[-1] == L' ' || end[-1] == L'\t')) --end;
+        if (end - start >= 2 && *start == L'"' && end[-1] == L'"') {
+            ++start;
+            --end;
+        }
+        *end = 0;
+        if (*start) return start;
+    }
+    return NULL;
+}
+
+void w_os_path_extensions(wchar_t *out, DWORD cap) {
+    DWORD length = GetEnvironmentVariableW(L"PATHEXT",out,cap);
+    if (!length || length >= cap) lstrcpynW(out,L".COM;.EXE;.BAT;.CMD",(int)cap);
+}
+
+int w_os_extension_order(const wchar_t *extension, const wchar_t *extensions) {
+    size_t length = wcslen(extension);
+    int order = 1;
+    for (const wchar_t *p = extensions; *p; ++order) {
+        size_t n = wcscspn(p,L";");
+        if (n == length && !_wcsnicmp(p,extension,length)) return order;
+        p += n;
+        if (*p) ++p;
+    }
+    return 0;
+}
+
+static bool w_in_directory(const wchar_t *directory, const wchar_t *name, const wchar_t *extensions,
+                           wchar_t *out, int cap) {
+    // An empty list checks the explicitly supplied filename just once.
+    for (const wchar_t *p = extensions;;) {
+        int n = (int)wcscspn(p,L";");
+        if (!*extensions || (n > 1 && *p == L'.' && (size_t)n <= wcscspn(p,L"\\/:*?\""))) {
+            wchar_t candidate[os_path_cap];
+            if (swprintf(candidate,count_of(candidate),L"%ls\\%ls%.*ls",directory,name,n,p) >= 0) {
+                DWORD length = GetFullPathNameW(candidate,cap,out,NULL);
+                DWORD flags = length && length < (DWORD)cap ? GetFileAttributesW(out) : INVALID_FILE_ATTRIBUTES;
+                if (flags != INVALID_FILE_ATTRIBUTES && !(flags & FILE_ATTRIBUTE_DIRECTORY)) return true;
+            }
+        }
+        p += n;
+        if (!*p) return false;
+        ++p;
+    }
+}
+
+static bool w_resolve_program(const wchar_t *raw, const wchar_t *extensions, wchar_t *out, int cap) {
+    wchar_t path[os_path_cap];
+    DWORD n = ExpandEnvironmentStringsW(raw,path,count_of(path));
+    if (!n || n > count_of(path) || !*path) return false;
+    if (wcspbrk(path,L"\\/:")) return w_absolute_executable(path,out,cap);
+    const wchar_t *ext = wcsrchr(path,L'.');
+    if (ext && (!_wcsicmp(ext,L".exe") || w_os_extension_order(ext,extensions))) extensions = L"";
+    wchar_t *env = w_os_path_directories(), *cursor = env, *directory;
+    bool found = false;
+    while (!found && (directory = w_os_next_directory(&cursor)))
+        found = w_in_directory(directory,path,extensions,out,cap);
+    free(env);
+    return found || w_registered_executable(path,out,cap);
+}
+
+bool w_os_provider(const char *name, wchar_t *out, int cap) {
+    wchar_t raw[os_path_cap];
+    w_environment_for_launch();
+    return w_os_wide(name,raw,count_of(raw)) && w_resolve_program(raw,L".exe",out,cap);
 }
 
 bool w_os_task_manager(const char *name, wchar_t *out, int cap) {
@@ -205,6 +242,7 @@ static wchar_t *w_quote(wchar_t *p, const wchar_t *s) {
 }
 
 static HANDLE w_launch_at(const wchar_t *exe, const wchar_t *arg, const wchar_t *directory, const POINT *origin) {
+    w_environment_for_launch();
     size_t len = 2 * (wcslen(exe) + (arg ? wcslen(arg) : 0)) + 10;
     if (len > 32767)
         return NULL;
@@ -242,6 +280,7 @@ HANDLE w_os_launch_positioned(const wchar_t *exe, const wchar_t *arg, POINT orig
 }
 
 bool w_os_shell_execute(const wchar_t *file, const wchar_t *parameters, const wchar_t *directory, bool admin) {
+    w_environment_for_launch();
     HRESULT apartment = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     SHELLEXECUTEINFOW info = {.cbSize = sizeof(info), .fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
         .lpVerb = admin ? L"runas" : NULL, .lpFile = file, .lpParameters = parameters, .lpDirectory = directory,
@@ -275,8 +314,10 @@ static bool w_launch_command_line(wchar_t *line, bool admin, bool allow_shell_ta
     if (!*line) { SetLastError(ERROR_INVALID_PARAMETER); return false; }
     wchar_t **argv = CommandLineToArgvW(line, &argc);
     if (!argv) return false;
-    char name[4096];
-    bool found = argc && w_os_utf8(argv[0], name, sizeof(name)) && w_os_provider(name, path, count_of(path));
+    w_environment_for_launch();
+    wchar_t extensions[32768];
+    if (allow_shell_targets) w_os_path_extensions(extensions,count_of(extensions));
+    bool found = argc && w_resolve_program(argv[0],allow_shell_targets ? extensions : L".exe",path,count_of(path));
     if (!found && !allow_shell_targets) {
         LocalFree(argv);
         SetLastError(ERROR_FILE_NOT_FOUND);
@@ -284,7 +325,8 @@ static bool w_launch_command_line(wchar_t *line, bool admin, bool allow_shell_ta
     }
     DWORD n = GetEnvironmentVariableW(L"USERPROFILE", home, count_of(home));
     const wchar_t *directory = n && n < count_of(home) ? home : NULL;
-    if (admin || !found) {
+    const wchar_t *ext = found ? wcsrchr(path,L'.') : NULL;
+    if (admin || !ext || (_wcsicmp(ext,L".exe") && _wcsicmp(ext,L".com"))) {
         // Let Windows resolve shell objects, applets and registered URI handlers.
         // Preserve quoting in the argument tail of executable commands.
         const wchar_t *args = *line == L'"' ? wcschr(line + 1, L'"') : line + wcscspn(line, L" \t");
@@ -411,12 +453,13 @@ bool w_os_cloaked(HWND w) {
     return SUCCEEDED(DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked;
 }
 
-bool w_os_candidate(HWND w) {
-    if (!w || !IsWindowVisible(w) || w_os_same_process(w) || GetAncestor(w, GA_ROOT) != w ||
-        w_os_app_window(w) != w || GetPropW(w, L"winwm.ignore"))
+bool w_os_candidate(HWND w, DWORD *pid) {
+    if (!w || !IsWindowVisible(w) || GetAncestor(w, GA_ROOT) != w ||
+        !GetWindowThreadProcessId(w, pid) || *pid == GetCurrentProcessId() || GetPropW(w, L"winwm.ignore"))
         return false;
     LONG_PTR ex = GetWindowLongPtrW(w, GWL_EXSTYLE), style = GetWindowLongPtrW(w, GWL_STYLE);
-    if ((ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) || (style & WS_CHILD))
+    if ((ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) || (style & WS_CHILD) ||
+        (!(ex & WS_EX_APPWINDOW) && GetWindow(w, GW_OWNER)))
         return false;
     wchar_t cls[128] = {0};
     GetClassNameW(w, cls, count_of(cls));
@@ -645,7 +688,7 @@ void w_os_window_appearance(HWND w, DWORD color, DWORD corner) {
         DwmSetWindowAttribute(w, 34, &color, sizeof(color));
 }
 
-bool w_os_direct_surface(HWND w) {
+bool w_os_direct_surface(HWND w, DWORD pid) {
     if (GetPropW(w, dim_prop) == dim_releasing ||
         (GetWindowLongPtrW(w, GWL_EXSTYLE) & (WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP)) ||
         (GetClassLongPtrW(w, GCL_STYLE) & (CS_OWNDC | CS_CLASSDC)))
@@ -654,8 +697,6 @@ bool w_os_direct_surface(HWND w) {
     // the application is already presenting with OpenGL. In particular Winit
     // uses a full-redraw window class without CS_OWNDC. Check the rendering
     // runtime once at discovery, never in the animation or input loop.
-    DWORD pid = 0;
-    GetWindowThreadProcessId(w, &pid);
     HANDLE modules = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid);
     if (modules == INVALID_HANDLE_VALUE)
         return true;
@@ -825,6 +866,7 @@ typedef struct w_recovery_stack {
 
 static BOOL CALLBACK w_restore_one(HWND w, LPARAM arg) {
     w_recovery_stack *stack = (w_recovery_stack *)arg;
+    RemovePropW(w,WINWM_TRAY_WINDOW_PROPERTY);
     uintptr_t rank = (uintptr_t)GetPropW(w, stack_prop);
     if (rank && rank <= window_limit) {
         stack->windows[rank-1] = w;

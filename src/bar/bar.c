@@ -2,7 +2,10 @@
 #include "bar/accessibility.h"
 #include "bar/menu.h"
 #include "bar/tooltip.h"
+#include "bar/tray.h"
+#include "theme/theme.h"
 #include <windowsx.h>
+#include <shellapi.h>
 #include <stdio.h>
 #include <wchar.h>
 
@@ -34,6 +37,9 @@ static int w_format_module(w_bar_window *b, const char *key, wchar_t *s, int cap
     } else if (!strcmp(key,"notifications")) {
         wcscpy(s,L"Desktop notifications");
         strcpy(action,"notifications");
+    } else if (!strcmp(key,"tray")) {
+        int count=b->tray.total;
+        swprintf(s,cap,L"%d tray %ls",count,count==1 ? L"application" : L"applications");
     } else if (!strcmp(key, "audio")) {
         if (b->audio_percent < 0)
             wcscpy(s, L"No audio output");
@@ -178,7 +184,7 @@ static void w_measure(w_bar_window *b, HDC dc, const char *spec, bool vertical, 
                              {"media", icon_play},  {"cpu", icon_cpu}, {"keyboard",icon_keyboard},
                              {"clock",icon_clock}, {"throughput",icon_traffic}, {"display",icon_display},
                              {"project",icon_project}, {"clipboard",icon_clipboard}, {"notifications",icon_bell},
-                             {"mode",icon_resize}};
+                             {"mode",icon_resize},{"tray",icon_left}};
                 for (size_t k = 0; b->icons.coverage && k < count_of(icons); ++k)
                     if (!strcmp(base, icons[k].key)) {
                         if (display == module_auto && (!strcmp(base,"clock") || !strcmp(base,"keyboard") ||
@@ -275,6 +281,7 @@ static void w_place_group(w_bar_window *b, RECT bounds, const w_bar_group *group
                           int source_base) {
     for (int i=0;i<group->count && pos<end;++i) {
         const w_bar_cell *cell=&group->cells[i];
+        if (!cell->width) continue;
         struct w_bar_hit *hit=&b->hits[b->hit_count++];
         if (strcmp(hit->instance,cell->instance) || hit->workspace!=cell->workspace)
             hit->painted=false;
@@ -293,6 +300,9 @@ static void w_place_group(w_bar_window *b, RECT bounds, const w_bar_group *group
         hit->empty=cell->empty;
         hit->label=cell->label;
         hit->icon=cell->icon;
+        hit->tray_key=0;
+        hit->tray_more=false;
+        hit->tray_hide_tip=false;
         strcpy(hit->module,cell->key);
         strcpy(hit->instance,cell->instance);
         strcpy(hit->action,cell->action);
@@ -326,6 +336,15 @@ static void w_paint_hit(w_bar_window *b,HDC dc,struct w_bar_hit *hit,COLORREF ba
         SelectObject(dc,pen);
     }
     SetTextColor(dc,hit->ink);
+    if (hit->tray_key) {
+        w_bar_tray_item item;
+        if (!b->tray_read || !b->tray_read(hit->tray_index,&item) || item.key!=hit->tray_key) return;
+        HICON image=item.icon ? item.icon : LoadIconW(NULL,IDI_APPLICATION);
+        int size=min(MulDiv(18,b->dpi,96),min(box.right-box.left,box.bottom-box.top)-2);
+        if (size>0 && image)
+            DrawIconEx(dc,(box.left+box.right-size)/2,(box.top+box.bottom-size)/2,image,size,size,0,NULL,DI_NORMAL);
+        return;
+    }
     RECT label=box,icon=box;
     if (hit->icon && hit->label) {
         if (vertical) {
@@ -412,7 +431,8 @@ static LRESULT w_paint_bar(w_bar_window *b, HWND w) {
     FillRect(dc, &ps.rcPaint, GetStockObject(DC_BRUSH));
     HGDIOBJ old = SelectObject(dc, b->font ? b->font : GetStockObject(DEFAULT_GUI_FONT));
     SetBkMode(dc, TRANSPARENT);
-    bool vertical = r.bottom > r.right;
+    const char *edge=b->docked_edge ? b->docked_edge : b->config->edge;
+    bool vertical=!strcmp(edge,"left") || !strcmp(edge,"right");
     if (EqualRect(&r,&ps.rcPaint) || !b->hit_count) {
         w_bar_layout(b,dc,r,vertical);
         if (b->access) w_bar_access_layout(b);
@@ -441,31 +461,37 @@ static LRESULT w_paint_bar(w_bar_window *b, HWND w) {
 
 static void w_bar_layout(w_bar_window *b,HDC dc,RECT r,bool vertical) {
     int length = vertical ? r.bottom : r.right;
-    int margin = MulDiv(6, b->dpi ? b->dpi : 96, 96);
+    int margin = min(MulDiv(6, b->dpi ? b->dpi : 96, 96),max(0,(length-2)/4));
     const char *groups[]={b->config->bar_left,b->config->bar_center,b->config->bar_right};
     int count=0;
+    bool tray=false;
     for (size_t i=0;i<count_of(groups);++i) {
         const char *p=groups[i];
         while (*(p+=strspn(p," "))) {
             size_t n=strcspn(p," ");
             bool spaces=n>=10 && !strncmp(p,"workspaces",10) && (n==10 || p[10]=='#');
+            tray|=n>=4 && !strncmp(p,"tray",4) && (n==4 || p[4]=='#');
             count+=spaces ? workspace_limit : 1;
             p+=n;
         }
     }
     b->hit_count=0;
+    if (!tray && (b->tray.open || b->tray.start)) w_bar_tray_reset(b);
     if (!count) return;
+    b->tray.total=tray && b->tray_count ? b->tray_count() : 0;
+    if (b->tray.total<0) b->tray.total=0;
+    int capacity=count+(tray ? bar_tray_slots : 0);
     // A named workspace instance may expand as other workspaces become occupied.
     // The three configuration strings bound the total. Retain storage through resizes.
-    if (count>b->cell_capacity) {
-        w_bar_cell *cells=malloc((size_t)count*sizeof(*cells));
-        struct w_bar_hit *hits=calloc((size_t)count,sizeof(*hits));
+    if (capacity>b->cell_capacity) {
+        w_bar_cell *cells=malloc((size_t)capacity*sizeof(*cells));
+        struct w_bar_hit *hits=calloc((size_t)capacity,sizeof(*hits));
         if (!cells || !hits) { free(cells); free(hits); return; }
         free(b->cells);
         free(b->hits);
         b->cells=cells;
         b->hits=hits;
-        b->cell_capacity=count;
+        b->cell_capacity=capacity;
     }
     w_bar_group left = {.cells = b->cells, .capacity = count};
     w_measure(b, dc, b->config->bar_left, vertical, &left);
@@ -485,6 +511,27 @@ static void w_bar_layout(w_bar_window *b,HDC dc,RECT r,bool vertical) {
                 cell->width=width;
             }
     }
+    // On a short edge keep the drawer reachable even when earlier controls consume the bar.
+    int available=length-2*margin;
+    if (tray && left.length+center.length+right.length>available) {
+        w_bar_group *priority[]={&right,&left,&center};
+        int wanted=0;
+        for (size_t g=0;g<count_of(priority);++g)
+            for (int i=0;i<priority[g]->count;++i)
+                if (!strcmp(priority[g]->cells[i].key,"tray")) wanted+=priority[g]->cells[i].width;
+        int tray_space=min(wanted,max(1,available/2)),ordinary=max(0,available-tray_space);
+        for (size_t g=0;g<count_of(priority);++g) {
+            w_bar_group *group=priority[g];
+            group->length=0;
+            for (int i=0;i<group->count;++i) {
+                w_bar_cell *cell=&group->cells[i];
+                int *budget=!strcmp(cell->key,"tray") ? &tray_space : &ordinary;
+                cell->width=min(cell->width,*budget);
+                *budget-=cell->width;
+                group->length+=cell->width;
+            }
+        }
+    }
     // Keep status controls on the trailing edge. Shift the clock before clipping a group.
     int right_start=max(margin,length-margin-right.length);
     int middle=max(margin,min(max(margin+left.length,(length-center.length)/2),right_start-center.length));
@@ -492,6 +539,7 @@ static void w_bar_layout(w_bar_window *b,HDC dc,RECT r,bool vertical) {
     w_place_group(b,r,&left,vertical,margin,center.length ? middle : right_start,0);
     w_place_group(b,r,&center,vertical,middle,center_end,sizeof(b->config->bar_left));
     w_place_group(b,r,&right,vertical,right_start,length-margin,sizeof(b->config->bar_left)+sizeof(b->config->bar_center));
+    if (tray) w_bar_tray_layout(b,r,vertical,margin);
 }
 
 bool w_bar_anchor(const w_bar_window *b, int hit, w_popup_anchor *anchor) {
@@ -514,6 +562,7 @@ void w_bar_invoke(w_bar_window *b, int hit, const char *action) {
 bool w_bar_activate_hit(w_bar_window *b, int hit) {
     if (hit < 0 || hit >= b->hit_count) return false;
     const struct w_bar_hit *item = &b->hits[hit];
+    if (!(item->style && *item->style->action) && w_bar_tray_action(b,hit,NIN_KEYSELECT)) return true;
     w_bar_tip_hide(b);
     if (!(item->style && *item->style->action) && strcmp(item->module,"media") && w_bar_menu_open(b,hit))
         return true;
@@ -546,7 +595,7 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_PAINT)
         return w_paint_bar(b, w);
     // A status or configuration change can move controls before the next WM_PAINT.
-    if (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONUP || msg==WM_RBUTTONUP || msg==WM_MBUTTONUP ||
+    if (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONDBLCLK || msg==WM_LBUTTONUP || msg==WM_RBUTTONUP || msg==WM_MBUTTONUP ||
         msg==WM_MOUSEWHEEL) UpdateWindow(w);
     if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN ||
         msg == WM_MOUSEWHEEL || msg == WM_CANCELMODE) w_bar_tip_hide(b);
@@ -565,6 +614,7 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(w,NULL,FALSE);
         }
         b->pointer_inside=false;
+        w_bar_tray_hover(b,-1);
         w_hover(b,-1);
     }
     if (msg == WM_TIMER && wp == bar_modules_timer) {
@@ -580,15 +630,17 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     }
-    if (msg == WM_TIMER && wp == bar_fade_timer) {
-        if (b->fade.start && !w_bar_fade_tick(w,&b->fade,b->motion_allowed) && !b->fade.target)
+    if (msg==WM_TIMER && wp==bar_tray_timer) { InvalidateRect(w,NULL,FALSE);return 0; }
+    if (msg == WM_TIMER && wp == layer_fade_timer) {
+        if (b->fade.start && !w_layer_fade_tick(w,&b->fade,b->motion_allowed) && !b->fade.target)
             ShowWindow(w,SW_HIDE);
         return 0;
     }
     if (msg == WM_SHOWWINDOW && !wp) {
+        w_bar_tray_reset(b);
         w_bar_tip_track(b,-1);
         KillTimer(w,bar_modules_timer);
-        KillTimer(w,bar_fade_timer);
+        KillTimer(w,layer_fade_timer);
         b->modules_ticking = b->pointer_inside = false;
         b->fade = (w_layer_fade){0};
         b->hover = -1;
@@ -604,12 +656,15 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             TRACKMOUSEEVENT track = {sizeof(track), TME_LEAVE, w, 0};
             b->pointer_inside = TrackMouseEvent(&track)!=0;
         }
-        w_hover(b, w_hit_at(b, p));
+        int index=w_hit_at(b,p);
+        w_bar_tray_hover(b,index);
+        w_hover(b,index);
         w_bar_tip_move(b);
         return 0;
     }
     if (msg == WM_MOUSELEAVE) {
         b->pointer_inside = false;
+        w_bar_tray_hover(b,-1);
         w_hover(b, -1);
         return 0;
     }
@@ -629,6 +684,11 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         b->cells=NULL;
         b->cell_capacity=b->hit_count=0;
         return 0;
+    }
+    if (msg==WM_LBUTTONDBLCLK) {
+        int hit=w_hit_at(b,(POINT){GET_X_LPARAM(lp),GET_Y_LPARAM(lp)});
+        if (hit>=0 && b->hits[hit].tray_key && w_bar_tray_action(b,hit,msg)) return 0;
+        msg=WM_LBUTTONDOWN;
     }
     if (msg == WM_LBUTTONDOWN) {
         b->press = (POINT){GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
@@ -676,6 +736,7 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         if (hit != w_hit_at(b, start) || hit<0 || strcmp(b->press_instance,b->hits[hit].instance) ||
             b->press_workspace!=b->hits[hit].workspace)
             return 0;
+        if (!(b->hits[hit].style && *b->hits[hit].style->action) && w_bar_tray_action(b,hit,WM_LBUTTONUP)) return 0;
         w_bar_activate_hit(b,hit);
         return 0;
     }
@@ -683,10 +744,21 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         ReleaseCapture();
     if (msg == WM_CAPTURECHANGED || msg == WM_CANCELMODE) {
         b->dragging = b->pressed = false;
+        b->tray.context_button=0;
         return 0;
+    }
+    if (msg==WM_RBUTTONDOWN || msg==WM_MBUTTONDOWN || msg==WM_RBUTTONDBLCLK || msg==WM_MBUTTONDBLCLK) {
+        UpdateWindow(w);
+        int i=w_hit_at(b,(POINT){GET_X_LPARAM(lp),GET_Y_LPARAM(lp)});
+        b->tray.context_key=i>=0 ? b->hits[i].tray_key : 0;
+        b->tray.context_button=msg==WM_RBUTTONDOWN || msg==WM_RBUTTONDBLCLK ? WM_RBUTTONUP : WM_MBUTTONUP;
     }
     if (msg == WM_MBUTTONUP || msg == WM_RBUTTONUP) {
         int hit = w_hit_at(b, (POINT){GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
+        if (b->tray.context_button==msg) {
+            b->tray.context_button=0;
+            if (b->tray.context_key!=(hit>=0 ? b->hits[hit].tray_key : 0)) return 0;
+        }
         if (hit < 0) {
             w_bar_menu_close(NULL, true);
             w_bar_invoke(b,-1,NULL);
@@ -696,6 +768,7 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         const w_module_style *style=b->hits[hit].style;
         if (style && *(msg==WM_MBUTTONUP ? style->middle_click : style->right_click))
             action=msg==WM_MBUTTONUP ? style->middle_click : style->right_click;
+        else if (w_bar_tray_action(b,hit,msg)) return 0;
         else if (!strcmp(key, "audio"))
             action = "mute";
         else if (msg == WM_MBUTTONUP && !strcmp(key,"menu")) action="bar_settings";
@@ -735,6 +808,7 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             return 0;
         const w_module_style *style = b->hits[hit].style;
         const char *action = style ? (steps > 0 ? style->scroll_up : style->scroll_down) : "";
+        if (!*action && w_bar_tray_scroll(b,hit,steps)) return 0;
         if (!*action && !strcmp(b->hits[hit].module, "audio"))
             action = steps > 0 ? "volume_up" : "volume_down";
         if (*action) {
@@ -755,7 +829,7 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         POINT cursor;
         if (GetCursorPos(&cursor) && ScreenToClient(w,&cursor)) {
             int hit=w_hit_at(b,cursor);
-            if (hit>=0 && (*b->hits[hit].action || !strcmp(b->hits[hit].module,"audio") ||
+            if (hit>=0 && (*b->hits[hit].action || !strcmp(b->hits[hit].module,"audio") || !strcmp(b->hits[hit].module,"tray") ||
                 (b->hits[hit].style && (*b->hits[hit].style->right_click || *b->hits[hit].style->middle_click)))) {
                 SetCursor(LoadCursorW(NULL,IDC_HAND));
                 return TRUE;
@@ -773,12 +847,13 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 //~ Bar lifecycle
 
 bool w_bar_create(w_bar_window *b, int output, const w_desktop_config *cfg, bar_action invoke) {
-    WNDCLASSW wc = {.hInstance = GetModuleHandleW(NULL),
+    WNDCLASSW wc = {.hInstance = GetModuleHandleW(NULL),.style=CS_DBLCLKS,
                     .lpszClassName = L"WinwmBar",
                     .lpfnWndProc = w_bar_proc,
                     .hCursor = LoadCursorW(NULL, IDC_ARROW)};
     RegisterClassW(&wc);
     b->tip.index = b->hover = b->audio_percent = -1;
+    b->tray.source=b->tray.suppressed=-1;
     HIGHCONTRASTW hc={.cbSize=sizeof(hc)};
     b->high_contrast=SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(hc),&hc,0) && (hc.dwFlags&HCF_HIGHCONTRASTON);
     b->config = cfg;
@@ -786,6 +861,7 @@ bool w_bar_create(w_bar_window *b, int output, const w_desktop_config *cfg, bar_
     b->invoke = invoke;
     b->hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, wc.lpszClassName,
                               L"winwm bar", WS_POPUP, 0, 0, 1, 1, NULL, NULL, wc.hInstance, b);
+    if (b->hwnd) w_theme_material(b->hwnd);
     return b->hwnd != NULL;
 }
 
@@ -815,7 +891,7 @@ w_rect w_bar_position(w_bar_window *b, w_rect screen, w_rect available, int dpi,
             if (GetCapture() == b->hwnd)
                 ReleaseCapture();
             SetWindowLongPtrW(b->hwnd,GWL_EXSTYLE,GetWindowLongPtrW(b->hwnd,GWL_EXSTYLE)|WS_EX_TRANSPARENT);
-            if (!w_bar_fade(b->hwnd,&b->fade,0,b->config->motion[motion_layers_out],b->motion_allowed))
+            if (!w_layer_fade_to(b->hwnd,&b->fade,0,b->config->motion[motion_layers_out],b->motion_allowed))
                 ShowWindow(b->hwnd,SW_HIDE);
         }
         return work;
@@ -840,7 +916,7 @@ w_rect w_bar_position(w_bar_window *b, w_rect screen, w_rect available, int dpi,
     }
     if (!IsWindowVisible(b->hwnd) || !b->fade.target) {
         SetWindowLongPtrW(b->hwnd,GWL_EXSTYLE,GetWindowLongPtrW(b->hwnd,GWL_EXSTYLE)&~(LONG_PTR)WS_EX_TRANSPARENT);
-        w_bar_fade(b->hwnd,&b->fade,255,b->config->motion[motion_layers_in],b->motion_allowed);
+        w_layer_fade_to(b->hwnd,&b->fade,255,b->config->motion[motion_layers_in],b->motion_allowed);
     }
     SetWindowPos(b->hwnd, HWND_TOPMOST, area.x, area.y, area.w, area.h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
     return work;
@@ -856,7 +932,7 @@ void w_bar_invalidate(w_bar_window *b, const char *module) {
 void w_bar_update(w_bar_window *b, const w_bar_view *v) {
     if (memcmp(&b->view, v, sizeof(*v))) {
         b->view = *v;
-        InvalidateRect(b->hwnd, NULL, FALSE);
+        if (b->hwnd) InvalidateRect(b->hwnd, NULL, FALSE);
     }
 }
 

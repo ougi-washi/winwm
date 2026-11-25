@@ -1,4 +1,5 @@
 #include "os_win32/os_win32.h"
+#include "os_win32/environment.h"
 #include <restartmanager.h>
 #include <wchar.h>
 
@@ -74,6 +75,7 @@ static bool w_explorer_tray_pending(const wchar_t *exe) {
     HWND tray = NULL;
     while ((tray = FindWindowExW(NULL,tray,L"Shell_TrayWnd",NULL))) {
         DWORD pid = w_window_pid(tray);
+        if (pid == GetCurrentProcessId()) continue;
         HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,FALSE,pid);
         if (!process) continue;
         DWORD error = w_check_explorer(process,pid,exe);
@@ -81,6 +83,11 @@ static bool w_explorer_tray_pending(const wchar_t *exe) {
         if (!error) return true;
     }
     return false;
+}
+
+bool w_os_explorer_tray_present(void) {
+    wchar_t directory[MAX_PATH], exe[MAX_PATH];
+    return !w_explorer_path(directory,exe) && w_explorer_tray_pending(exe);
 }
 
 static DWORD w_shutdown_explorer(HWND shell, HANDLE process, DWORD pid) {
@@ -166,6 +173,7 @@ DWORD w_os_ensure_shell(void) {
         if (!launched && !shell && !w_explorer_tray_pending(exe)) {
             STARTUPINFOW startup = {.cb=sizeof(startup)};
             PROCESS_INFORMATION child = {0};
+            w_environment_for_launch();
             if (!CreateProcessW(exe,NULL,NULL,NULL,FALSE,0,NULL,directory,&startup,&child))
                 return GetLastError();
             CloseHandle(child.hThread);

@@ -10,7 +10,7 @@ typedef struct w_run_state {
     LONG refs;
     SRWLOCK lock;
     HANDLE job;
-    bool cancelled, done, pending;
+    bool cancelled, done, pending, dirty;
     HWND owner;
     UINT message;
     w_provider_config spec;
@@ -45,6 +45,17 @@ static void w_signal_owner(w_run_state *r) {
         r->pending = PostMessageW(r->owner, r->message, 0, 0) != 0;
 }
 
+static bool w_same_value(const w_provider_value *a, const w_provider_value *b) {
+    return a->percent == b->percent && !wcscmp(a->text,b->text) && !wcscmp(a->tooltip,b->tooltip) &&
+           !strcmp(a->class_name,b->class_name);
+}
+
+static bool w_set_value(w_provider_value *current, const w_provider_value *next) {
+    if (w_same_value(current,next)) return false;
+    *current = *next;
+    return true;
+}
+
 static void w_publish(w_run_state *r, const char *line) {
     w_provider_value v = {.percent = -1};
     if (*line == '{') {
@@ -72,8 +83,8 @@ static void w_publish(w_run_state *r, const char *line) {
     } else if (!w_os_wide(line, v.text, count_of(v.text)))
         return;
     AcquireSRWLockExclusive(&r->lock);
-    r->value = v;
-    w_signal_owner(r);
+    if (w_set_value(&r->value,&v)) r->dirty = true;
+    if (r->dirty) w_signal_owner(r);
     ReleaseSRWLockExclusive(&r->lock);
 }
 
@@ -212,21 +223,25 @@ static bool w_start_slot(w_provider_slot *s, ULONGLONG now) {
 ////////////////
 //~ Provider lifecycle
 
-void w_providers_tick(void) {
+bool w_providers_tick(void) {
     KillTimer(owner, provider_timer);
     ULONGLONG now = GetTickCount64(), next = 0;
+    bool updated = false;
     for (int i = 0; i < slot_count; i++) {
         w_provider_slot *s = &slots[i];
         if (s->run) {
             w_run_state *r = s->run;
             AcquireSRWLockExclusive(&r->lock);
             bool done = r->done;
-            s->value = r->value;
+            if (r->dirty) {
+                updated |= w_set_value(&s->value,&r->value);
+                r->dirty = false;
+            }
             r->pending = false;
             ReleaseSRWLockExclusive(&r->lock);
             if (done || (s->deadline && now >= s->deadline)) {
                 if (!done)
-                    s->value = (w_provider_value){.text=L"timed out", .percent=-1};
+                    updated |= w_set_value(&s->value,&(w_provider_value){.text=L"timed out", .percent=-1});
                 w_stop_slot(s);
                 s->deadline = 0;
                 s->due = s->spec.interval ? now + 1000ull * s->spec.interval : 0;
@@ -235,7 +250,7 @@ void w_providers_tick(void) {
         if (!s->run && s->due && s->due <= now) {
             s->due = 0;
             if (!w_start_slot(s, now)) {
-                s->value = (w_provider_value){.text=L"unavailable", .percent=-1};
+                updated |= w_set_value(&s->value,&(w_provider_value){.text=L"unavailable", .percent=-1});
                 if (s->spec.interval)
                     s->due = now + 1000ull * s->spec.interval;
             }
@@ -246,6 +261,7 @@ void w_providers_tick(void) {
     }
     if (next)
         SetTimer(owner, provider_timer, next > now ? (UINT)(next - now) : 1, NULL);
+    return updated;
 }
 
 void w_providers_stop(void) {
@@ -310,5 +326,5 @@ void w_providers_refresh(void) {
     for (int i = 0; i < slot_count; i++)
         if (!slots[i].run)
             slots[i].due = 1;
-    w_providers_tick();
+    if (slot_count) PostMessageW(owner,changed,0,0);
 }

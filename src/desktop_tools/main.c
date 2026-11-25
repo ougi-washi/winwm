@@ -2,6 +2,7 @@
 #include "desktop_tools/tools.h"
 #include "desktop_tools/adapter.h"
 #include "theme/theme.h"
+#include "os_win32/environment.h"
 #include <powrprof.h>
 #include <shellscalingapi.h>
 #include <wchar.h>
@@ -33,10 +34,13 @@ static int w_run_tool(const wchar_t *mode) {
     w_desktop_config *cfg = calloc(1, sizeof(*cfg));
     if (cfg) {
         w_config_defaults(cfg);
-        w_os_cache_read(cfg);
-        w_theme_colors(cfg->background, cfg->foreground, cfg->accent);
+        char diagnostic[256];
+        if (!w_os_cache_read(cfg) && !w_os_config_load(cfg,diagnostic,sizeof(diagnostic)))
+            w_config_defaults(cfg);
+        w_theme_configure(cfg);
         w_tool_popup_preferences(cfg);
         if (!wcscmp(mode, L"project")) {
+            w_environment_start(NULL,0);
             int result = w_project_run(cfg);
             free(cfg);
             return result;
@@ -52,8 +56,10 @@ static int w_run_tool(const wchar_t *mode) {
         return w_clock_run();
     if (!wcscmp(mode, L"pick_color"))
         return w_color_run();
-    if (!wcscmp(mode,L"packages") || !wcscmp(mode,L"updates") || !wcscmp(mode,L"chocolatey") || !wcscmp(mode,L"google_japanese_input"))
+    if (!wcscmp(mode,L"packages") || !wcscmp(mode,L"updates") || !wcscmp(mode,L"chocolatey") || !wcscmp(mode,L"google_japanese_input")) {
+        w_environment_start(NULL,0);
         return w_packages_run(mode);
+    }
     if (!wcscmp(mode, L"activity"))
         return w_activity_run();
     int result = 0;
@@ -84,5 +90,6 @@ static int w_run_tool(const wchar_t *mode) {
 int w_tools_run(const wchar_t *mode) {
     int result = w_run_tool(mode);
     w_tool_popup_cleanup();
+    w_environment_stop();
     return result;
 }

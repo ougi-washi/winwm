@@ -1,5 +1,6 @@
 @compile.rsp
 src/install/main.c
+src/os_win32/shell_policy.c
 build/install_res.o
 -luser32
 -ladvapi32

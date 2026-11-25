@@ -86,7 +86,7 @@ static bool w_release_app(HWND foreground, HWND surface) {
 
 void w_desktop_focus_empty(void) {
     w_desktop_focus_cancel();
-    if (!w_palette_shown() && !w_bar_menu_active() && !w_desktop_popup_process())
+    if (!w_palette_shown() && !w_notice_visible() && !w_bar_menu_active() && !w_desktop_popup_process())
         w_release_app(GetForegroundWindow(), w_desktop_surface());
     desk.model.focus = -1;
     w_desktop_schedule();
@@ -121,7 +121,7 @@ static bool w_thread_owns_pointer(DWORD thread_id) {
 }
 
 bool w_desktop_focus_new(w_window_id id) {
-    if (!w_model_visible(&desk.model, id.slot) || w_palette_shown() || w_bar_menu_active() || w_desktop_popup_process() ||
+    if (!w_model_visible(&desk.model, id.slot) || w_palette_shown() || w_notice_visible() || w_bar_menu_active() || w_desktop_popup_process() ||
         w_thread_owns_pointer(0) || w_thread_owns_pointer(GetCurrentThreadId()))
         return false;
     HWND owner = desk.windows[id.slot].hwnd;
@@ -268,6 +268,7 @@ static bool w_tool_panel(HWND window, DWORD pid) {
 }
 
 bool w_desktop_close_foreground(void) {
+    if (w_notice_close()) return true;
     HWND window = GetForegroundWindow();
     DWORD pid = 0;
     GetWindowThreadProcessId(window,&pid);
@@ -294,7 +295,7 @@ void w_desktop_focus_apply(void) {
     if (!w_model_valid(&desk.model, pending.window))
         return;
     int slot = pending.window.slot;
-    if (!w_model_visible(&desk.model, slot) || w_palette_shown() || w_bar_menu_active() ||
+    if (!w_model_visible(&desk.model, slot) || w_palette_shown() || w_notice_visible() || w_bar_menu_active() ||
         pending.pointer_presses != w_input_pointer_press_count()) {
         w_desktop_focus_cancel();
         w_select_owner(w_os_app_window(GetForegroundWindow()));
@@ -324,7 +325,7 @@ void w_desktop_hover(POINT point) {
     static HWND last_hit, denied_by;
     static uint32_t last_generation;
     static bool denied;
-    if (!desk.config.follow_mouse || w_desktop_focus_pending() || w_palette_shown() ||
+    if (!desk.config.follow_mouse || w_desktop_focus_pending() || w_palette_shown() || w_notice_visible() ||
         w_bar_menu_active() || w_desktop_popup_process() ||
         GetAsyncKeyState(VK_LBUTTON) < 0 || GetAsyncKeyState(VK_RBUTTON) < 0 ||
         GetAsyncKeyState(VK_MBUTTON) < 0 || GetAsyncKeyState(VK_XBUTTON1) < 0 || GetAsyncKeyState(VK_XBUTTON2) < 0)

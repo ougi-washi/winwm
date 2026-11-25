@@ -197,6 +197,7 @@ static w_button_panel *w_panel(HWND parent) {
         return NULL;
     }
     SetWindowTheme(s->tip,L"",L"");
+    w_theme_material(s->tip);
     return s;
 }
 

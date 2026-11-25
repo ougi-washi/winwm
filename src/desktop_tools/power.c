@@ -10,8 +10,26 @@ DWORD WINAPI PowerWriteACValueIndex(HKEY, const GUID *, const GUID *, const GUID
 DWORD WINAPI PowerWriteDCValueIndex(HKEY, const GUID *, const GUID *, const GUID *, DWORD);
 
 static HWND plans_box, activate, timers, duration, message, save;
-static GUID *plans;
+typedef struct {
+    GUID id;
+    wchar_t name[256];
+} w_power_plan;
+typedef struct {
+    DWORD seconds;
+    bool available;
+} w_timer_value;
+typedef struct {
+    LONG refs;
+    w_power_plan *plans;
+    size_t count;
+    GUID active;
+    size_t initial;
+    w_timer_value values[4];
+} w_power_scan;
+static w_power_plan *plans;
 static size_t plan_count;
+static HANDLE scan_thread;
+static w_power_scan *scan;
 static DWORD original;
 static bool editing, readable;
 static const GUID *const groups[] = {&GUID_VIDEO_SUBGROUP, &GUID_SLEEP_SUBGROUP};
@@ -20,7 +38,7 @@ static const wchar_t *const names[] = {L"Turn off display", L"Put computer to sl
 
 static GUID *w_plan(void) {
     LRESULT i = SendMessageW(plans_box, CB_GETCURSEL, 0, 0);
-    return i >= 0 && (size_t)i < plan_count ? &plans[i] : NULL;
+    return i >= 0 && (size_t)i < plan_count ? &plans[i].id : NULL;
 }
 
 static int w_timer_id(void) {
@@ -61,9 +79,10 @@ static bool w_active(const GUID *plan) {
     return same;
 }
 
-void w_power_selected(void) {
+static void w_show_timer(w_timer_value value, bool active) {
     GUID *plan = w_plan();
-    readable = w_read(plan, w_timer_id(), &original) == ERROR_SUCCESS;
+    readable = value.available;
+    original = value.seconds;
     wchar_t text[40] = {0};
     if (readable) w_interval(original, text, count_of(text));
     editing = true;
@@ -71,7 +90,6 @@ void w_power_selected(void) {
     editing = false;
     EnableWindow(duration, readable);
     EnableWindow(save, FALSE);
-    bool active = w_active(plan);
     EnableWindow(activate, plan && !active);
     SetWindowTextW(activate, active ? L"Active plan" : L"Use plan");
     SetWindowTextW(message, !plan ? L"No power plans available." :
@@ -79,19 +97,38 @@ void w_power_selected(void) {
                               L"This timer is unavailable on this system.");
 }
 
-static void w_load_timers(int selected) {
+static w_timer_value w_timer_value_for(GUID *plan, int id) {
+    w_timer_value value = {0};
+    value.available = w_read(plan,id,&value.seconds) == ERROR_SUCCESS;
+    return value;
+}
+
+void w_power_selected(void) {
+    if (scan_thread) return;
+    GUID *plan = w_plan();
+    w_show_timer(w_timer_value_for(plan,w_timer_id()),w_active(plan));
+}
+
+static void w_show_timers(int selected, const w_timer_value *values, bool active) {
     GUID *plan = w_plan();
     SendMessageW(timers, LB_RESETCONTENT, 0, 0);
     for (int i = 0; plan && i < 4; ++i) {
-        DWORD seconds = 0;
         wchar_t value[40] = L"Unavailable", text[160];
-        if (w_read(plan, i, &seconds) == ERROR_SUCCESS) w_interval(seconds, value, count_of(value));
+        if (values[i].available) w_interval(values[i].seconds,value,count_of(value));
         swprintf(text, count_of(text), L"%ls    ·    %ls    ·    %ls",
                  i < 2 ? L"Plugged in" : L"On battery", names[i%2], value);
         SendMessageW(timers, LB_ADDSTRING, 0, (LPARAM)text);
     }
     SendMessageW(timers, LB_SETCURSEL, selected, 0);
-    w_power_selected();
+    int id = w_timer_id();
+    w_show_timer(id >= 0 && id < 4 ? values[id] : (w_timer_value){0},active);
+}
+
+static void w_load_timers(int selected) {
+    GUID *plan = w_plan();
+    w_timer_value values[4];
+    for (int i = 0; i < 4; ++i) values[i] = w_timer_value_for(plan,i);
+    w_show_timers(selected,values,w_active(plan));
 }
 
 void w_power_save(void) {
@@ -119,8 +156,22 @@ void w_power_save(void) {
                    pending ? L"Timer saved. Reactivate the plan to apply it." : L"Timer saved.");
 }
 
+static void w_release_scan(w_power_scan *s) {
+    if (s && !InterlockedDecrement(&s->refs)) {
+        free(s->plans);
+        free(s);
+    }
+}
+
 bool w_power_message(UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_DESTROY) { free(plans); return false; }
+    if (msg == WM_DESTROY) {
+        if (scan_thread) CloseHandle(scan_thread);
+        scan_thread = NULL;
+        w_release_scan(scan);
+        scan = NULL;
+        free(plans);
+        return false;
+    }
     if (msg != WM_COMMAND) return false;
     HWND from = (HWND)lp;
     if (from == plans_box && HIWORD(wp) == CBN_SELCHANGE) {
@@ -161,23 +212,69 @@ void w_power_create(HWND panel, HWND list, HWND status, HWND apply) {
         wchar_t val[40]; w_interval(minutes[i]*60, val, count_of(val));
         SendMessageW(duration, CB_ADDSTRING, 0, (LPARAM)val);
     }
+    EnableWindow(activate,FALSE);
+    EnableWindow(duration,FALSE);
+    EnableWindow(save,FALSE);
+    SetWindowTextW(message,L"Reading power plans…");
+}
+
+static DWORD WINAPI w_scan_plans(void *arg) {
+    w_power_scan *s = arg;
     GUID *active = NULL;
-    PowerGetActiveScheme(NULL, &active);
-    int selected = 0;
+    if (PowerGetActiveScheme(NULL,&active) == ERROR_SUCCESS && active) s->active = *active;
+    LocalFree(active);
     for (DWORD i = 0; ; ++i) {
         GUID id;
         DWORD bytes = sizeof(id);
         if (PowerEnumerate(NULL,NULL,NULL,ACCESS_SCHEME,i,(BYTE *)&id,&bytes) != ERROR_SUCCESS) break;
         wchar_t name[256]; bytes = sizeof(name);
         if (PowerReadFriendlyName(NULL,&id,NULL,NULL,(BYTE *)name,&bytes) != ERROR_SUCCESS) continue;
-        GUID *next = realloc(plans, (plan_count+1)*sizeof(*plans));
+        w_power_plan *next = realloc(s->plans,(s->count+1)*sizeof(*next));
         if (!next) break;
-        plans = next;
-        if (SendMessageW(plans_box,CB_ADDSTRING,0,(LPARAM)name) < 0) continue;
-        if (active && IsEqualGUID(active,&id)) selected = (int)plan_count;
-        plans[plan_count++] = id;
+        s->plans = next;
+        if (IsEqualGUID(&s->active,&id)) s->initial = s->count;
+        next[s->count].id = id;
+        lstrcpynW(next[s->count++].name,name,count_of(next[0].name));
     }
-    LocalFree(active);
+    if (s->count)
+        for (int i=0; i<4; ++i) s->values[i] = w_timer_value_for(&s->plans[s->initial].id,i);
+    w_release_scan(s);
+    return 0;
+}
+
+void w_power_start(void) {
+    scan = calloc(1,sizeof(*scan));
+    if (scan) {
+        scan->refs = 2;
+        scan_thread = CreateThread(NULL,0,w_scan_plans,scan,0,NULL);
+    }
+    if (!scan_thread) {
+        free(scan);
+        scan = NULL;
+        SetWindowTextW(message,L"Could not read power plans.");
+    }
+}
+
+HANDLE w_power_pending(void) { return scan_thread; }
+
+void w_power_finish(void) {
+    CloseHandle(scan_thread);
+    scan_thread = NULL;
+    plans = scan->plans;
+    scan->plans = NULL;
+    GUID initial = scan->count ? plans[scan->initial].id : (GUID){0};
+    int selected = 0;
+    for (size_t i = 0; i < scan->count; ++i) {
+        if (SendMessageW(plans_box,CB_ADDSTRING,0,(LPARAM)plans[i].name) < 0) continue;
+        if (IsEqualGUID(&scan->active,&plans[i].id)) selected = (int)plan_count;
+        if (plan_count != i) plans[plan_count] = plans[i];
+        ++plan_count;
+    }
     SendMessageW(plans_box,CB_SETCURSEL,selected,0);
-    w_load_timers(0);
+    GUID *shown = w_plan();
+    if (!shown || IsEqualGUID(shown,&initial))
+        w_show_timers(0,scan->values,shown && IsEqualGUID(shown,&scan->active));
+    else w_load_timers(0);
+    w_release_scan(scan);
+    scan = NULL;
 }

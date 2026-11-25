@@ -50,7 +50,7 @@ HANDLE w_recovery_attach(bool preview, HWND *window) {
     if (!w_recovery_path(path) || !GetProcessTimes(GetCurrentProcess(),&created,&exited,&kernel,&user))
         return NULL;
     DWORD pid = GetCurrentProcessId();
-    swprintf(args,count_of(args),L"/start2:%u:%lu:%llu",preview,pid,
+    swprintf(args,count_of(args),L"/start3:%u:%lu:%llu",preview,pid,
              ((uint64_t)created.dwHighDateTime << 32) | created.dwLowDateTime);
     // The short-lived launcher exits before we change any windows. Ending the
     // manager's process tree then leaves the recovery monitor running.
@@ -60,25 +60,21 @@ HANDLE w_recovery_attach(bool preview, HWND *window) {
     if (WaitForSingleObject(launcher,15000) == WAIT_OBJECT_0) GetExitCodeProcess(launcher,&code);
     CloseHandle(launcher);
     if (code) { SetLastError(code); return NULL; }
-    ULONGLONG end = GetTickCount64()+5000;
-    do {
-        HWND w = FindWindowW(L"WinwmHost",NULL);
-        if ((DWORD)(uintptr_t)GetPropW(w,L"winwm.session_pid") == pid) {
-            DWORD host_pid = 0;
-            GetWindowThreadProcessId(w,&host_pid);
-            HANDLE host = OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,FALSE,host_pid);
-            if (host) {
-                wchar_t actual[os_path_cap];
-                DWORD size = count_of(actual);
-                if (QueryFullProcessImageNameW(host,0,actual,&size) && !_wcsicmp(actual,path)) {
-                    *window = w;
-                    return host;
-                }
-                CloseHandle(host);
-            }
+    HWND w = NULL;
+    while ((w = FindWindowExW(NULL,w,L"WinwmHost",NULL))) {
+        if ((DWORD)(uintptr_t)GetPropW(w,L"winwm.session_pid") != pid) continue;
+        DWORD host_pid = 0;
+        GetWindowThreadProcessId(w,&host_pid);
+        HANDLE host = OpenProcess(SYNCHRONIZE|PROCESS_QUERY_LIMITED_INFORMATION,FALSE,host_pid);
+        if (!host) continue;
+        wchar_t actual[os_path_cap];
+        DWORD size = count_of(actual);
+        if (QueryFullProcessImageNameW(host,0,actual,&size) && !_wcsicmp(actual,path)) {
+            *window = w;
+            return host;
         }
-        Sleep(20);
-    } while (GetTickCount64() < end);
-    SetLastError(ERROR_TIMEOUT);
+        CloseHandle(host);
+    }
+    SetLastError(ERROR_INVALID_OWNER);
     return NULL;
 }

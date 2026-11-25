@@ -1,5 +1,4 @@
 #include "config/config.h"
-#include "base/json.h"
 #include <ctype.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -130,16 +129,21 @@ bool w_config_bind(w_desktop_config *c, const char *chord, const char *action) {
     bool remove = !strcmp(action, "unbound");
     if (!remove && !w_command_parse(action, &b.action))
         return false;
-    for (int i = 0; i < c->binding_count; i++)
-        if (c->bindings[i].mods == b.mods && c->bindings[i].key == b.key && c->bindings[i].modal == b.modal &&
-            c->bindings[i].next_key == b.next_key && c->bindings[i].next_mods == b.next_mods &&
-            c->bindings[i].release == b.release) {
-            if (remove)
-                c->bindings[i] = c->bindings[--c->binding_count];
-            else
-                c->bindings[i] = b;
-            return true;
+    for (int i = 0; i < c->binding_count;) {
+        w_key_binding *existing = &c->bindings[i];
+        if (existing->mods == b.mods && existing->key == b.key && existing->modal == b.modal &&
+            existing->next_key == b.next_key && existing->next_mods == b.next_mods) {
+            if (remove) {
+                *existing = c->bindings[--c->binding_count];
+                continue;
+            }
+            if (existing->release == b.release) {
+                *existing = b;
+                return true;
+            }
         }
+        ++i;
+    }
     if (remove)
         return true;
     if (c->binding_count >= binding_limit)
@@ -149,7 +153,7 @@ bool w_config_bind(w_desktop_config *c, const char *chord, const char *action) {
 }
 
 ////////////////
-//~ Default bindings
+//~ Default options
 
 void w_config_defaults(w_desktop_config *c) {
     memset(c, 0, sizeof(*c));
@@ -157,8 +161,8 @@ void w_config_defaults(w_desktop_config *c) {
     c->outer_gap = 6;
     c->border_size = 2;
     c->resize_on_border = true;
-    c->drag_mods = 8; // Super
     c->rounding = 8;
+    c->panel_material = (w_panel_material){.opacity = 240, .blur = true, .shadow = true};
     c->animations = motion_system;
     const int ms[motion_count] = {160, 190, 180, 140, 140, 160, 120, 160, 140};
     for (int i = 0; i < motion_count; i++)
@@ -167,6 +171,10 @@ void w_config_defaults(w_desktop_config *c) {
     c->inactive_border = 0x292b33;
     c->follow_mouse = true;
     c->bar_height = 32;
+    c->notifications = (w_notification_config){
+        .enabled = true, .capture = notice_capture_windows, .corner = notice_top_right, .duration_ms = 5000,
+        .fade_ms = 160, .history_limit = 128, .visible_limit = 3, .margin = 12, .width = 360
+    };
     c->bar_tooltip_delay = 400;
     c->bar_tooltip_duration = 4500;
     c->bar_workspace_count = 5;
@@ -176,133 +184,19 @@ void w_config_defaults(w_desktop_config *c) {
     strcpy(c->edge, "top");
     strcpy(c->bar_left, "menu workspaces mode");
     strcpy(c->bar_center, "clock");
-    strcpy(c->bar_right, "cpu bluetooth network audio keyboard battery");
+    strcpy(c->bar_right, "tray cpu bluetooth network audio keyboard battery notifications");
     strcpy(c->file_browser, "FilePilot.exe");
     strcpy(c->task_manager, "TaskSlinger.exe");
     strcpy(c->terminal, "auto");
     strcpy(c->editor, "%SystemRoot%\\System32\\notepad.exe");
-    static const char *const pairs[][2] = {{"super+enter", "terminal"},
-                                           {"super+d", "menu"},
-                                           {"ctrl+alt+space", "menu"},
-                                           {"super+p", "open_folder"},
-                                           {"super+shift+escape", "open_tasks"},
-                                           {"super+tab", "switcher"},
-                                           {"super+b", "launch brave"},
-                                           {"super+shift+v", "split horizontal"},
-                                           {"alt+tab", "switcher"},
-                                           {"alt+shift+tab", "switcher"},
-                                           {"alt+escape", "switcher"},
-                                           {"alt+f4", "close"},
-                                           {"ctrl+shift+escape", "open_tasks"},
-                                           {"ctrl+escape", "menu"},
-                                           {"resize:left", "resize shrink"},
-                                           {"resize:right", "resize grow"},
-                                           {"super+v", "split vertical"},
-                                           {"super+e", "layout tree"},
-                                           {"super+w", "layout tabs"},
-                                           {"super+s", "layout stack"},
-                                           {"super+f", "fullscreen"},
-                                           {"super+shift+space", "floating"},
-                                           {"resize:escape", "resize_mode"},
-                                           {"resize:h", "resize shrink"},
-                                           {"resize:l", "resize grow"},
-                                           {"super+r", "resize_mode"},
-                                           {"super+minus", "scratch_show"},
-                                           {"super+shift+minus", "scratch_send"},
-                                           {"super+shift+q", "close"},
-                                           {"super+shift+c", "reload"},
-                                           {"super+shift+p", "settings"},
-                                           {"super+shift+i", "clipboard"},
-                                           {"super+shift+x", "capture"},
-                                           {"super+shift+b", "bar_toggle"},
-                                           {"super+shift+d", "output_send"},
-                                           {"super+o", "output_next"},
-                                           {"super+shift+r", "reload"},
-                                           {"super+shift+e", "confirm_sign_out"},
-                                           {"super+space", "focus_mode_toggle"},
-                                           {"super+e", "layout toggle_split"},
-                                           {"resize:enter", "resize_mode"},
-                                           {"print", "capture_region"},
-                                           {"super+f6", "capture_region"},
-                                           {"volume_mute", "mute"},
-                                           {"repeat:volume_up", "volume_up"},
-                                           {"repeat:volume_down", "volume_down"},
-                                           {"resize:repeat:left", "resize left"},
-                                           {"resize:repeat:down", "resize down"},
-                                           {"resize:repeat:up", "resize up"},
-                                           {"resize:repeat:right", "resize right"},
-                                           {"resize:repeat:h", "resize left"},
-                                           {"resize:repeat:j", "resize down"},
-                                           {"resize:repeat:k", "resize up"},
-                                           {"resize:repeat:l", "resize right"}};
-    for (size_t i = 0; i < count_of(pairs); i++)
-        w_config_bind(c, pairs[i][0], pairs[i][1]);
-    const char *dirs[] = {"left", "down", "up", "right"};
-    for (int i = 0; i < 4; i++) {
-        char chord[64], action[64];
-        snprintf(action, sizeof(action), "focus %s", dirs[i]);
-        snprintf(chord, sizeof(chord), "super+%s", dirs[i]);
-        w_config_bind(c, chord, action);
-        snprintf(chord, sizeof(chord), "ctrl+alt+%s", dirs[i]);
-        w_config_bind(c, chord, action);
-        snprintf(chord, sizeof(chord), "super+%c", "hjkl"[i]);
-        w_config_bind(c, chord, action);
-        snprintf(action, sizeof(action), "move %s", dirs[i]);
-        snprintf(chord, sizeof(chord), "repeat:super+shift+%s", dirs[i]);
-        w_config_bind(c, chord, action);
-        snprintf(chord, sizeof(chord), "repeat:super+shift+%c", "hjkl"[i]);
-        w_config_bind(c, chord, action);
-    }
-    w_config_bind(c, "super+h", "split horizontal");
-    for (int n = 1; n <= 10; n++) {
-        char chord[64], action[64];
-        snprintf(chord, sizeof(chord), "super+%d", n % 10);
-        snprintf(action, sizeof(action), "workspace_select %d", n);
-        w_config_bind(c, chord, action);
-        snprintf(chord, sizeof(chord), "super+shift+%d", n % 10);
-        snprintf(action, sizeof(action), "workspace_send %d", n);
-        w_config_bind(c, chord, action);
-    }
 }
 
-static bool w_token_int(w_json_token *t, int lo, int hi, int *out) {
-    if (t->type != json_scalar || !t->length || t->length > 6)
-        return false;
-    int n = 0;
-    for (size_t i = 0; i < t->length; i++) {
-        if (!isdigit((unsigned char)t->text[i]))
-            return false;
-        n = n * 10 + t->text[i] - '0';
-    }
-    if (n < lo || n > hi)
-        return false;
-    *out = n;
-    return true;
-}
-
-static bool w_token_bool(w_json_token *t, bool *v) {
-    if (t->type != json_scalar)
-        return false;
-    if (t->length == 4 && !strncmp(t->text, "true", 4)) {
-        *v = true;
-        return true;
-    }
-    if (t->length == 5 && !strncmp(t->text, "false", 5)) {
-        *v = false;
-        return true;
-    }
-    return false;
-}
-
-static bool w_color(w_json_token *t, uint32_t *out) {
-    char s[10];
-    if (!w_json_read(t, s, sizeof(s)) || strlen(s) != 7 || *s != '#')
-        return false;
-    for (int i = 1; i <= 6; i++)
-        if (!isxdigit((unsigned char)s[i]))
-            return false;
-    *out = (uint32_t)strtoul(s + 1, NULL, 16);
-    return true;
+bool w_config_notifications_valid(const w_notification_config *c) {
+    return (unsigned)c->capture <= notice_capture_visible && (unsigned)c->corner <= notice_bottom_left &&
+           (unsigned)c->duration_ms <= 3600000 &&
+           (unsigned)c->fade_ms <= 5000 && c->history_limit >= 1 && c->history_limit <= notice_history_max &&
+           c->visible_limit >= 1 && c->visible_limit <= notice_visible_max &&
+           (unsigned)c->margin <= 256 && c->width >= 160 && c->width <= 1200;
 }
 
 bool w_config_has_module(const w_desktop_config *c, const char *module) {
@@ -326,7 +220,7 @@ bool w_config_has_module(const w_desktop_config *c, const char *module) {
 
 static const char *const builtins[] = {"menu", "workspaces", "mode", "title", "clock", "bluetooth",
     "network", "throughput", "audio", "keyboard", "battery", "cpu", "memory", "media",
-    "display", "clipboard", "notifications", "project"};
+    "display", "clipboard", "notifications", "project", "tray"};
 
 const char *w_config_module_name(int index) {
     return (unsigned)index < count_of(builtins) ? builtins[index] : NULL;
@@ -401,285 +295,7 @@ bool w_config_style_option(w_module_style *style, const char *key, const char *v
 }
 
 ////////////////
-//~ Configuration parsing
-
-static bool w_json_modules(const w_json_token *t, int v, char *out, size_t cap) {
-    char spec[sizeof(((w_desktop_config *)0)->bar_left)];
-    if (t[v].type == json_string)
-        return w_json_read(&t[v],spec,sizeof(spec)) && w_config_set_modules(out,cap,spec);
-    if (t[v].type != json_array) return false;
-    size_t used = 0;
-    for (int i=v+1; i<t[v].after; i=t[i].after) {
-        char name[sizeof(((w_module_style *)0)->name)];
-        if (!w_json_read(&t[i],name,sizeof(name)) || !w_module_valid(name,strlen(name))) return false;
-        size_t n = strlen(name);
-        if (used + (used != 0) + n >= sizeof(spec)) return false;
-        if (used) spec[used++] = ' ';
-        memcpy(spec+used,name,n);
-        used += n;
-    }
-    spec[used] = 0;
-    return w_str_copy(out,cap,spec);
-}
-
-static bool w_parse_object(w_desktop_config *c, w_json_token *t, int root, char *err, size_t cap) {
-    bool version = false;
-    if (t[root].type != json_object)
-        return false;
-    for (int i = root + 1; i < t[root].after;) {
-        char k[128];
-        int v = i + 1;
-        bool ok = w_json_read(&t[i], k, sizeof(k));
-        if (!ok)
-            return false;
-        w_json_token *a = t + v;
-        if (!strcmp(k, "version")) {
-            int n;
-            ok = w_token_int(a, 1, 1, &n);
-            version = ok;
-        } else if (!strcmp(k, "gap")) {
-            ok = w_token_int(a, 0, 128, &c->gap);
-            c->outer_gap = c->gap;
-        } else if (!strcmp(k, "workspace_names")) {
-            ok = a->type == json_array;
-            memset(c->workspace_names, 0, sizeof(c->workspace_names));
-            int which = 0;
-            for (int j = v + 1; ok && j < a->after; j = t[j].after) {
-                ok = which < workspace_limit &&
-                     w_json_read(t + j, c->workspace_names[which], sizeof(c->workspace_names[0]));
-                if (ok && *c->workspace_names[which]) {
-                    if (isdigit((unsigned char)c->workspace_names[which][0]))
-                        ok = false;
-                    for (int prev = 0; prev < which; prev++)
-                        if (!strcmp(c->workspace_names[which], c->workspace_names[prev]))
-                            ok = false;
-                }
-                which++;
-            }
-        } else if (!strcmp(k, "bar_height"))
-            ok = w_token_int(a, 16, 128, &c->bar_height);
-        else if (!strcmp(k, "bar_tooltip_delay"))
-            ok = w_token_int(a, 0, 10000, &c->bar_tooltip_delay);
-        else if (!strcmp(k, "bar_tooltip_duration"))
-            ok = w_token_int(a, 0, 60000, &c->bar_tooltip_duration);
-        else if (!strcmp(k, "bar_workspace_count"))
-            ok = w_token_int(a, 0, workspace_limit, &c->bar_workspace_count);
-        else if (!strcmp(k, "background"))
-            ok = w_color(a, &c->background);
-        else if (!strcmp(k, "foreground"))
-            ok = w_color(a, &c->foreground);
-        else if (!strcmp(k, "accent"))
-            ok = w_color(a, &c->accent);
-        else if (!strcmp(k, "inactive_border"))
-            ok = w_color(a, &c->inactive_border);
-        else if (!strcmp(k, "border_size"))
-            ok = w_token_int(a, 0, 16, &c->border_size);
-        else if (!strcmp(k, "rounding"))
-            ok = w_token_int(a, 0, 32, &c->rounding);
-        else if (!strcmp(k, "resize_on_border"))
-            ok = w_token_bool(a, &c->resize_on_border);
-        else if (!strcmp(k, "animations")) {
-            bool on;
-            ok = w_token_bool(a, &on);
-            if (ok)
-                c->animations = on ? motion_on : motion_off;
-        }
-        else if (!strcmp(k, "edge"))
-            ok = w_json_read(a, c->edge, sizeof(c->edge)) &&
-                 (!strcmp(c->edge, "top") || !strcmp(c->edge, "bottom") || !strcmp(c->edge, "left") ||
-                  !strcmp(c->edge, "right"));
-        else if (!strcmp(k, "bar_left"))
-            ok = w_json_modules(t,v,c->bar_left,sizeof(c->bar_left));
-        else if (!strcmp(k, "bar_center"))
-            ok = w_json_modules(t,v,c->bar_center,sizeof(c->bar_center));
-        else if (!strcmp(k, "bar_right"))
-            ok = w_json_modules(t,v,c->bar_right,sizeof(c->bar_right));
-        else if (!strcmp(k, "file_browser"))
-            ok = w_json_read(a, c->file_browser, sizeof(c->file_browser)) && *c->file_browser;
-        else if (!strcmp(k, "task_manager"))
-            ok = w_json_read(a, c->task_manager, sizeof(c->task_manager)) && *c->task_manager;
-        else if (!strcmp(k, "terminal"))
-            ok = w_json_read(a, c->terminal, sizeof(c->terminal)) && *c->terminal;
-        else if (!strcmp(k, "editor"))
-            ok = w_json_read(a, c->editor, sizeof(c->editor)) && *c->editor;
-        else if (!strcmp(k, "bindings") || !strcmp(k, "apps")) {
-            ok = a->type == json_object;
-            for (int j = v + 1; ok && j < a->after; j = t[j + 1].after) {
-                char name[80], value[1024];
-                ok = w_json_read(&t[j], name, sizeof(name)) && w_json_read(&t[j + 1], value, sizeof(value)) &&
-                     *name && *value;
-                if (!ok)
-                    break;
-                if (!strcmp(k, "bindings"))
-                    ok = w_config_bind(c, name, value);
-                else {
-                    int n = 0;
-                    while (n < c->app_count && strcmp(c->apps[n].name, name))
-                        n++;
-                    ok = n < app_limit;
-                    if (ok) {
-                        if (n == c->app_count)
-                            c->app_count++;
-                        strcpy(c->apps[n].name, name);
-                        strcpy(c->apps[n].path, value);
-                    }
-                }
-                if (!ok) {
-                    snprintf(err, cap, "line %d: invalid %s entry '%s'", t[j].line, k, name);
-                    return false;
-                }
-            }
-        } else if (!strcmp(k, "modules")) {
-            ok = a->type == json_object;
-            for (int j = v + 1; ok && j < a->after; j = t[j + 1].after) {
-                char name[sizeof(c->styles[0].name)];
-                if (t[j + 1].type != json_object || !w_json_read(&t[j], name, sizeof(name))) {
-                    ok = false;
-                    break;
-                }
-                w_module_style *style = w_config_module_style(c,name);
-                if (!style) {
-                    ok = false;
-                    break;
-                }
-                for (int z = j + 2; ok && z < t[j + 1].after; z = t[z + 1].after) {
-                    char field[32];
-                    w_json_token *val = &t[z + 1];
-                    if (!w_json_read(t + z, field, sizeof(field))) {
-                        ok = false;
-                        break;
-                    }
-                    if (!strcmp(field, "color")) {
-                        ok = w_color(val, &style->color);
-                        style->colored = ok;
-                    } else if (!strcmp(field,"tooltip_enabled") || (!strcmp(field,"tooltip") && val->type == json_scalar)) {
-                        bool enabled;
-                        ok = w_token_bool(val,&enabled);
-                        if (ok) style->hide_tooltip = !enabled;
-                    } else {
-                        char value[sizeof(style->tooltip)];
-                        ok = w_json_read(val,value,sizeof(value)) && w_config_style_option(style,field,value);
-                    }
-                    if (!ok) {
-                        snprintf(err,cap,"line %d: invalid module option '%s.%s'",val->line,name,field);
-                        return false;
-                    }
-                }
-            }
-        } else if (!strcmp(k, "providers")) {
-            ok = a->type == json_object;
-            for (int j = v + 1; ok && j < a->after; j = t[j + 1].after) {
-                char provider[sizeof(c->providers[0].name)];
-                if (t[j + 1].type != json_object || !w_json_read(&t[j], provider, sizeof(provider)) || !*provider) {
-                    ok = false;
-                    break;
-                }
-                int n = 0;
-                while (n < c->provider_count && strcmp(c->providers[n].name, provider))
-                    n++;
-                if (n >= provider_limit) {
-                    ok = false;
-                    break;
-                }
-                w_provider_config *p = &c->providers[n];
-                if (n == c->provider_count) {
-                    c->provider_count++;
-                    p->timeout = 10;
-                    strcpy(p->name, provider);
-                }
-                for (const char *q = p->name; ok && *q; q++)
-                    ok = isalnum((unsigned char)*q) || *q == '_' || *q == '-';
-                for (int z = j + 2; ok && z < t[j + 1].after; z = t[z + 1].after) {
-                    char name[32];
-                    w_json_token *val = &t[z + 1];
-                    if (!w_json_read(&t[z], name, sizeof(name))) {
-                        ok = false;
-                        break;
-                    }
-                    if (!strcmp(name, "executable"))
-                        ok = w_json_read(val, p->executable, sizeof(p->executable));
-                    else if (!strcmp(name, "interval"))
-                        ok = w_token_int(val, 0, 86400, &p->interval);
-                    else if (!strcmp(name, "timeout"))
-                        ok = w_token_int(val, 1, 86400, &p->timeout);
-                    else if (!strcmp(name, "stream"))
-                        ok = w_token_bool(val, &p->stream);
-                    else if (!strcmp(name, "action")) {
-                        w_command action;
-                        ok =
-                            w_json_read(val, p->action, sizeof(p->action)) && w_command_parse(p->action, &action);
-                    } else
-                        ok = false;
-                }
-                ok = ok && *p->executable && !(p->stream && p->interval);
-            }
-        } else if (!strcmp(k, "rules")) {
-            ok = a->type == json_array;
-            for (int j = v + 1; ok && j < a->after; j = t[j].after) {
-                if (t[j].type != json_object || c->rule_count >= rule_limit) {
-                    ok = false;
-                    break;
-                }
-                w_window_rule *r = &c->rules[c->rule_count++];
-                r->workspace = r->output = r->layout = -1;
-                r->sets_floating = true;
-                for (int z = j + 1; ok && z < t[j].after; z = t[z + 1].after) {
-                    char name[32];
-                    w_json_token *val = &t[z + 1];
-                    if (!w_json_read(&t[z], name, sizeof(name))) {
-                        ok = false;
-                        break;
-                    }
-                    if (!strcmp(name, "class"))
-                        ok = w_json_read(val, r->class_name, sizeof(r->class_name));
-                    else if (!strcmp(name, "title"))
-                        ok = w_json_read(val, r->title, sizeof(r->title));
-                    else if (!strcmp(name, "executable"))
-                        ok = w_json_read(val, r->executable, sizeof(r->executable));
-                    else if (!strcmp(name, "output")) {
-                        int index;
-                        ok = w_token_int(val, 1, output_limit, &index);
-                        if (ok)
-                            r->output = index - 1;
-                    } else if (!strcmp(name, "border")) {
-                        ok = w_color(val, &r->border);
-                        r->colored = ok;
-                    } else if (!strcmp(name, "layout")) {
-                        char layout[20];
-                        const char *names[] = {"tree", "alternate", "master", "tabs", "stack"};
-                        ok = w_json_read(val, layout, sizeof(layout));
-                        if (ok) {
-                            for (int k = 0; k < 5; k++)
-                                if (!strcmp(layout, names[k]))
-                                    r->layout = k;
-                            ok = r->layout >= 0;
-                        }
-                    } else if (!strcmp(name, "floating"))
-                        ok = w_token_bool(val, &r->floating);
-                    else if (!strcmp(name, "exclude"))
-                        ok = w_token_bool(val, &r->exclude);
-                    else if (!strcmp(name, "workspace")) {
-                        int ws;
-                        ok = w_token_int(val, 1, 10, &ws);
-                        if (ok)
-                            r->workspace = ws - 1;
-                    } else
-                        ok = false;
-                }
-                ok = ok && (*r->class_name || *r->title || *r->executable);
-            }
-        } else
-            ok = false;
-        if (!ok) {
-            snprintf(err, cap, "line %d: unknown key or invalid value for '%s'", t[i].line, k);
-            return false;
-        }
-        i = a->after;
-    }
-    if (!version)
-        snprintf(err, cap, "configuration requires version 1");
-    return version;
-}
+//~ Provider references
 
 bool w_config_validate_providers(const w_desktop_config *c, char *err, size_t cap) {
     const char *groups[] = {c->bar_left, c->bar_center, c->bar_right};
@@ -706,38 +322,4 @@ bool w_config_validate_providers(const w_desktop_config *c, char *err, size_t ca
         }
     }
     return true;
-}
-
-static bool w_parse_json(w_desktop_config *out, const char *s, char *err, size_t cap, bool merge) {
-    w_json_token *tokens = calloc(4096, sizeof(*tokens));
-    w_desktop_config *next = malloc(sizeof(*next));
-    w_json_doc d;
-    snprintf(err, cap, "invalid configuration");
-    bool ok = false;
-    if (tokens && next) {
-        if (merge)
-            *next = *out;
-        else
-            w_config_defaults(next);
-        if (w_json_parse(&d, s, tokens, 4096))
-            ok = w_parse_object(next, tokens, 0, err, cap) && (merge || w_config_validate_providers(next, err, cap));
-        else
-            snprintf(err, cap, "%s", d.error);
-        if (ok) {
-            *out = *next;
-            if (cap)
-                *err = 0;
-        }
-    }
-    free(next);
-    free(tokens);
-    return ok;
-}
-
-bool w_config_parse(w_desktop_config *out, const char *s, char *err, size_t cap) {
-    return w_parse_json(out, s, err, cap, false);
-}
-
-bool w_config_merge(w_desktop_config *out, const char *s, char *err, size_t cap) {
-    return w_parse_json(out, s, err, cap, true);
 }

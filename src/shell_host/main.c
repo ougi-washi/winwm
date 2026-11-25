@@ -1,5 +1,7 @@
 #include "theme/theme.h"
 #include "shell_host/entry.h"
+#include "native_notifications/toast.h"
+#include "os_win32/environment.h"
 #include "win_platform/win_platform.h"
 #include <shellapi.h>
 #include <wchar.h>
@@ -84,6 +86,26 @@ static void w_rescue(void) {
     w_os_mark(L"rescue_visible");
 }
 
+static bool w_reset_profile(void) {
+    wchar_t paths[2][os_path_cap], backups[2][os_path_cap+64];
+    bool moved[2] = {false};
+    if (!w_os_config_path(paths[0],count_of(paths[0])) || !w_os_toolbar_path(paths[1],count_of(paths[1])))
+        return false;
+    ULONGLONG stamp = GetTickCount64();
+    for (int i=0; i<2; ++i) {
+        swprintf(backups[i],count_of(backups[i]),L"%ls.recovery.%llu",paths[i],stamp);
+        moved[i] = MoveFileW(paths[i],backups[i]) != FALSE;
+        if (!moved[i]) {
+            DWORD error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) goto restore;
+        }
+    }
+    if (w_os_config_seed()) return true;
+restore:
+    for (int i=0; i<2; ++i) if (moved[i]) MoveFileW(backups[i],paths[i]);
+    return false;
+}
+
 static void w_handle_action(int id) {
     if (id == 101) {
         if (!w_restart(session_exe))
@@ -96,17 +118,8 @@ static void w_handle_action(int id) {
         if (w_os_config_path(path, count_of(path)) && w_os_utf8(path, arg, sizeof(arg)))
             w_os_launch_provider("%SystemRoot%\\System32\\notepad.exe", arg, false);
     } else if (id == 104) {
-        wchar_t path[os_path_cap], backup[os_path_cap + 64];
-        if (!w_os_config_path(path, count_of(path)))
-            return;
-        swprintf(backup, count_of(backup), L"%ls.recovery.%llu", path, (unsigned long long)GetTickCount64());
-        if (!MoveFileW(path, backup) && GetLastError() != ERROR_FILE_NOT_FOUND &&
-            GetLastError() != ERROR_PATH_NOT_FOUND) {
-            MessageBoxW(panel, L"Could not preserve the old configuration.", L"Recovery", MB_OK);
-            return;
-        }
-        if (!w_os_config_seed(false)) {
-            MessageBoxW(panel, L"Could not create a fresh configuration.", L"Recovery", MB_OK);
+        if (!w_reset_profile()) {
+            MessageBoxW(panel, L"Could not back up and reset the profile.", L"Recovery", MB_OK);
             return;
         }
         w_os_cache_discard();
@@ -202,7 +215,7 @@ static LRESULT CALLBACK w_host_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     }
 }
 
-static int w_host_run(HINSTANCE inst, DWORD pid, uint64_t birth) {
+static int w_host_run(HINSTANCE inst, DWORD pid, uint64_t birth, HANDLE ready) {
     w_os_instance_lock lock;
     DWORD error = w_os_instance_claim(os_host_instance, &lock);
     if (error)
@@ -236,6 +249,8 @@ static int w_host_run(HINSTANCE inst, DWORD pid, uint64_t birth) {
     if (!panel || !SetPropW(panel,L"winwm.session_pid",(HANDLE)(uintptr_t)pid)) { error = GetLastError(); goto done; }
     if (!RegisterHotKey(panel, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F12))
         SetPropW(panel, L"winwm.recovery_hotkey_error", (HANDLE)(uintptr_t)GetLastError());
+    if (!SetEvent(ready)) { error = GetLastError(); goto done; }
+    w_environment_start(NULL,0);
     while (!ending) {
         DWORD n = session ? 1 : 0;
         DWORD wait =
@@ -244,6 +259,9 @@ static int w_host_run(HINSTANCE inst, DWORD pid, uint64_t birth) {
             break;
         if (n && wait == WAIT_OBJECT_0) {
             DWORD code = 0;
+            FILETIME born, exited, kernel, user;
+            if (GetProcessTimes(session,&born,&exited,&kernel,&user))
+                w_notification_submit_recover(GetProcessId(session),((uint64_t)born.dwHighDateTime << 32) | born.dwLowDateTime);
             GetExitCodeProcess(session, &code);
             SetPropW(panel, L"winwm.child_exit", (HANDLE)(uintptr_t)((uint64_t)code + 1));
             CloseHandle(session);
@@ -283,7 +301,31 @@ done:
         else CloseHandle(next);
     }
     w_os_wait_layer_cleanup();
+    w_environment_stop();
     return (int)error;
+}
+
+static DWORD w_start_watch(const wchar_t *name, unsigned mode, DWORD pid, uint64_t birth) {
+    wchar_t self[os_path_cap], watch[96];
+    if (!w_os_self(self,count_of(self))) return GetLastError();
+    swprintf(watch,count_of(watch),L"/watch3:%u:%lu:%llu",mode,pid,(unsigned long long)birth);
+    HANDLE ready = CreateEventW(NULL, TRUE, FALSE, name);
+    if (!ready) return GetLastError();
+    DWORD error = GetLastError();
+    if (error != ERROR_ALREADY_EXISTS) {
+        HANDLE monitor = w_os_launch(self,watch);
+        if (monitor) {
+            HANDLE waits[] = {monitor,ready};
+            DWORD wait = WaitForMultipleObjects(2,waits,FALSE,10000), code;
+            if (wait == WAIT_OBJECT_0 + 1) error = ERROR_SUCCESS;
+            else if (wait == WAIT_OBJECT_0 && GetExitCodeProcess(monitor,&code))
+                error = code ? code : ERROR_PROCESS_ABORTED;
+            else error = wait == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError();
+            CloseHandle(monitor);
+        } else error = GetLastError();
+    }
+    CloseHandle(ready);
+    return error;
 }
 
 int WINAPI wWinMain(HINSTANCE inst,HINSTANCE previous,PWSTR args,int show) {
@@ -296,23 +338,24 @@ int WINAPI wWinMain(HINSTANCE inst,HINSTANCE previous,PWSTR args,int show) {
         result = ERROR_SUCCESS;
     else if (argc == 2) {
         const wchar_t *arg = argv[1];
-        bool launch = !wcsncmp(arg,L"/start2:",8);
+        bool launch = !wcsncmp(arg,L"/start3:",8);
         unsigned mode;
         unsigned long pid;
         unsigned long long birth;
         wchar_t extra;
-        if ((launch || !wcsncmp(arg,L"/watch2:",8)) &&
+        if ((launch || !wcsncmp(arg,L"/watch3:",8)) &&
             swscanf(arg+8,L"%u:%lu:%llu%lc",&mode,&pid,&birth,&extra) == 3 && mode <= 1 && pid && birth) {
-            if (launch) {
-                wchar_t self[os_path_cap], watch[96];
-                swprintf(watch,count_of(watch),L"/watch2:%u:%lu:%llu",mode,pid,birth);
-                HANDLE monitor = w_os_self(self,count_of(self)) ? w_os_launch(self,watch) : NULL;
-                result = monitor ? 0 : (int)GetLastError();
-                if (monitor) CloseHandle(monitor);
-            } else {
+            wchar_t name[96];
+            swprintf(name,count_of(name),L"Local\\winwm.recovery.ready.%lu.%llu",pid,birth);
+            if (launch) result = (int)w_start_watch(name,mode,pid,birth);
+            else {
                 preview = mode != 0;
-                SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-                result = w_host_run(inst,pid,birth);
+                HANDLE ready = OpenEventW(EVENT_MODIFY_STATE,FALSE,name);
+                if (ready) {
+                    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+                    result = w_host_run(inst,pid,birth,ready);
+                    CloseHandle(ready);
+                } else result = (int)GetLastError();
             }
         }
     }

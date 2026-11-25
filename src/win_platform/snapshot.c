@@ -1,8 +1,9 @@
 #include "win_platform/win_platform.h"
+#include "model/model.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
-enum { cache_limit = 512 * 1024, cache_format = 9 };
+enum { cache_limit = 512 * 1024, cache_format = 14 };
 
 ////////////////
 //~ Snapshot
@@ -77,15 +78,15 @@ static void w_contents(w_cache_stream *s, w_desktop_config *c) {
     w_field(s, &c->accent, 4);
     w_field(s, &c->border_size, sizeof(int));
     w_field(s, &c->rounding, sizeof(int));
+    w_field(s,&c->panel_material.opacity,sizeof(int));
+    unsigned char panel_flags = s->writing ? c->panel_material.blur | (c->panel_material.shadow << 1) : 0;
+    w_field(s,&panel_flags,sizeof(panel_flags));
+    if ((unsigned)c->panel_material.opacity > 255 || panel_flags > 3) s->ok = false;
+    c->panel_material.blur = (panel_flags & 1) != 0;
+    c->panel_material.shadow = (panel_flags & 2) != 0;
     unsigned char resize = c->resize_on_border;
     w_field(s, &resize, 1);
     c->resize_on_border = resize != 0;
-    w_field(s, &c->drag_mods, sizeof(c->drag_mods));
-    unsigned char inverse = c->inverse_drag;
-    w_field(s, &inverse, 1);
-    c->inverse_drag = inverse != 0;
-    if (!c->drag_mods || c->drag_mods > 15)
-        s->ok = false;
     unsigned char animations = c->animations;
     w_field(s, &animations, 1);
     if (animations > motion_system)
@@ -162,7 +163,6 @@ static void w_contents(w_cache_stream *s, w_desktop_config *c) {
 #undef string_member
 }
 
-// Format 9 appends bar preferences, preserving the format 8 startup prefix.
 static void w_bar_preferences(w_cache_stream *s, w_desktop_config *c) {
     w_field(s,&c->bar_tooltip_delay,sizeof(int));
     w_field(s,&c->bar_tooltip_duration,sizeof(int));
@@ -198,6 +198,68 @@ static void w_bar_preferences(w_cache_stream *s, w_desktop_config *c) {
     }
 }
 
+// Desktop startup commands always come from a successful parse of the active profile.
+static void w_session_settings(w_cache_stream *s, w_desktop_config *c) {
+    w_notification_config *nc = &c->notifications;
+    unsigned char prefs = nc->enabled | (nc->capture << 1);
+    w_field(s,&prefs,sizeof(prefs));
+    nc->enabled = (prefs & 1) != 0;
+    nc->capture = (enum w_capture_source)(prefs >> 1);
+    int *values[] = {&nc->corner,&nc->duration_ms,&nc->fade_ms,&nc->history_limit,&nc->visible_limit,&nc->margin,&nc->width};
+    for (size_t i = 0; i < count_of(values); ++i) w_field(s,values[i],sizeof(int));
+    if (!w_config_notifications_valid(nc)) s->ok = false;
+    unsigned char master = c->master_default;
+    w_field(s,&master,sizeof(master));
+    w_field(s,c->mouse_actions,sizeof(c->mouse_actions));
+    w_field(s,&c->rule_count,sizeof(c->rule_count));
+    if (master > 1 || (unsigned)c->rule_count > count_of(c->rules)) s->ok = false;
+    c->master_default = master != 0;
+    for (int b=0; b<2; ++b)
+        for (int m=0; m<16; ++m)
+            if (c->mouse_actions[b][m] > mouse_resize) s->ok = false;
+    for (int i=0; s->ok && i<c->rule_count; ++i) {
+        w_window_rule *r = &c->rules[i];
+        w_string_field(s,r->class_name,sizeof(r->class_name));
+        w_string_field(s,r->title,sizeof(r->title));
+        w_string_field(s,r->executable,sizeof(r->executable));
+        w_field(s,&r->workspace,sizeof(r->workspace));
+        w_field(s,&r->output,sizeof(r->output));
+        w_field(s,&r->layout,sizeof(r->layout));
+        w_field(s,&r->border,sizeof(r->border));
+        unsigned char flags = r->colored | (r->floating << 1) | (r->exclude << 2) | (r->sets_floating << 3);
+        w_field(s,&flags,sizeof(flags));
+        r->colored = flags & 1;
+        r->floating = flags & 2;
+        r->exclude = flags & 4;
+        r->sets_floating = flags & 8;
+        if (flags > 15 || r->workspace < -1 || r->workspace >= workspace_limit ||
+            r->output < -1 || r->output >= output_limit || r->layout < -1 || r->layout > layout_stack)
+            s->ok = false;
+    }
+    w_field(s,&c->provider_count,sizeof(c->provider_count));
+    if ((unsigned)c->provider_count > count_of(c->providers)) s->ok = false;
+    for (int i=0; s->ok && i<c->provider_count; ++i) {
+        w_provider_config *p = &c->providers[i];
+        w_string_field(s,p->name,sizeof(p->name));
+        w_string_field(s,p->executable,sizeof(p->executable));
+        w_string_field(s,p->action,sizeof(p->action));
+        w_field(s,&p->interval,sizeof(p->interval));
+        w_field(s,&p->timeout,sizeof(p->timeout));
+        unsigned char stream = p->stream;
+        w_field(s,&stream,sizeof(stream));
+        p->stream = stream != 0;
+        w_command action;
+        if (stream > 1 || !*p->name || !*p->executable || (unsigned)p->interval > 86400 ||
+            p->timeout < 1 || p->timeout > 86400 || (p->stream && p->interval) ||
+            (*p->action && !w_command_parse(p->action,&action))) s->ok = false;
+    }
+    if (s->ok && !s->writing) {
+        c->startup_count = 0;
+        s->ok = w_config_modules_valid(c->bar_left) && w_config_modules_valid(c->bar_center) &&
+                w_config_modules_valid(c->bar_right) && w_config_validate_providers(c,NULL,0);
+    }
+}
+
 static bool w_cache_path(wchar_t *out, bool create) {
     if (!w_os_data_path(out, os_path_cap, L"startup.bin", create) || out[1] != L':')
         return false;
@@ -205,6 +267,25 @@ static bool w_cache_path(wchar_t *out, bool create) {
     if (GetDriveTypeW(drive) != DRIVE_FIXED)
         return false;
     return true;
+}
+
+static bool w_cache_matches(const wchar_t *path, const w_cache_header *header, const unsigned char *data) {
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
+                              OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return false;
+    w_cache_header previous;
+    DWORD n;
+    LARGE_INTEGER size;
+    bool equal = GetFileSizeEx(file,&size) && size.QuadPart == (LONGLONG)sizeof(previous) + header->bytes &&
+                 ReadFile(file,&previous,sizeof(previous),&n,NULL) && n == sizeof(previous) &&
+                 !memcmp(header,&previous,sizeof(previous));
+    unsigned char block[8192];
+    for (DWORD offset = 0; equal && offset < header->bytes; offset += n) {
+        DWORD length = min(header->bytes - offset, sizeof(block));
+        equal = ReadFile(file,block,length,&n,NULL) && n == length && !memcmp(block,data + offset,length);
+    }
+    CloseHandle(file);
+    return equal;
 }
 
 void w_os_cache_write(w_desktop_config *cfg) {
@@ -216,8 +297,13 @@ void w_os_cache_write(w_desktop_config *cfg) {
         return;
     w_contents(&s, cfg);
     if (s.ok) w_bar_preferences(&s,cfg);
+    if (s.ok) w_session_settings(&s,cfg);
     if (s.ok) {
         w_cache_header h = {0x4e444348, cache_format, (uint32_t)s.pos, w_checksum(s.data, s.pos)};
+        if (w_cache_matches(path,&h,s.data)) {
+            free(s.data);
+            return;
+        }
         swprintf(tmp, count_of(tmp), L"%ls.%lu.%lu.tmp", path, GetCurrentProcessId(), GetCurrentThreadId());
         HANDLE file = CreateFileW(tmp, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
         if (file != INVALID_HANDLE_VALUE) {
@@ -244,13 +330,14 @@ bool w_os_cache_read(w_desktop_config *cfg) {
     w_cache_header h;
     bool ok = false;
     if (ReadFile(f, &h, sizeof(h), &n, NULL) && n == sizeof(h) && h.magic == 0x4e444348 &&
-        (h.format == 8 || h.format == cache_format) &&
+        h.format == cache_format &&
         h.bytes > 0 && h.bytes <= cache_limit) {
         w_cache_stream s = {.data = malloc(h.bytes), .end = h.bytes, .ok = true};
         if (s.data && ReadFile(f, s.data, h.bytes, &n, NULL) && n == h.bytes &&
             w_checksum(s.data, n) == h.checksum) {
             w_contents(&s, cfg);
-            if (s.ok && h.format == cache_format) w_bar_preferences(&s,cfg);
+            if (s.ok) w_bar_preferences(&s,cfg);
+            if (s.ok) w_session_settings(&s,cfg);
             ok = s.ok && s.pos == s.end;
         }
         free(s.data);

@@ -26,6 +26,10 @@ typedef struct w_palette_entry {
 
 typedef void (*palette_callback)(int id, bool admin);
 typedef void (*palette_line_callback)(const wchar_t *line, UINT request, bool admin);
+typedef struct {
+    int count;
+    void (*read)(int index, w_palette_entry *entry);
+} w_palette_apps;
 typedef struct w_palette_site {
     HMONITOR monitor;
     w_popup_anchor anchor;
@@ -36,7 +40,8 @@ typedef struct w_palette_site {
 //~ Palette Interface
 
 void w_palette_open(const w_palette_site *site, const wchar_t *title, const w_palette_entry *entries, int count,
-                  palette_callback callback, HANDLE app_images, palette_line_callback run_line);
+                    palette_callback callback, HANDLE app_images, palette_line_callback run_line,
+                    const w_palette_apps *apps);
 void w_palette_line_result(UINT request, DWORD error);
 void w_palette_focus(void);
 void w_palette_position(const w_palette_site *site);

@@ -7,6 +7,7 @@
 #include "providers/providers.h"
 #include "input/input.h"
 #include "catalog/catalog.h"
+#include "notifications/view.h"
 
 ////////////////
 //~ Desktop
@@ -25,7 +26,9 @@ enum {
     msg_hover,
     msg_desktop_menu,
     msg_catalog,
-    msg_pointer_select, msg_drag_preview, msg_drag_limits, msg_run_result, msg_shell_started, msg_pointer_down
+    msg_pointer_select, msg_drag_preview, msg_drag_limits, msg_run_result, msg_shell_started, msg_pointer_down,
+    msg_titles, msg_environment, msg_notifications, msg_notification_published, msg_notification_banner, msg_notification_open,
+    msg_tray_changed, msg_tray_refresh
 };
 
 typedef struct w_output_state {
@@ -94,9 +97,9 @@ typedef struct w_desktop_state {
     uint64_t revision;
     HWINEVENTHOOK hooks[7];
     char status[512];
-    wchar_t notices[32][256], clips[24][4096];
-    int notice_count, clip_count;
-    DWORD clipboard_seq;
+    wchar_t clips[24][4096];
+    int clip_count;
+    HANDLE clipboard_reader;
     bool clipboard_enabled;
     bool motion_allowed, high_contrast, borders_hidden;
 } w_desktop_state;
@@ -125,6 +128,7 @@ void w_desktop_resize_direction(int direction);
 void w_desktop_place_floating(int slot, w_rect bounds);
 void w_desktop_set_floating(int slot, bool floating);
 void w_desktop_apply(void);
+void w_desktop_titles(void);
 enum { animation_timer = 30 };
 void w_effects_preferences(void);
 void w_effects_tick(void);
@@ -153,7 +157,18 @@ void w_desktop_bar_palette(enum command_kind kind, int output, const w_popup_anc
 void w_desktop_focus_menu(int output);
 void w_desktop_catalog_update(void);
 void w_desktop_clear_clips(void);
+void w_desktop_clipboard_done(void);
+void w_desktop_clipboard_changed(bool cleared);
 void w_desktop_notice(const char *s);
+void w_desktop_notify(const wchar_t *title, const char *body);
+void w_desktop_notifications_configure(void);
+void w_desktop_tray_balloons(void);
+void w_desktop_notifications_receive(LPARAM payload);
+void w_desktop_notification_published(LPARAM payload);
+void w_desktop_banner_receive(WPARAM status, LPARAM payload);
+void w_desktop_notifications_open(int output, const w_popup_anchor *anchor);
+void w_desktop_notifications_stop(void);
+const char *w_desktop_notification_status(void);
 void w_desktop_load(void);
 void w_desktop_start_programs(bool first_load);
 void w_desktop_copy_clip(void);

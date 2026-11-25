@@ -4,7 +4,7 @@
 ////////////////
 //~ Shell Host
 
-#define WINWM_RECOVERY_CHECK L"/validate:2"
+#define WINWM_RECOVERY_CHECK L"/validate:3"
 enum { recovery_session_closing = WM_APP + 1, recovery_take_desktop };
 bool w_recovery_validate(void);
 HANDLE w_recovery_attach(bool preview, HWND *window);

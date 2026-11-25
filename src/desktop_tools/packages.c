@@ -259,6 +259,10 @@ static void w_finish(DWORD code) {
     if (stream) CloseHandle(stream);
     stream = NULL;
     CloseHandle(process); process = NULL;
+    if (w_mutating() && (!code || code == ERROR_SUCCESS_REBOOT_REQUIRED || code == ERROR_SUCCESS_REBOOT_INITIATED)) {
+        HWND manager = FindWindowW(L"WinwmEvents",NULL);
+        if (manager) PostMessageW(manager,winwm_packages_changed,0,0);
+    }
     if (closing) { DestroyWindow(window); return; }
     if (chocolatey && action == pkg_install) {
         wchar_t message[512];

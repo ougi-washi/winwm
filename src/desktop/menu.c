@@ -9,6 +9,7 @@ static w_palette_entry entries[window_limit];
 static w_command actions[window_limit];
 static w_window_id targets[window_limit];
 static int row_count, configured_start;
+static const wchar_t *configured_labels[app_limit];
 static int row_output[window_limit], palette_output;
 static enum command_kind current_palette;
 static HWND menu_target;
@@ -106,20 +107,25 @@ static void w_pick(int n, bool admin) {
             return;
         size_t bytes = (wcslen(clip_rows[n]) + 1) * sizeof(wchar_t);
         HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, bytes);
-        if (!mem)
+        if (!mem) {
+            w_desktop_notice("Could not copy the history entry.");
             return;
+        }
         void *p = GlobalLock(mem);
         if (!p) {
             GlobalFree(mem);
+            w_desktop_notice("Could not copy the history entry.");
             return;
         }
         memcpy(p, clip_rows[n], bytes);
         GlobalUnlock(mem);
         if (OpenClipboard(desk.root)) {
-            EmptyClipboard();
-            if (SetClipboardData(CF_UNICODETEXT, mem))
+            if (EmptyClipboard() && SetClipboardData(CF_UNICODETEXT, mem))
                 mem = NULL;
             CloseClipboard();
+            if (mem) w_desktop_notice("Could not copy the history entry.");
+        } else {
+            w_desktop_notice("Clipboard is busy. Select the history entry again.");
         }
         if (mem)
             GlobalFree(mem);
@@ -342,10 +348,21 @@ static void w_menu_actions(bool run) {
     }
 }
 
-void w_desktop_clear_clips(void) {
-    SecureZeroMemory(desk.clips, sizeof(desk.clips));
-    SecureZeroMemory(clip_rows, sizeof(clip_rows));
-    desk.clip_count = 0;
+static int w_compare_label(const void *a, const void *b) {
+    return _wcsicmp(*(const wchar_t *const *)a,*(const wchar_t *const *)b);
+}
+
+static void w_installed_row(int index, w_palette_entry *row) {
+    row->identity = w_catalog_identity(snapshot,index);
+    w_catalog_label(snapshot,index,row->label,count_of(row->label),&row->system_icon);
+    const wchar_t *label = row->label;
+    int configured = row_count-configured_start;
+    if (configured && bsearch(&label,configured_labels,configured,sizeof(label),w_compare_label) &&
+        wcslen(label)+15 < count_of(row->label))
+        wcscat(row->label,L"  ·  Installed");
+    row->id = window_limit+index;
+    row->group = palette_apps;
+    row->can_run_admin = true;
 }
 
 static void w_open_palette(enum command_kind kind, int output, const w_popup_anchor *anchor) {
@@ -389,17 +406,12 @@ static void w_open_palette(enum command_kind kind, int output, const w_popup_anc
                      desk.registered[j] ? "" : "   [unavailable]");
             w_action_row(label, action);
         }
-    } else if (kind == cmd_notifications) {
-        title = L"Notifications";
-        for (int j = desk.notice_count - 1; j >= 0; j--)
-            w_add_row(desk.notices[j], NULL, (w_window_id){-1, 0});
     } else if (kind == cmd_clipboard) {
-        if (!desk.clipboard_enabled) {
+        if (!desk.clipboard_enabled)
             desk.clipboard_enabled = AddClipboardFormatListener(desk.root) != 0;
-            w_desktop_copy_clip();
-        }
+        w_desktop_copy_clip();
         title = L"Clipboard history";
-        memcpy(clip_rows, desk.clips, sizeof(clip_rows));
+        memcpy(clip_rows, desk.clips, desk.clip_count * sizeof(clip_rows[0]));
         for (int j = 0; j < desk.clip_count; j++) {
             wchar_t preview[palette_text_capacity];
             size_t n = 0;
@@ -420,40 +432,20 @@ static void w_open_palette(enum command_kind kind, int output, const w_popup_anc
         if (run) {
             w_catalog_begin(desk.root, msg_catalog);
             w_catalog_state *next = w_catalog_acquire();
-            int apps = w_catalog_count(next);
-            w_palette_entry *all = apps ? calloc((size_t)row_count + apps, sizeof(*all)) : NULL;
-            int total = row_count;
-            if (all) {
-                memcpy(all, entries, (size_t)row_count * sizeof(*entries));
-                for (int i = 0; i < apps; ++i) {
-                    w_palette_entry *row = &all[total++];
-                    row->identity = w_catalog_identity(next,i);
-                    w_catalog_label(next,i,row->label,count_of(row->label),&row->system_icon);
-                    // An explicitly configured app owns its plain display name.
-                    // Keep the Start menu shortcut independently selectable.
-                    for (int j = configured_start; j < row_count; ++j) {
-                        if (!_wcsicmp(all[j].label, row->label) &&
-                            wcslen(row->label) + 15 < count_of(row->label)) {
-                            wcscat(row->label, L"  ·  Installed");
-                            break;
-                        }
-                    }
-                    row->id = window_limit+i;
-                    row->group = palette_apps;
-                    row->can_run_admin = true;
-                }
-            }
+            int configured = row_count-configured_start;
+            for (int i=0; i<configured; ++i) configured_labels[i] = entries[configured_start+i].label;
+            qsort(configured_labels,configured,sizeof(*configured_labels),w_compare_label);
             w_catalog_release(snapshot);
             snapshot = next;
-            w_palette_open(&site,title,all ? all : entries,total,w_pick,
-                           w_catalog_images(snapshot),w_desktop_run_line);
-            free(all);
+            w_palette_apps apps = {.count=w_catalog_count(snapshot),.read=w_installed_row};
+            w_palette_open(&site,title,entries,row_count,w_pick,
+                           w_catalog_images(snapshot),w_desktop_run_line,&apps);
             return;
         }
     }
     w_catalog_release(snapshot);
     snapshot = NULL;
-    w_palette_open(&site,title,entries,row_count,w_pick,NULL,NULL);
+    w_palette_open(&site,title,entries,row_count,w_pick,NULL,NULL,NULL);
 }
 
 void w_desktop_palette(enum command_kind kind, int output) {
@@ -470,8 +462,7 @@ void w_desktop_bar_palette(enum command_kind kind, int output, const w_popup_anc
     w_open_palette(kind, output, anchor);
 }
 
-void w_desktop_catalog_update(void) {
-    if (!w_palette_visible(L"Menu")) return;
+static void w_refresh_palette(enum command_kind kind) {
     const w_popup_anchor *anchor = w_palette_anchor();
     int output = palette_output;
     if (anchor && (!IsWindowVisible(anchor->bar) || anchor->bar != desk.outputs[output].bar.hwnd)) {
@@ -479,7 +470,18 @@ void w_desktop_catalog_update(void) {
         return;
     }
     if (!desk.outputs[output].live) output = desk.model.output;
-    w_open_palette(cmd_menu, output, anchor);
+    w_open_palette(kind, output, anchor);
+}
+
+void w_desktop_catalog_update(void) {
+    if (w_palette_visible(L"Menu")) w_refresh_palette(cmd_menu);
+}
+
+void w_desktop_clipboard_changed(bool cleared) {
+    if (cleared) SecureZeroMemory(clip_rows, sizeof(clip_rows));
+    // Keep populated lists stable under the pointer and during keyboard selection.
+    if ((cleared || !row_count) && w_palette_visible(L"Clipboard history"))
+        w_refresh_palette(cmd_clipboard);
 }
 
 void w_desktop_focus_menu(int output) {

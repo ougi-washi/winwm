@@ -5,7 +5,6 @@
 
 static const wchar_t layout_path[] = L"SYSTEM\\CurrentControlSet\\Control\\Keyboard Layout";
 static const wchar_t journal_path[] = L"SOFTWARE\\Winwm\\PhysicalModifier";
-static const wchar_t legacy_journal[] = L"SOFTWARE\\NativeDesktop\\PhysicalModifier";
 enum { map_capacity = 1024 };
 
 static const DWORD left_modifier = 0xe05b0064u, right_modifier = 0xe05c0065u;
@@ -37,13 +36,6 @@ static bool w_same_map(const w_scan_map *a, const w_scan_map *b) {
 
 static LSTATUS w_write_map(HKEY key, const wchar_t *name, const w_scan_map *map) {
     return RegSetValueExW(key, name, 0, REG_BINARY, (const BYTE *)map->words, map->bytes);
-}
-
-// Finish an earlier installation with its original journal so restore stays reversible.
-static const wchar_t *w_active_journal(void) {
-    DWORD size = 0;
-    return RegGetValueW(HKEY_LOCAL_MACHINE, legacy_journal, L"Installed", RRF_RT_REG_BINARY, NULL, NULL,
-                        &size) == ERROR_SUCCESS ? legacy_journal : journal_path;
 }
 
 void w_os_modifier_keys(bool mapped[2]) {
@@ -130,12 +122,11 @@ DWORD w_os_modifier_map(bool install) {
         RegOpenKeyExW(HKEY_LOCAL_MACHINE, layout_path, 0, KEY_QUERY_VALUE | KEY_SET_VALUE, &layout);
     if (!error) {
         REGSAM access = KEY_QUERY_VALUE | KEY_SET_VALUE;
-        const wchar_t *path = w_active_journal();
         if (install)
             error =
-                RegCreateKeyExW(HKEY_LOCAL_MACHINE, path, 0, NULL, 0, access, NULL, &journal, NULL);
+                RegCreateKeyExW(HKEY_LOCAL_MACHINE, journal_path, 0, NULL, 0, access, NULL, &journal, NULL);
         else
-            error = RegOpenKeyExW(HKEY_LOCAL_MACHINE, path, 0, access, &journal);
+            error = RegOpenKeyExW(HKEY_LOCAL_MACHINE, journal_path, 0, access, &journal);
         if (!error)
             error = w_edit_map(layout, journal, install);
         else if (!install && error == ERROR_FILE_NOT_FOUND)
