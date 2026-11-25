@@ -1,5 +1,6 @@
 #include "desktop/desktop.h"
 #include "providers/audio.h"
+#include "win_platform/cpu.h"
 #include <ws2tcpip.h>
 #include <iphlpapi.h>
 #include <netioapi.h>
@@ -11,7 +12,8 @@
 typedef struct w_status_sample {
     unsigned mask, generation;
     bool refresh_network, network_error, routed;
-    ULONGLONG idle, total, rx, tx, time, link, luid;
+    ULONGLONG cpu_at, rx, tx, time, link, luid;
+    w_cpu_times cpu;
     MEMORYSTATUSEX memory;
     wchar_t network[96], adapter[192];
     bar_icon network_icon;
@@ -53,10 +55,6 @@ void w_desktop_network_changed(void) {
         network_dirty = true;
         w_desktop_status_sample();
     }
-}
-
-static ULONGLONG w_file_ticks(FILETIME ft) {
-    return ((ULONGLONG)ft.dwHighDateTime << 32) | ft.dwLowDateTime;
 }
 
 static void w_read_link(w_status_sample *s, const MIB_IF_ROW2 *row) {
@@ -133,11 +131,11 @@ static DWORD WINAPI w_sample_thread(void *ptr) {
     s->time = GetTickCount64();
     if (s->mask & (status_network | status_rate)) w_sample_network(s);
     if (s->mask & status_cpu) {
-        FILETIME idle, kernel, user;
-        s->idle = s->total = 0;
-        if (GetSystemTimes(&idle, &kernel, &user)) {
-            s->idle = w_file_ticks(idle);
-            s->total = w_file_ticks(kernel) + w_file_ticks(user);
+        ULONGLONG now = GetTickCount64();
+        // Network notifications can arrive within the same scheduler tick.
+        if (!s->cpu_at || now - s->cpu_at >= 750) {
+            s->cpu = w_cpu_read();
+            s->cpu_at = now;
         }
     }
     if (s->mask & status_memory) {
@@ -159,10 +157,11 @@ static void w_poll_after(UINT ms) {
 }
 
 static void w_poll_schedule(void) {
-    if ((enabled_mask & status_cpu && previous.total && !*cpu) ||
-        (enabled_mask & status_rate && previous.luid && !rate_ready))
-        w_poll_after(250); // A percentage or rate needs two samples.
-    else if ((enabled_mask & (status_cpu | status_rate | status_memory)) ||
+    if (enabled_mask & status_rate && previous.luid && !rate_ready)
+        w_poll_after(250);
+    else if (enabled_mask & status_cpu)
+        w_poll_after(1000);
+    else if ((enabled_mask & (status_rate | status_memory)) ||
              (enabled_mask & status_network && (!network_watch || !route_watch || previous.network_error)))
         w_poll_after(5000);
     else w_poll_after(0);
@@ -218,14 +217,10 @@ void w_desktop_status_done(void *ptr) {
             }
             w_changed("network", s->network, network, count_of(network));
         }
-        if (s->mask & status_cpu) {
-            if (!s->total) w_changed("cpu", L"—", cpu, count_of(cpu));
-            else if (previous.total && s->total > previous.total && s->idle >= previous.idle) {
-                wchar_t t[48];
-                double busy = 1.0 - (double)(s->idle - previous.idle) / (double)(s->total - previous.total);
-                swprintf(t, count_of(t), L"%d%%", w_clamp_int((int)(busy * 100 + 0.5), 0, 100));
-                w_changed("cpu", t, cpu, count_of(cpu));
-            }
+        if ((s->mask & status_cpu) && s->cpu_at != previous.cpu_at) {
+            wchar_t t[48];
+            w_cpu_format(t, count_of(t), w_cpu_percent(previous.cpu, s->cpu));
+            w_changed("cpu", t, cpu, count_of(cpu));
         }
         if (s->mask & status_rate) {
             wchar_t t[64] = L"—";
@@ -349,9 +344,7 @@ bool w_desktop_status_detail(const char *key, wchar_t *text, int cap) {
         double total = previous.memory.ullTotalPhys / gib;
         swprintf(text, cap, L"%.1f of %.1f GiB in use · %ls", total - previous.memory.ullAvailPhys / gib, total, memory);
     } else if (!strcmp(key, "cpu") && *cpu) {
-        SYSTEM_INFO si;
-        GetNativeSystemInfo(&si);
-        swprintf(text, cap, L"%ls utilization · %lu logical processors", cpu, si.dwNumberOfProcessors);
+        swprintf(text, cap, L"%ls utilization · %lu logical processors", cpu, previous.cpu.processors);
     } else if (!strcmp(key, "throughput") && rate_ready) {
         swprintf(text, cap, L"%ls\nDownload %llu KiB/s · Upload %llu KiB/s", previous.network, download, upload);
     } else if (!strcmp(key, "network") && previous.luid) {

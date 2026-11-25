@@ -53,6 +53,7 @@ src/providers/audio.c
 src/providers/providers.c
 src/shell_host/main.c
 src/win_platform/snapshot.c
+src/win_platform/cpu.c
 src/win_platform/percent_slider.c
 src/win_platform/win_platform.c
 -luser32
@@ -77,6 +78,7 @@ src/win_platform/win_platform.c
 -lshlwapi
 -luuid
 -lpowrprof
+-lpdh
 -lmfuuid
 -lcomdlg32
 -lrstrtmgr

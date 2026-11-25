@@ -202,7 +202,7 @@ static void w_measure(w_bar_window *b, HDC dc, const char *spec, bool vertical, 
                 cell->label = !strcmp(base,"cpu") || !strcmp(base,"memory") || !strcmp(base,"display") ||
                               (!strcmp(base,"audio") && b->audio_percent >= 0) ||
                               (!strcmp(base,"battery") && cell->icon != icon_plug);
-            if (cell->label && cell->icon && !formatted) {
+            if (cell->label && cell->icon && !formatted && strcmp(base,"cpu")) {
                 // Keep the full measurement in the hover card.
                 wchar_t *percent = wcschr(cell->text,L'%');
                 if (percent) {

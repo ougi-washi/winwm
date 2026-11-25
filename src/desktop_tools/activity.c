@@ -1,6 +1,7 @@
 #include "desktop_tools/tools.h"
 #include "theme/theme.h"
 #include "theme/icon_button.h"
+#include "win_platform/cpu.h"
 #include <commctrl.h>
 #include <psapi.h>
 #include <shlwapi.h>
@@ -11,15 +12,15 @@ typedef struct {
     wchar_t name[MAX_PATH];
     DWORD pid;
     uint64_t created, time, memory;
-    int cpu; // Tenths of a percent of all logical processors, or -1 between first samples.
+    double cpu; // Percent of all logical processors, or -1 until measured.
     bool has_memory;
 } w_process;
 
 typedef struct {
     w_process *rows;
     int count;
-    DWORD logical_cpus;
-    uint64_t sampled, total, idle;
+    w_cpu_times cpu;
+    uint64_t sampled;
     MEMORYSTATUSEX memory;
 } w_sample;
 
@@ -81,13 +82,7 @@ static bool w_collect(w_sample *s) {
     CloseHandle(snapshot);
     if (error != ERROR_NO_MORE_FILES || !s->count) return false;
     s->sampled = GetTickCount64();
-    s->logical_cpus = GetActiveProcessorCount(ALL_PROCESSOR_GROUPS);
-    FILETIME idle, kernel, user;
-    // GetSystemTimes covers only the caller's processor group on very large machines.
-    if (GetActiveProcessorGroupCount() == 1 && GetSystemTimes(&idle, &kernel, &user)) {
-        s->total = w_timestamp(kernel) + w_timestamp(user);
-        s->idle = w_timestamp(idle);
-    }
+    s->cpu = w_cpu_read();
     s->memory.dwLength = sizeof(s->memory);
     GlobalMemoryStatusEx(&s->memory);
     qsort(s->rows, s->count, sizeof(*s->rows), w_by_pid);
@@ -101,7 +96,7 @@ static DWORD WINAPI w_sample_thread(void *arg) {
 }
 
 static void w_request_sample(void) {
-    if (worker) return;
+    if (worker || (current.sampled && GetTickCount64() - current.sampled < 750)) return;
     worker = CreateThread(NULL, 0, w_sample_thread, panel, 0, NULL);
     if (!worker) SetWindowTextW(feedback, L"Could not start sampling. Press F5 to retry.");
 }
@@ -182,19 +177,18 @@ static void w_apply_sample(bool ok) {
     if (next) {
         visible = next;
         int j = 0;
-        double capacity = (double)(incoming.sampled-current.sampled) * 10000.0 * incoming.logical_cpus;
+        double capacity = (double)(incoming.sampled-current.sampled) * 10000.0 * incoming.cpu.processors;
         for (int i = 0; i < incoming.count && capacity > 0; i++) {
             w_process *p = &incoming.rows[i];
             while (j < current.count && current.rows[j].pid < p->pid) j++;
             if (j < current.count && current.rows[j].pid == p->pid && p->created && p->created == current.rows[j].created &&
-                p->time >= current.rows[j].time)
-                p->cpu = w_clamp_int((int)((p->time-current.rows[j].time) * 1000.0 / capacity + 0.5), 0, 1000);
+                incoming.cpu.processors == current.cpu.processors && p->time >= current.rows[j].time) {
+                double percent = 100.0 * (p->time-current.rows[j].time) / capacity;
+                p->cpu = min(percent, 100.0);
+            }
         }
-        wchar_t cpu[24] = L"—", text[192];
-        if (current.total && incoming.total > current.total && incoming.idle >= current.idle) {
-            uint64_t total = incoming.total-current.total, idle = incoming.idle-current.idle;
-            swprintf(cpu, count_of(cpu), L"%u%%", (unsigned)(100.0 * (total-min(total,idle)) / total + 0.5));
-        }
+        wchar_t cpu[24], text[192];
+        w_cpu_format(cpu, count_of(cpu), w_cpu_percent(current.cpu, incoming.cpu));
         swprintf(text, count_of(text), L"CPU   %ls      Memory   %.1f / %.1f GiB      Processes   %d", cpu,
                  (incoming.memory.ullTotalPhys-incoming.memory.ullAvailPhys)/1073741824.0,
                  incoming.memory.ullTotalPhys/1073741824.0, incoming.count);
@@ -335,8 +329,7 @@ static void w_cell_text(NMLVDISPINFOW *info) {
     case 0: value = p->name; break;
     case 1: swprintf(text, count_of(text), L"%lu", p->pid); break;
     case 2:
-        if (p->cpu >= 0) swprintf(text, count_of(text), L"%.1f%%", p->cpu/10.0);
-        else value = L"—";
+        w_cpu_format(text, count_of(text), p->cpu);
         break;
     case 3:
         if (p->has_memory) swprintf(text, count_of(text), L"%.1f MiB", p->memory/1048576.0);
