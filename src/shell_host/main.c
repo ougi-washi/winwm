@@ -36,8 +36,7 @@ static const wchar_t *const labels[] = {
 static bool w_launch_child(const wchar_t *exe) {
     child = w_os_launch(exe, preview ? L"--preview-session" : L"--session");
     if (child) {
-        // The real desktop owns wallpaper and gutters. A hosted session only
-        // supplies the solid color visible when the user has no wallpaper.
+        // Supply the shell desktop color when no wallpaper is configured.
         if (!preview) {
             previous_backdrop = GetSysColor(backdrop_index);
             if (previous_backdrop != backdrop)

@@ -347,7 +347,8 @@ bool w_os_desktop_surface(HWND window) {
         return true;
     wchar_t name[32];
     return GetClassNameW(window, name, count_of(name)) &&
-           (!wcscmp(name, L"WorkerW") || !wcscmp(name, L"Progman"));
+           (!wcscmp(name, L"WorkerW") || !wcscmp(name, L"Progman") ||
+            (!wcscmp(name, L"WinwmEvents") && w_os_same_process(window)));
 }
 
 // An explicitly taskbar-visible owned window is an independent app window.

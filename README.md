@@ -11,7 +11,8 @@ Tiling window manager and shell for Windows x64.
 
 ## Features
 
-- Per-monitor workspaces, tiling, floating, hover focus, mouse move and resize.
+- Per-monitor workspaces, tiling, floating, mouse move and resize.
+- Hover to focus and center the pointer. Desktop gaps clear focus.
 - Configurable borders, animations, keybindings, and toolbar.
 - Win+D Menu for apps, commands, WinGet installs and updates.
 - Audio, network, displays, power, languages, keyboards, and IMEs.

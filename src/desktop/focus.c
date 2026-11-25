@@ -1,4 +1,5 @@
 #include "desktop/desktop.h"
+#include <dwmapi.h>
 
 ////////////////
 //~ Focus
@@ -17,13 +18,11 @@ void w_desktop_focus_cancel(void) {
     pending.window.generation = 0;
 }
 
-void w_desktop_focus_empty(void) {
-    w_desktop_focus_cancel();
-    HWND bar = desk.outputs[desk.model.output].bar.hwnd;
-    if (!w_palette_shown() && !w_bar_menu_active() && w_desktop_find(w_os_app_window(GetForegroundWindow())) >= 0)
-        SetForegroundWindow(IsWindowVisible(bar) ? bar : GetDesktopWindow());
-    desk.model.focus = -1;
-    w_desktop_schedule();
+static HWND w_desktop_surface(void) {
+    if (desk.root && IsWindowVisible(desk.root))
+        return desk.root;
+    HWND shell = GetShellWindow();
+    return shell ? shell : GetDesktopWindow();
 }
 
 static bool w_can_activate(HWND window) {
@@ -60,6 +59,18 @@ static HWND w_activation_target(HWND owner, HWND hit) {
         return owner;
     popup = GetWindow(owner, GW_ENABLEDPOPUP);
     return w_os_app_window(popup) == owner && w_can_activate(popup) ? popup : NULL;
+}
+
+static bool w_release_app(HWND foreground, HWND surface) {
+    return w_desktop_find(w_os_app_window(foreground)) < 0 || w_foreground(surface);
+}
+
+void w_desktop_focus_empty(void) {
+    w_desktop_focus_cancel();
+    if (!w_palette_shown() && !w_bar_menu_active())
+        w_release_app(GetForegroundWindow(), w_desktop_surface());
+    desk.model.focus = -1;
+    w_desktop_schedule();
 }
 
 static void w_select_owner(HWND owner) {
@@ -262,22 +273,54 @@ void w_desktop_focus_apply(void) {
 ////////////////
 //~ Pointer focus
 
+static HWND w_root_at(POINT point) {
+    return GetAncestor(WindowFromPoint(point), GA_ROOT);
+}
+
+static POINT w_midpoint(RECT r) {
+    return (POINT){r.left + ((int64_t)r.right - r.left) / 2,
+                   r.top + ((int64_t)r.bottom - r.top) / 2};
+}
+
+static void w_center_pointer(POINT entry, HWND target) {
+    RECT frame, clip, area;
+    if ((FAILED(DwmGetWindowAttribute(target, DWMWA_EXTENDED_FRAME_BOUNDS, &frame, sizeof(frame))) &&
+         !GetWindowRect(target, &frame)) ||
+        !GetClipCursor(&clip) || !IntersectRect(&area, &frame, &clip))
+        return;
+    POINT center = w_midpoint(area);
+    if (!MonitorFromPoint(center, MONITOR_DEFAULTTONULL)) {
+        MONITORINFO monitor = {.cbSize = sizeof(monitor)};
+        if (!GetMonitorInfoW(MonitorFromPoint(entry, MONITOR_DEFAULTTONULL), &monitor) ||
+            !IntersectRect(&area, &area, &monitor.rcMonitor))
+            return;
+        center = w_midpoint(area);
+    }
+    // A floating peer can cover the center of the tile underneath it.
+    if ((center.x != entry.x || center.y != entry.y) && w_root_at(center) == target)
+        SetCursorPos(center.x, center.y);
+}
+
 void w_desktop_hover(POINT point) {
-    static HWND rejected_target, rejected_foreground;
-    static uint32_t rejected_generation;
+    static HWND last_hit, denied_by;
+    static uint32_t last_generation;
+    static bool denied;
     if (!desk.config.follow_mouse || w_palette_shown() || w_bar_menu_active() ||
         GetAsyncKeyState(VK_LBUTTON) < 0 || GetAsyncKeyState(VK_RBUTTON) < 0 ||
         GetAsyncKeyState(VK_MBUTTON) < 0 || GetAsyncKeyState(VK_XBUTTON1) < 0 || GetAsyncKeyState(VK_XBUTTON2) < 0)
         return;
-    HWND hit = GetAncestor(WindowFromPoint(point), GA_ROOT);
-    HWND owner = w_os_app_window(hit);
-    if (!owner) {
-        rejected_target = NULL;
-        return;
-    }
+    HWND hit = w_root_at(point);
     HWND foreground = GetForegroundWindow();
-    if (w_os_app_window(foreground) == owner) {
-        rejected_target = NULL;
+    HWND owner = w_os_app_window(hit);
+    int slot = w_desktop_find(owner);
+    uint32_t generation = slot >= 0 ? desk.model.windows[slot].generation : 0;
+    bool entered = hit != last_hit || generation != last_generation;
+    if (!entered && denied) {
+        if (denied_by == foreground)
+            return;
+        entered = true;
+    }
+    if (!entered && slot >= 0 && foreground == hit) {
         if (!w_model_valid(&desk.model, pending.window))
             w_select_owner(owner);
         return;
@@ -286,24 +329,32 @@ void w_desktop_hover(POINT point) {
     // their thread releases it. GetCapture() only sees our own input queue.
     if (w_thread_owns_pointer(0) || w_thread_owns_pointer(GetCurrentThreadId()))
         return;
-    int slot = w_desktop_find(owner);
-    if (slot < 0 || !w_model_visible(&desk.model, slot)) {
-        rejected_target = NULL;
-        return;
-    }
-    HWND target = w_activation_target(owner, hit);
-    // A denied hover is a single enter event. Further movement inside the
-    // same window must not repeatedly request attention from the shell.
-    if (target && target == rejected_target && foreground == rejected_foreground &&
-        rejected_generation == desk.model.windows[slot].generation)
-        return;
-    rejected_target = NULL;
-    if (target && w_foreground(target)) {
+    last_hit = hit;
+    last_generation = generation;
+    denied = false;
+    if (w_os_desktop_surface(hit)) {
         w_desktop_focus_cancel();
-        w_select_owner(owner);
-    } else if (target) {
-        rejected_target = target;
-        rejected_foreground = foreground;
-        rejected_generation = desk.model.windows[slot].generation;
+        if (!w_release_app(foreground, hit ? hit : w_desktop_surface())) {
+            denied = true;
+            denied_by = foreground;
+            return;
+        }
+        w_select_owner(NULL);
+        return;
     }
+    if (slot < 0 || !w_model_visible(&desk.model, slot) ||
+        (GetWindowLongPtrW(hit, GWL_EXSTYLE) & WS_EX_NOACTIVATE))
+        return;
+    HWND target = w_activation_target(owner, hit);
+    if (!target)
+        return;
+    if (foreground != target && !w_foreground(target)) {
+        denied = true;
+        denied_by = foreground;
+        return;
+    }
+    w_desktop_focus_cancel();
+    w_select_owner(owner);
+    if (entered)
+        w_center_pointer(point, target);
 }

@@ -149,7 +149,15 @@ static DWORD WINAPI w_handoff_explorer(void *root) {
     return 0;
 }
 
+static void w_position_desktop(void) {
+    if (!preview_mode)
+        SetWindowPos(desk.root, HWND_BOTTOM, GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
+                     GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN),
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW);
+}
+
 static void w_initialize(void) {
+    w_position_desktop();
     shell_notification = RegisterWindowMessageW(L"SHELLHOOK");
     if (shell_notification)
         RegisterShellHookWindow(desk.root);
@@ -257,6 +265,28 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         return 0;
     }
     switch (msg) {
+    case WM_ACTIVATE:
+        if (desk.ready && LOWORD(wp) != WA_INACTIVE)
+            w_desktop_focus_observe(hwnd);
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    case WM_WINDOWPOSCHANGING: {
+        WINDOWPOS *pos = (WINDOWPOS *)lp;
+        if (!preview_mode && !(pos->flags & SWP_NOZORDER))
+            pos->hwndInsertAfter = HWND_BOTTOM;
+        return DefWindowProcW(hwnd, msg, wp, lp);
+    }
+    case WM_PAINT: {
+        PAINTSTRUCT paint;
+        HDC dc = BeginPaint(hwnd, &paint);
+        if (!PaintDesktop(dc))
+            FillRect(dc, &paint.rcPaint, GetSysColorBrush(COLOR_DESKTOP));
+        EndPaint(hwnd, &paint);
+        return 0;
+    }
+    case WM_SYSCOMMAND:
+        if ((wp & 0xfff0) == SC_CLOSE)
+            return 0;
+        return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_INPUT:
         w_input_mouse_motion();
         return DefWindowProcW(hwnd, msg, wp, lp);
@@ -416,14 +446,20 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         w_desktop_apply();
         return 0;
     case WM_DISPLAYCHANGE:
+        w_position_desktop();
         if (desk.ready)
             w_desktop_outputs();
         return 0;
     case WM_SETTINGCHANGE:
+        InvalidateRect(hwnd, NULL, FALSE);
         w_effects_preferences();
         w_theme_colors(desk.config.background, desk.config.foreground, desk.config.accent);
         w_desktop_schedule();
         return 0;
+    case WM_SYSCOLORCHANGE:
+    case WM_THEMECHANGED:
+        InvalidateRect(hwnd, NULL, FALSE);
+        return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_TIMER:
         if (wp == animation_timer) {
             w_effects_tick();
@@ -491,7 +527,8 @@ int w_session_run(HINSTANCE instance, bool preview) {
     w_config_defaults(&desk.config);
     w_os_cache_read(&desk.config);
     WNDCLASSW wc = {
-        .hInstance = instance, .lpszClassName = L"WinwmEvents", .lpfnWndProc = w_desktop_proc};
+        .hInstance = instance, .lpszClassName = L"WinwmEvents", .lpfnWndProc = w_desktop_proc,
+        .hCursor = LoadCursorW(NULL, IDC_ARROW)};
     RegisterClassW(&wc);
     desk.root = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"winwm events", WS_POPUP, 0, 0, 0, 0,
                                 NULL, NULL, instance, NULL);
