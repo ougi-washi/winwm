@@ -337,7 +337,8 @@ static LRESULT CALLBACK w_mouse_proc(int code, WPARAM event, LPARAM data) {
             return 1;
         }
     }
-    if (event == WM_RBUTTONDOWN && !drag_button && context_msg && !w_super_pressed() && !w_drag_modifier() &&
+    if (event == WM_RBUTTONDOWN && !drag_button && context_msg && !GetShellWindow() &&
+        !w_super_pressed() && !w_drag_modifier() &&
         w_os_desktop_surface(GetAncestor(WindowFromPoint(m->pt), GA_ROOT))) {
         desktop_context_press = true;
         return 1;

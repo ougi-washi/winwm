@@ -579,6 +579,9 @@ bool w_desktop_run_on(const w_command *c, int output, bool admin) {
     case cmd_rescue:
         PostQuitMessage(42);
         break;
+    case cmd_quit:
+        PostQuitMessage(0);
+        break;
     default:
         ok = false;
     }

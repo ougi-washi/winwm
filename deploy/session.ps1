@@ -17,9 +17,7 @@ if (!(Test-Path $journal) -and (Test-Path $priorJournal)) {
 $manifest=Join-Path $root 'staged.json'
 $sessionSid=[Security.Principal.WindowsIdentity]::GetCurrent().User.Value
 $version=Get-ItemProperty 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
-$light=Get-ItemPropertyValue 'HKLM:\SOFTWARE\Microsoft\PolicyManager\current\device\WindowsLogon' 'OverrideShellProgram' -ErrorAction SilentlyContinue
 $x64=($env:PROCESSOR_ARCHITECTURE -eq 'AMD64' -or $env:PROCESSOR_ARCHITEW6432 -eq 'AMD64')
-$editionOk=$version.EditionID -match '^(Professional|Enterprise|Education|IoTEnterprise)'
 $utf8=New-Object System.Text.UTF8Encoding($false)
 function Write-Atomic($path,$text) {
     $tmp="$path.$([Guid]::NewGuid()).tmp"
@@ -32,7 +30,6 @@ function Get-RegValue($entry) {
     try {
         if (!$key -or $key.GetValueNames() -notcontains $entry.name) {return @{present=$false}}
         $kind=$key.GetValueKind($entry.name).ToString()
-        if ($kind -notin 'String','ExpandString' -and !($entry.kind -eq 'DWord' -and $kind -eq 'DWord')) {throw "Unexpected registry type at $($entry.path)"}
         return @{present=$true;kind=$kind;value=$key.GetValue($entry.name,$null,'DoNotExpandEnvironmentNames')}
     } finally {if ($key) {$key.Dispose()}}
 }
@@ -43,30 +40,34 @@ function Set-RegValue($entry,$v) {
         else {$key.DeleteValue($entry.name,$false)}
     } finally {$key.Dispose()}
 }
+function Restore-Entry($entry) {
+    $now=Get-RegValue $entry
+    $kind=if ($entry.kind) {$entry.kind} else {'String'}
+    if ($now.present -and $now.kind -eq $kind -and
+        ($now.value -ceq $entry.value -or ($null -ne $entry.oldOwned -and $now.value -ceq $entry.oldOwned))) {
+        Set-RegValue $entry $entry.before
+    }
+}
 function Restore-Activation {
     $record=Get-Content $journal -Raw | ConvertFrom-Json
     if ($record.sid -ne $sessionSid) {throw 'Activation belongs to a different user'}
     $entries=@($record.entries)
     [array]::Reverse($entries)
-    foreach ($entry in $entries) {
-        $now=Get-RegValue $entry
-        if ($now.present -and ($now.value -ceq $entry.value -or ($null -ne $entry.oldOwned -and $now.value -ceq $entry.oldOwned))) {Set-RegValue $entry $entry.before}
-    }
+    foreach ($entry in $entries) {Restore-Entry $entry}
     Remove-Item -LiteralPath $journal
 }
 if ($Action -eq 'Rollback') {
     if (Test-Path $journal) {Restore-Activation}
-    Write-Output 'Previous user shell and folder verbs restored for the next sign-in.'
+    Write-Output 'Activation rollback complete.'
     return
 }
-[pscustomobject]@{Edition=$version.EditionID; Build=$version.CurrentBuild; X64=$x64;
-    PerUserShellAvailable=[bool]$editionOk; LightweightShell=$light; Account=$sessionSid; ConfigRoot=$root}
+[pscustomobject]@{Edition=$version.EditionID; Build=$version.CurrentBuild; X64=$x64; Account=$sessionSid; ConfigRoot=$root}
 if ($Action -eq 'Preflight') {return}
-if (!$editionOk -or [int]$version.CurrentBuild -lt 19045 -or $light -eq 1 -or !$x64) {
-    throw 'This Windows configuration has no qualified activation path.'
+if ([int]$version.CurrentBuild -lt 19045 -or !$x64) {
+    throw 'A supported x64 Windows installation is required.'
 }
 if ($Action -eq 'Stage') {
-    $names=@('winwm.exe')
+    $names=@('winwm.exe','winwm_recovery.exe')
     $hashes=foreach ($name in $names) {(Get-FileHash -Algorithm SHA256 -LiteralPath (Join-Path $Bin $name)).Hash}
     $tag=($hashes | ForEach-Object {$_.Substring(0,12)}) -join '-'
     $destination=Join-Path $root "releases\$tag"
@@ -92,7 +93,7 @@ if ($Action -eq 'Stage') {
         Write-Atomic (Join-Path $configDir 'companions.jsonc') (@{version=1;file_browser=$fb;task_manager=$tm}|ConvertTo-Json)
         Write-Atomic $nativeConfig "source = companions.jsonc`n"
     }
-    $check=Start-Process -FilePath (Join-Path $destination 'winwm.exe') -ArgumentList 'ctl','prepare' -PassThru -Wait
+    $check=Start-Process -FilePath (Join-Path $destination 'winwm.exe') -ArgumentList 'ctl','prepare' -PassThru -Wait -WindowStyle Hidden
     if ($check.ExitCode) {throw 'winwm configuration validation failed.'}
     $previous=$null
     if (Test-Path $manifest) {
@@ -108,54 +109,41 @@ if (!(Test-Path $manifest)) {throw 'Stage the binaries before activation.'}
 $stage=Get-Content $manifest -Raw|ConvertFrom-Json
 $hostExe=Join-Path $stage.path 'winwm.exe'
 if (!(Test-Path -LiteralPath $hostExe -PathType Leaf)) {throw "Missing $hostExe"}
-$check=Start-Process -FilePath $hostExe -ArgumentList 'ctl','prepare' -PassThru -Wait
-if ($check.ExitCode) {throw 'Config validation failed'}
-# The account must already be covered by an enforced executable rule. AuditOnly
-# evaluation can return Denied during simulation, so check enforcement separately.
-$effective=Get-AppLockerPolicy -Effective -Xml -ErrorAction Stop
-$policy=[xml]$effective
-$collection=@($policy.AppLockerPolicy.RuleCollection | Where-Object Type -eq 'Exe')
-if ($collection.Count -ne 1 -or $collection[0].EnforcementMode -ne 'Enabled' -or
-    (Get-Service AppIDSvc).Status -ne 'Running') {throw 'Explorer exclusion is not enforced for this account.'}
-$actual=Get-AppLockerPolicy -Effective
-$result=Test-AppLockerPolicy -PolicyObject $actual -Path (Join-Path $env:WINDIR 'explorer.exe') -User $sessionSid
-if (@($result | Where-Object PolicyDecision -eq 'Denied').Count -ne 1) {throw 'Explorer is allowed by effective policy.'}
-foreach ($binary in @($hostExe)) {
-    $decision=Test-AppLockerPolicy -PolicyObject $actual -Path $binary -User $sessionSid
-    if ([string]$decision.PolicyDecision -notlike 'Allowed*') {throw "Application policy blocks $binary"}
-}
-$entries=@()
-foreach ($type in 'Directory','Drive') {
-    $base="Software\Classes\$type\shell"
-    $entries+=@{path="$base\winwm\command";name='';value=('"'+$hostExe+'" ctl run open_folder "%1\."')}
-    $entries+=@{path=$base;name='';value='winwm'}
-}
-$entries+=@{path='Software\Microsoft\Windows\CurrentVersion\Policies\System';name='Shell';value=('"'+$hostExe+'"')}
-foreach ($name in 'AppsUseLightTheme','SystemUsesLightTheme') {
-    $entries+=@{path='Software\Microsoft\Windows\CurrentVersion\Themes\Personalize';name=$name;value=0;kind='DWord'}
-}
+$recoveryExe=Join-Path $stage.path 'winwm_recovery.exe'
+if (!(Test-Path -LiteralPath $recoveryExe -PathType Leaf)) {throw "Missing $recoveryExe. Stage the complete release first."}
+$check=Start-Process -FilePath $hostExe -ArgumentList 'ctl','validate-startup' -PassThru -Wait -WindowStyle Hidden
+if ($check.ExitCode) {throw 'The staged release failed startup validation.'}
+$startup=@{path='Software\Microsoft\Windows\CurrentVersion\Run';name='winwm';value=('"'+$hostExe+'"')}
+$startup.before=Get-RegValue $startup
+$legacy=@()
 if (Test-Path $journal) {
     $old=Get-Content $journal -Raw|ConvertFrom-Json
     if ($old.sid -ne $sessionSid) {throw 'Activation journal belongs to a different user.'}
-    foreach ($entry in $entries) {
-        $match=@($old.entries|Where-Object {$_.path -eq $entry.path -and $_.name -eq $entry.name})
-        if ($match.Count -eq 0 -and $entry.kind -eq 'DWord') {
-            $entry.before=Get-RegValue $entry
-            continue
+    $match=@($old.entries|Where-Object {$_.path -eq $startup.path -and $_.name -eq $startup.name})
+    if ($match.Count -gt 1) {throw 'Activation journal mismatch.'}
+    if ($match.Count -eq 1) {
+        $current=$startup.before
+        if ($current.present -and ($current.kind -ne 'String' -or
+            ($current.value -cne $match[0].value -and $current.value -cne $match[0].oldOwned))) {
+            throw 'Startup entry changed independently. Roll back before activating again.'
         }
-        if ($match.Count -ne 1) {throw 'Activation journal mismatch.'}
-        $current=Get-RegValue $entry
-        if (!$current.present -or $current.value -ne $match[0].value) {throw 'Activation changed externally. Roll back before retrying.'}
-        $entry.before=$match[0].before
-        $entry.oldOwned=$match[0].value
+        $startup.before=$match[0].before
+        if ($current.present) {$startup.oldOwned=$current.value}
     }
-} else {foreach ($entry in $entries) {$entry.before=Get-RegValue $entry}}
-Write-Atomic $journal (@{sid=$sessionSid;entries=$entries}|ConvertTo-Json -Depth 6)
+    $legacy=@($old.entries|Where-Object {$_.path -ne $startup.path -or $_.name -ne $startup.name})
+}
+if ($startup.before.present -and !$startup.ContainsKey('oldOwned')) {
+    throw 'The winwm startup entry already belongs to another deployment.'
+}
+# Journal both sides before migrating an older deployment away from shell replacement.
+Write-Atomic $journal (@{sid=$sessionSid;entries=@($startup)+$legacy}|ConvertTo-Json -Depth 6)
 try {
-    foreach ($entry in $entries) {
-        $kind=if ($entry.kind) {$entry.kind} else {'String'}
-        Set-RegValue $entry @{present=$true;kind=$kind;value=$entry.value}
+    Set-RegValue $startup @{present=$true;kind='String';value=$startup.value}
+    if ($legacy.Count) {
+        [array]::Reverse($legacy)
+        foreach ($entry in $legacy) {Restore-Entry $entry}
+        Write-Atomic $journal (@{sid=$sessionSid;entries=@($startup)}|ConvertTo-Json -Depth 6)
     }
 } catch {Restore-Activation;throw}
-Write-Output 'Per-user shell and folder verbs activated for the next sign-in.'
+Write-Output 'winwm will start at the next sign-in.'
 

@@ -1,59 +1,31 @@
 #include "theme/theme.h"
 #include "shell_host/entry.h"
 #include "win_platform/win_platform.h"
+#include <shellapi.h>
 #include <wchar.h>
 #include <stdio.h>
 
 ////////////////
 //~ Shell Host
 
-static HANDLE child;
+static HANDLE session;
 static HWND panel;
-static bool snap_suspended, backdrop_changed;
-static COLORREF previous_backdrop;
-static const COLORREF backdrop = RGB(9, 10, 13);
-static const int backdrop_index = COLOR_DESKTOP;
+static wchar_t session_exe[os_path_cap], restart_exe[os_path_cap];
 
 ////////////////
 //~ Shell Host Functions
 
-static void w_restore_session_preferences(void) {
-    if (backdrop_changed && GetSysColor(backdrop_index) == backdrop)
-        SetSysColors(1, &backdrop_index, &previous_backdrop);
-    backdrop_changed = false;
-    if (snap_suspended) {
-        SystemParametersInfoW(SPI_SETWINARRANGING, 0, (void *)(UINT_PTR)TRUE, 0);
-        snap_suspended = false;
-    }
-}
-
-static bool ending, rescue_requested, preview;
-enum { first_recovery_id = 101, exit_preview_id = 109, recovery_row = 36 };
+static bool ending, rescue_requested, quit_requested, preview, logging_off;
+enum { first_recovery_id = 101, exit_windows_id = 109, recovery_row = 36 };
 
 static const wchar_t *const labels[] = {
     L"&Restart winwm",        L"Open &terminal", L"&Edit configuration",   L"Use built-in &defaults",
-    L"Use &previous release", L"&Sign out",      L"Restore sign-in &shell"};
-static bool w_launch_child(const wchar_t *exe) {
-    child = w_os_launch(exe, preview ? L"--preview-session" : L"--session");
-    if (child) {
-        // Supply the shell desktop color when no wallpaper is configured.
-        if (!preview) {
-            previous_backdrop = GetSysColor(backdrop_index);
-            if (previous_backdrop != backdrop)
-                backdrop_changed = SetSysColors(1, &backdrop_index, &backdrop) != 0;
-        }
-        BOOL enabled = FALSE;
-        if (!preview && SystemParametersInfoW(SPI_GETWINARRANGING, 0, &enabled, 0) && enabled)
-            snap_suspended = SystemParametersInfoW(SPI_SETWINARRANGING, 0, NULL, 0) != 0;
-        ShowWindow(panel, SW_HIDE);
-        return true;
-    }
-    return false;
-}
-
-static bool w_start_child(void) {
-    wchar_t exe[os_path_cap];
-    return w_os_self(exe, count_of(exe)) && w_launch_child(exe);
+    L"Use &previous release", L"&Sign out",      L"Remove winwm from &startup"};
+static bool w_restart(const wchar_t *exe) {
+    if (GetFileAttributesW(exe) == INVALID_FILE_ATTRIBUTES) return false;
+    wcscpy(restart_exe,exe);
+    PostQuitMessage(0);
+    return true;
 }
 
 static bool w_start_managed_previous(void) {
@@ -72,7 +44,19 @@ static bool w_start_managed_previous(void) {
     if (!complete || !w_os_provider(path, exe, count_of(exe)) || _wcsnicmp(exe, releases, wcslen(releases)))
         return false;
     const wchar_t *file_name = wcsrchr(exe, L'\\');
-    return file_name && !_wcsicmp(file_name + 1, L"winwm.exe") && w_launch_child(exe);
+    if (!file_name || _wcsicmp(file_name + 1, L"winwm.exe")) return false;
+    // Earlier releases take down Explorer. Only restart a manager that can
+    // validate its own recovery companion and configuration.
+    wchar_t command[os_path_cap+32];
+    swprintf(command,count_of(command),L"\"%ls\" ctl validate-startup",exe);
+    STARTUPINFOW si = {.cb=sizeof(si)};
+    PROCESS_INFORMATION pi;
+    if (!CreateProcessW(exe,command,NULL,NULL,FALSE,CREATE_NO_WINDOW,NULL,NULL,&si,&pi)) return false;
+    CloseHandle(pi.hThread);
+    DWORD code = ERROR_TIMEOUT;
+    if (WaitForSingleObject(pi.hProcess,15000) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess,&code);
+    CloseHandle(pi.hProcess);
+    return !code && w_restart(exe);
 }
 
 ////////////////
@@ -86,16 +70,13 @@ static void w_create_recovery_controls(void) {
             CreateWindowW(L"BUTTON", labels[i], WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 14,
                           12 + recovery_row * i, 290, 30, panel, (HMENU)(INT_PTR)id, instance, NULL);
     }
-    if (preview && !GetDlgItem(panel, exit_preview_id))
-        CreateWindowW(L"BUTTON", L"E&xit preview", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 14,
-                      12 + recovery_row * count_of(labels), 290, 30, panel, (HMENU)exit_preview_id, instance,
+    if (!GetDlgItem(panel, exit_windows_id))
+        CreateWindowW(L"BUTTON", L"E&xit to Windows", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 14,
+                      12 + recovery_row * count_of(labels), 290, 30, panel, (HMENU)exit_windows_id, instance,
                       NULL);
 }
 
 static void w_rescue(void) {
-    w_restore_session_preferences();
-    w_os_area_restore();
-    w_os_restore_all();
     w_create_recovery_controls();
     ShowWindow(panel, SW_SHOW);
     SetForegroundWindow(panel);
@@ -105,7 +86,7 @@ static void w_rescue(void) {
 
 static void w_handle_action(int id) {
     if (id == 101) {
-        if (!w_start_child())
+        if (!w_restart(session_exe))
             MessageBoxW(panel, L"The selected winwm executable could not start.", L"Recovery", MB_OK);
     } else if (id == 102)
         w_os_launch_terminal("%SystemRoot%\\System32\\cmd.exe", false);
@@ -129,7 +110,7 @@ static void w_handle_action(int id) {
             return;
         }
         w_os_cache_discard();
-        w_start_child();
+        w_restart(session_exe);
     } else if (id == 105 || id == 107) {
         wchar_t exe[os_path_cap];
         const wchar_t *name = L"winwm_install.exe";
@@ -146,7 +127,7 @@ static void w_handle_action(int id) {
                         id == 105 ? L"No previous winwm release is available."
                                   : L"Run winwm_install.exe /uninstall from the release folder.",
                         L"winwm recovery", MB_OK);
-    } else if (id == exit_preview_id && preview) {
+    } else if (id == exit_windows_id) {
         PostQuitMessage(0);
     } else if (id == 106)
         ExitWindowsEx(EWX_LOGOFF, 0);
@@ -160,58 +141,76 @@ static LRESULT CALLBACK w_host_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     if (w_theme_message(w, msg, wp, lp, &color_result))
         return color_result;
     switch (msg) {
+    case recovery_session_closing:
+        if (session && (DWORD)wp == GetProcessId(session)) {
+            if (lp == 42) rescue_requested = true;
+            if (!rescue_requested) quit_requested = true;
+            SetTimer(w,1,5000,NULL);
+        }
+        return 0;
     case WM_COMMAND:
-        if (!child)
+        if (!session)
             w_handle_action(LOWORD(wp));
         return 0;
     case WM_HOTKEY:
-        if (child) {
-            // Closing the owned desktop process runs its normal cleanup. A hung
+    case WM_CLOSE:
+        if (msg == WM_CLOSE) quit_requested = true;
+        if (session) {
+            // Closing the session runs its normal cleanup. A hung
             // process is handled by the independent recovery action below.
-            DWORD pid = GetProcessId(child);
+            DWORD pid = GetProcessId(session);
             HWND h = FindWindowW(L"WinwmEvents", NULL);
             DWORD owner = 0;
             if (h)
                 GetWindowThreadProcessId(h, &owner);
-            rescue_requested = true;
+            rescue_requested = !quit_requested;
             if (owner == pid)
                 PostMessageW(h, WM_CLOSE, 0, 0);
             SetTimer(w, 1, 2000, NULL);
-        } else
+        } else if (quit_requested)
+            PostQuitMessage(0);
+        else
             w_rescue();
         return 0;
     case WM_TIMER:
         KillTimer(w, 1);
-        if (child && rescue_requested && WaitForSingleObject(child, 0) == WAIT_TIMEOUT)
-            TerminateProcess(child, 42);
+        if (session && (quit_requested || rescue_requested) && WaitForSingleObject(session, 0) == WAIT_TIMEOUT)
+            TerminateProcess(session, rescue_requested ? 42 : ERROR_CANCELLED);
         return 0;
     case WM_QUERYENDSESSION:
         return TRUE;
     case WM_ENDSESSION:
         if (wp) {
+            logging_off = true;
             ending = true;
             PostQuitMessage(0);
         }
-        return 0;
-    case WM_CLOSE:
-        if (!child)
-            SetFocus(GetDlgItem(w, 101));
         return 0;
     default:
         return DefWindowProcW(w, msg, wp, lp);
     }
 }
 
-int w_host_run(HINSTANCE inst, bool preview_mode) {
-    preview = preview_mode;
+static int w_host_run(HINSTANCE inst, DWORD pid, uint64_t birth) {
     w_os_instance_lock lock;
     DWORD error = w_os_instance_claim(os_host_instance, &lock);
     if (error)
         return (int)error;
-    error = w_os_instance_status(os_interactive_instance);
-    if (error) {
-        w_os_instance_release(&lock);
-        return (int)error;
+    if (!w_os_self(session_exe,count_of(session_exe))) { error = GetLastError(); goto done; }
+    wchar_t *name = wcsrchr(session_exe,L'\\');
+    if (!name || (size_t)(name+1-session_exe)+count_of(L"winwm.exe") > count_of(session_exe)) {
+        error = ERROR_BAD_PATHNAME; goto done;
+    }
+    wcscpy(name+1,L"winwm.exe");
+    session = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION|SYNCHRONIZE|PROCESS_TERMINATE,FALSE,pid);
+    if (!session) { error = GetLastError(); goto done; }
+    FILETIME created, exited, kernel, user;
+    wchar_t actual[os_path_cap];
+    DWORD size = count_of(actual);
+    if (!GetProcessTimes(session,&created,&exited,&kernel,&user) ||
+        birth != (((uint64_t)created.dwHighDateTime << 32) | created.dwLowDateTime) ||
+        !QueryFullProcessImageNameW(session,0,actual,&size) || _wcsicmp(actual,session_exe)) {
+        error = ERROR_INVALID_OWNER; goto done;
     }
     w_os_mark(L"host_entry");
     WNDCLASSW wc = {.lpfnWndProc = w_host_proc,
@@ -222,32 +221,29 @@ int w_host_run(HINSTANCE inst, bool preview_mode) {
     RegisterClassW(&wc);
     panel = CreateWindowExW(WS_EX_TOPMOST | WS_EX_CONTROLPARENT, wc.lpszClassName, L"winwm recovery",
                             WS_CAPTION | WS_SYSMENU, 100, 100, 338,
-                            74 + recovery_row * ((int)count_of(labels) + preview), NULL, NULL, inst, NULL);
-    if (!panel) {
-        w_os_instance_release(&lock);
-        return 3;
-    }
+                            74 + recovery_row * ((int)count_of(labels) + 1), NULL, NULL, inst, NULL);
+    if (!panel || !SetPropW(panel,L"winwm.session_pid",(HANDLE)(uintptr_t)pid)) { error = GetLastError(); goto done; }
     if (!RegisterHotKey(panel, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F12))
         SetPropW(panel, L"winwm.recovery_hotkey_error", (HANDLE)(uintptr_t)GetLastError());
-    if (!preview)
-        w_os_area_open(true);
-    if (!w_start_child())
-        w_rescue();
     while (!ending) {
-        DWORD n = child ? 1 : 0;
+        DWORD n = session ? 1 : 0;
         DWORD wait =
-            MsgWaitForMultipleObjectsEx(n, child ? &child : NULL, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            MsgWaitForMultipleObjectsEx(n, session ? &session : NULL, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         if (wait == WAIT_FAILED)
             break;
         if (n && wait == WAIT_OBJECT_0) {
             DWORD code = 0;
-            GetExitCodeProcess(child, &code);
+            GetExitCodeProcess(session, &code);
             SetPropW(panel, L"winwm.child_exit", (HANDLE)(uintptr_t)((uint64_t)code + 1));
-            CloseHandle(child);
-            child = NULL;
-            rescue_requested = false;
+            CloseHandle(session);
+            session = NULL;
             KillTimer(panel, 1);
-            w_rescue();
+            w_os_restore_all();
+            if (!quit_requested && (rescue_requested || code == 42))
+                w_rescue();
+            else
+                break;
+            rescue_requested = false;
         }
         MSG m;
         while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) {
@@ -261,10 +257,55 @@ int w_host_run(HINSTANCE inst, bool preview_mode) {
             }
         }
     }
-    if (child)
-        CloseHandle(child);
-    w_restore_session_preferences();
-    w_os_area_close();
+    if (!preview && !logging_off && !GetShellWindow()) w_os_ensure_shell();
+done:
+    if (session) CloseHandle(session);
+    if (panel) DestroyWindow(panel);
     w_os_instance_release(&lock);
-    return 0;
+    if (*restart_exe && !logging_off) {
+        HANDLE next = w_os_launch(restart_exe,preview ? L"--preview" : NULL);
+        if (!next) error = GetLastError();
+        else CloseHandle(next);
+    }
+    w_os_wait_layer_cleanup();
+    return (int)error;
+}
+
+int WINAPI wWinMain(HINSTANCE inst,HINSTANCE previous,PWSTR args,int show) {
+    (void)previous; (void)args; (void)show;
+    int argc;
+    wchar_t **argv = CommandLineToArgvW(GetCommandLineW(),&argc);
+    if (!argv) return (int)GetLastError();
+    int result = ERROR_INVALID_PARAMETER;
+    if (argc == 2 && !wcscmp(argv[1],WINWM_RECOVERY_CHECK))
+        result = ERROR_SUCCESS;
+    else if (argc == 2) {
+        const wchar_t *arg = argv[1];
+        bool launch = !wcsncmp(arg,L"/start:",7);
+        unsigned mode;
+        unsigned long pid;
+        unsigned long long birth;
+        wchar_t extra;
+        if ((launch || !wcsncmp(arg,L"/watch:",7)) &&
+            swscanf(arg+7,L"%u:%lu:%llu%lc",&mode,&pid,&birth,&extra) == 3 && mode <= 1 && pid && birth) {
+            if (launch) {
+                wchar_t self[os_path_cap], watch[96];
+                swprintf(watch,count_of(watch),L"/watch:%u:%lu:%llu",mode,pid,birth);
+                // An Explorer shell recovered here must also survive ending
+                // the manager's process tree.
+                result = mode ? 0 : (int)w_os_ensure_shell();
+                if (!result) {
+                    HANDLE monitor = w_os_self(self,count_of(self)) ? w_os_launch(self,watch) : NULL;
+                    result = monitor ? 0 : (int)GetLastError();
+                    if (monitor) CloseHandle(monitor);
+                }
+            } else {
+                preview = mode != 0;
+                SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+                result = w_host_run(inst,pid,birth);
+            }
+        }
+    }
+    LocalFree(argv);
+    return result;
 }

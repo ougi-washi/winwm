@@ -65,7 +65,7 @@ static const wchar_t command_glyphs[cmd_count] = {
     [cmd_date_time]=0xe823, [cmd_languages]=0xe774, [cmd_input_methods]=0xe765, [cmd_keyboard_settings]=0xe765,
     [cmd_packages]=0xe896, [cmd_chocolatey]=0xe896, [cmd_google_japanese_input]=0xe896, [cmd_updates]=0xe895, [cmd_windows_update]=0xe895,
     [cmd_reload]=0xe72c, [cmd_provider_refresh]=0xe72c, [cmd_lock]=0xe72e, [cmd_restart]=0xe777,
-    [cmd_sleep]=0xe708, [cmd_confirm_sign_out]=0xf3b1, [cmd_power_settings]=0xe7e8,
+    [cmd_sleep]=0xe708, [cmd_confirm_sign_out]=0xf3b1, [cmd_power_settings]=0xe7e8, [cmd_quit]=0xe8bb,
 };
 
 static void w_add_row(const wchar_t *label, const char *action, w_window_id target) {
@@ -218,6 +218,7 @@ static const w_menu_item menu_items[] = {
     {palette_session, "Sleep…", "sleep"},
     {palette_session, "Restart computer…", "restart"},
     {palette_session, "Sign out…", "confirm_sign_out"},
+    {palette_session, "Exit winwm and return to Windows", "quit"},
 };
 
 static const wchar_t *w_menu_keywords(enum command_kind kind) {

@@ -15,14 +15,17 @@ enum operation { op_install, op_uninstall, op_rollback };
 //~ Install
 
 static const wchar_t *const slot_dirs[slot_count] = {L"shell-a", L"shell-b", L"shell-c"};
-static const wchar_t *const previous_values[slot_count] = {L"PreviousA", L"PreviousB", L"PreviousC"};
+static const wchar_t *const previous_values[slot_count] = {L"StartupPreviousA", L"StartupPreviousB", L"StartupPreviousC"};
+static const wchar_t *const legacy_previous[slot_count] = {L"PreviousA", L"PreviousB", L"PreviousC"};
 static const wchar_t install_key[] = L"Software\\winwm\\Install";
+static const wchar_t run_key[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+static const wchar_t run_name[] = L"winwm";
 typedef wchar_t path_string[path_cap];
 
 static const wchar_t policy_key[] = L"Software\\Microsoft\\Windows\\CurrentVersion\\Policies\\System";
 typedef struct w_install_paths {
-    path_string root, source_shell, source_setup;
-    path_string slot[slot_count], shell[slot_count], command[slot_count], setup[slot_count];
+    path_string root, source_shell, source_setup, source_recovery;
+    path_string slot[slot_count], shell[slot_count], command[slot_count], setup[slot_count], recovery[slot_count];
 } w_install_paths;
 
 ////////////////
@@ -54,12 +57,16 @@ static DWORD w_get_paths(w_install_paths *p) {
         return ERROR_BAD_PATHNAME;
     *separator = 0;
     error = w_join(p->source_shell, source_directory, L"winwm.exe");
+    if (!error)
+        error = w_join(p->source_recovery, source_directory, L"winwm_recovery.exe");
     for (int i = 0; !error && i < slot_count; i++) {
         error = w_join(p->slot[i], p->root, slot_dirs[i]);
         if (!error)
             error = w_join(p->shell[i], p->slot[i], L"winwm.exe");
         if (!error)
             error = w_join(p->setup[i], p->slot[i], L"winwm_install.exe");
+        if (!error)
+            error = w_join(p->recovery[i], p->slot[i], L"winwm_recovery.exe");
         if (!error && swprintf(p->command[i], path_cap, L"\"%ls\"", p->shell[i]) < 0)
             error = ERROR_FILENAME_EXCED_RANGE;
     }
@@ -70,48 +77,35 @@ static bool w_absent(LSTATUS error) {
     return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
 }
 
-// Only the exact commands this installer publishes are owned by it.
-static DWORD w_active_slot(const w_install_paths *p, int *slot) {
+enum { foreign_slot = -2, absent_slot = -1 };
+
+// Only the exact REG_SZ commands this installer publishes are owned by it.
+static DWORD w_registered_slot(const w_install_paths *p, const wchar_t *key, const wchar_t *name, int *slot) {
     wchar_t command[path_cap];
     DWORD bytes = sizeof(command);
-    *slot = -1;
-    LSTATUS error =
-        RegGetValueW(HKEY_CURRENT_USER, policy_key, L"Shell", RRF_RT_REG_SZ, NULL, command, &bytes);
+    *slot = absent_slot;
+    LSTATUS error = RegGetValueW(HKEY_CURRENT_USER,key,name,RRF_RT_REG_SZ|RRF_NOEXPAND,NULL,command,&bytes);
     if (w_absent(error))
         return ERROR_SUCCESS;
+    *slot = foreign_slot;
+    if (error == ERROR_UNSUPPORTED_TYPE || error == ERROR_MORE_DATA) return ERROR_SUCCESS;
     if (error)
         return error;
     for (int i = 0; i < slot_count; i++) {
-        if (!_wcsicmp(command, p->command[i])) {
+        if (bytes == (wcslen(p->command[i])+1)*sizeof(wchar_t) && !_wcsicmp(command, p->command[i])) {
             *slot = i;
             return ERROR_SUCCESS;
         }
     }
-    return ERROR_ALREADY_ASSIGNED;
+    return ERROR_SUCCESS;
 }
 
-static DWORD w_check_platform(void) {
-    const wchar_t machine_key[] = L"Software\\Microsoft\\Windows NT\\CurrentVersion";
-    wchar_t edition[96];
-    DWORD size = sizeof(edition);
-    LSTATUS error =
-        RegGetValueW(HKEY_LOCAL_MACHINE, machine_key, L"EditionID", RRF_RT_REG_SZ, NULL, edition, &size);
-    if (error)
-        return error;
-    const wchar_t *editions[] = {L"Professional", L"Education", L"Enterprise", L"IoTEnterprise"};
-    bool supported = false;
-    for (size_t i = 0; i < length_of(editions); i++)
-        supported |= !_wcsnicmp(edition, editions[i], wcslen(editions[i]));
-    if (!supported)
-        return ERROR_NOT_SUPPORTED;
-    DWORD lightweight = 0;
-    size = sizeof(lightweight);
-    error =
-        RegGetValueW(HKEY_LOCAL_MACHINE, L"Software\\Microsoft\\PolicyManager\\current\\device\\WindowsLogon",
-                     L"OverrideShellProgram", RRF_RT_REG_DWORD, NULL, &lightweight, &size);
-    if (error && !w_absent(error))
-        return error;
-    return lightweight ? ERROR_ACCESS_DISABLED_BY_POLICY : ERROR_SUCCESS;
+static DWORD w_remove_owned(const w_install_paths *p, const wchar_t *key, const wchar_t *name) {
+    int slot;
+    DWORD error = w_registered_slot(p,key,name,&slot);
+    if (error || slot < 0) return error;
+    error = RegDeleteKeyValueW(HKEY_CURRENT_USER,key,name);
+    return w_absent(error) ? ERROR_SUCCESS : error;
 }
 
 static DWORD w_create_directory(const wchar_t *path) {
@@ -188,7 +182,7 @@ static DWORD w_stage_file(const wchar_t *source, const wchar_t *destination) {
 
 static DWORD w_validate(const wchar_t *exe, const wchar_t *directory) {
     wchar_t command[path_cap + 32];
-    swprintf(command, length_of(command), L"\"%ls\" ctl validate", exe);
+    swprintf(command, length_of(command), L"\"%ls\" ctl validate-startup", exe);
     STARTUPINFOW startup = {.cb = sizeof(startup)};
     PROCESS_INFORMATION process;
     if (!CreateProcessW(exe, command, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, directory, &startup,
@@ -209,12 +203,12 @@ static DWORD w_validate(const wchar_t *exe, const wchar_t *directory) {
 //~ Release activation and rollback
 
 // The live slot and its predecessor remain readable throughout an interrupted update.
-static DWORD w_previous_slot(int current, int *previous) {
+static DWORD w_previous_slot(int current, const wchar_t *const names[], int *previous) {
     *previous = -1;
     if (current < 0)
         return ERROR_SUCCESS;
     DWORD value, bytes = sizeof(value);
-    LSTATUS error = RegGetValueW(HKEY_CURRENT_USER, install_key, previous_values[current], RRF_RT_REG_DWORD,
+    LSTATUS error = RegGetValueW(HKEY_CURRENT_USER, install_key, names[current], RRF_RT_REG_DWORD,
                                  NULL, &value, &bytes);
     if (w_absent(error))
         return ERROR_SUCCESS;
@@ -226,33 +220,35 @@ static DWORD w_previous_slot(int current, int *previous) {
     return ERROR_SUCCESS;
 }
 
-static DWORD w_activate(const w_install_paths *p, int current, int slot) {
+static DWORD w_activate(const w_install_paths *p, int current, int slot, bool migrate) {
     int observed;
-    DWORD error = w_active_slot(p, &observed);
+    DWORD error = w_registered_slot(p,run_key,run_name,&observed);
     if (error || observed != current)
         return error ? error : ERROR_REVISION_MISMATCH;
-    if (current == slot)
-        return ERROR_SUCCESS;
-    if (current >= 0) {
+    if (wcslen(p->command[slot]) > 260) return ERROR_FILENAME_EXCED_RANGE;
+    if (current >= 0 && current != slot) {
         DWORD previous = (DWORD)current;
         error = RegSetKeyValueW(HKEY_CURRENT_USER, install_key, previous_values[slot], REG_DWORD, &previous,
                                 sizeof(previous));
-    } else {
+    } else if (current < 0) {
         error = RegDeleteKeyValueW(HKEY_CURRENT_USER, install_key, previous_values[slot]);
         if (w_absent(error))
             error = ERROR_SUCCESS;
     }
     if (error)
         return error;
-    return RegSetKeyValueW(HKEY_CURRENT_USER, policy_key, L"Shell", REG_SZ, p->command[slot],
+    // Retire a legacy shell before enabling startup. An interrupted migration
+    // leaves Explorer as the desktop at the next sign-in.
+    if (migrate) error = w_remove_owned(p,policy_key,L"Shell");
+    if (error || current == slot) return error;
+    return RegSetKeyValueW(HKEY_CURRENT_USER, run_key, run_name, REG_SZ, p->command[slot],
                            (DWORD)((wcslen(p->command[slot]) + 1) * sizeof(wchar_t)));
 }
 
 static DWORD w_select_release(const w_install_paths *p, int current, bool rollback) {
-    DWORD error = w_check_platform();
+    if (current == foreign_slot) return ERROR_ALREADY_ASSIGNED;
     int previous = -1;
-    if (!error)
-        error = w_previous_slot(current, &previous);
+    DWORD error = w_previous_slot(current,previous_values,&previous);
     if (error)
         return error;
     int slot = previous;
@@ -260,48 +256,56 @@ static DWORD w_select_release(const w_install_paths *p, int current, bool rollba
         if (previous < 0)
             return ERROR_NOT_FOUND;
     } else {
+        int legacy, keep_legacy = -1;
+        error = w_registered_slot(p,policy_key,L"Shell",&legacy);
+        if (!error && current < 0 && legacy >= 0)
+            error = w_previous_slot(legacy,legacy_previous,&keep_legacy);
+        if (error) return error;
         bool identical = false;
         if (current >= 0) {
             error = w_files_equal(p->source_shell, p->shell[current], &identical);
+            if (!error && identical)
+                error = w_files_equal(p->source_recovery, p->recovery[current], &identical);
             if (error)
                 return error;
         }
         slot = current;
         if (!identical) {
             slot = 0;
-            while (slot == current || slot == previous)
-                ++slot;
+            while (slot < slot_count && (slot == current || slot == previous || slot == legacy || slot == keep_legacy)) ++slot;
+            if (slot == slot_count) return ERROR_BUSY;
         }
         error = w_create_directory(p->slot[slot]);
         if (!error)
             error = w_stage_file(p->source_shell, p->shell[slot]);
         if (!error)
+            error = w_stage_file(p->source_recovery, p->recovery[slot]);
+        if (!error)
             error = w_stage_file(p->source_setup, p->setup[slot]);
     }
     if (!error)
         error = w_validate(p->shell[slot], p->slot[slot]);
-    return error ? error : w_activate(p, current, slot);
+    return error ? error : w_activate(p, current, slot,!rollback);
 }
 
-static DWORD w_uninstall(const w_install_paths *p, int current, bool *files_busy) {
-    if (current >= 0) {
-        LSTATUS error = RegDeleteKeyValueW(HKEY_CURRENT_USER, policy_key, L"Shell");
-        if (error && !w_absent(error))
-            return error;
-    }
+static DWORD w_uninstall(const w_install_paths *p, bool *files_busy) {
+    DWORD error = w_remove_owned(p,policy_key,L"Shell");
+    if (!error) error = w_remove_owned(p,run_key,run_name);
+    if (error) return error;
     for (int i = 0; i < slot_count; i++) {
-        const wchar_t *owned[] = {p->shell[i], p->setup[i]};
+        const wchar_t *owned[] = {p->shell[i], p->setup[i], p->recovery[i]};
         for (size_t j = 0; j < length_of(owned); j++) {
             if (!DeleteFileW(owned[j]) && !w_absent(GetLastError()))
                 *files_busy = true;
         }
         RemoveDirectoryW(p->slot[i]);
         RegDeleteKeyValueW(HKEY_CURRENT_USER, install_key, previous_values[i]);
+        RegDeleteKeyValueW(HKEY_CURRENT_USER, install_key, legacy_previous[i]);
     }
     return ERROR_SUCCESS;
 }
 
-static DWORD w_change_shell(enum operation op, bool *files_busy) {
+static DWORD w_change_installation(enum operation op, bool *files_busy) {
     w_install_paths p;
     DWORD error = w_get_paths(&p);
     if (error)
@@ -317,9 +321,9 @@ static DWORD w_change_shell(enum operation op, bool *files_busy) {
     if (lock == INVALID_HANDLE_VALUE)
         return GetLastError();
     int slot;
-    error = w_active_slot(&p, &slot);
+    error = w_registered_slot(&p,run_key,run_name,&slot);
     if (!error)
-        error = op == op_uninstall ? w_uninstall(&p, slot, files_busy)
+        error = op == op_uninstall ? w_uninstall(&p, files_busy)
                                    : w_select_release(&p, slot, op == op_rollback);
     CloseHandle(lock);
     return error;
@@ -334,32 +338,24 @@ static void w_report(bool interactive, enum operation op, bool files_busy, DWORD
     const wchar_t *detail;
     switch (error) {
     case ERROR_SUCCESS:
-        detail = op == op_uninstall  ? L"Your normal Windows shell will start at the next sign-in."
+        detail = op == op_uninstall  ? L"Removed winwm startup for this account."
                  : op == op_rollback ? L"The previous winwm release will start at the next sign-in."
-                                     : L"winwm will start as your shell at the next sign-in.";
+                                     : L"winwm will start alongside Windows at the next sign-in.";
         break;
     case ERROR_NOT_FOUND:
         detail = L"This installation has no previous release to restore.";
         break;
     case ERROR_ACCESS_DENIED:
-        detail = L"Windows denied access to the install directory or this account's sign-in shell policy. "
-                 L"Check the policy permissions for the account being configured.";
+        detail = L"Windows denied access to the install directory or this account's startup settings.";
         break;
     case ERROR_ALREADY_ASSIGNED:
-        detail = L"Another custom sign-in shell already owns this user policy.";
-        break;
-    case ERROR_NOT_SUPPORTED:
-        detail =
-            L"Custom User Interface requires a supported Pro, Education or Enterprise edition of Windows.";
-        break;
-    case ERROR_ACCESS_DISABLED_BY_POLICY:
-        detail = L"An active Windows policy prevents installation.";
+        detail = L"The winwm startup entry belongs to another installation.";
         break;
     case ERROR_FILE_NOT_FOUND:
-        detail = L"Place winwm.exe beside winwm_install.exe and retry.";
+        detail = L"Place winwm.exe and winwm_recovery.exe beside winwm_install.exe and retry.";
         break;
     case ERROR_INVALID_DATA:
-        detail = L"The staged shell failed configuration validation. Run winwm.exe ctl validate for details.";
+        detail = L"The staged release failed startup validation. Run winwm.exe ctl validate-startup for details.";
         break;
     default:
         detail = L"Windows could not complete this operation.";
@@ -406,16 +402,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show
         return ERROR_INVALID_PARAMETER;
     if (interactive) {
         const wchar_t *question =
-            remove ? L"Restore the normal Windows shell for this account at the next sign-in?"
+            remove ? L"Remove winwm and its startup entry from this account?"
             : rollback
                 ? L"Use the previous installed winwm release at the next sign-in?"
-                : L"Install winwm as this account's sign-in shell? The next sign-in will start winwm in "
-                  L"place of the Explorer desktop.";
+                : L"Install winwm and start it alongside Windows each time this account signs in?";
         if (MessageBoxW(NULL, question, L"winwm setup", MB_YESNO | MB_ICONQUESTION) != IDYES)
             return ERROR_CANCELLED;
     }
     bool files_busy = false;
-    DWORD error = w_change_shell(op, &files_busy);
+    DWORD error = w_change_installation(op, &files_busy);
     w_report(interactive, op, files_busy, error);
     return (int)error;
 }

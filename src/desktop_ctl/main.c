@@ -1,5 +1,6 @@
 #include "desktop_ctl/entry.h"
 #include "ipc/ipc.h"
+#include "shell_host/entry.h"
 #include <stdio.h>
 #include <wchar.h>
 
@@ -27,7 +28,11 @@ int w_ctl_run(int argc, wchar_t **argv) {
             puts("Restart Windows to apply the physical modifier mapping to all accounts.");
         return error ? 1 : 0;
     }
-    if (argc == 2 && (!wcscmp(argv[1], L"validate") || !wcscmp(argv[1], L"prepare"))) {
+    if (argc == 2 && (!wcscmp(argv[1], L"validate") || !wcscmp(argv[1], L"validate-startup") || !wcscmp(argv[1], L"prepare"))) {
+        if (!wcscmp(argv[1],L"validate-startup") && !w_recovery_validate()) {
+            fputs("A compatible winwm_recovery.exe is required beside winwm.exe.\n",stderr);
+            return 1;
+        }
         static w_desktop_config cfg;
         char error[256];
         if (!w_os_config_load(&cfg, error, sizeof(error))) {

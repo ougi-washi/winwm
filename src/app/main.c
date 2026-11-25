@@ -1,7 +1,6 @@
 #include "desktop/entry.h"
 #include "desktop_ctl/entry.h"
 #include "desktop_tools/entry.h"
-#include "shell_host/entry.h"
 #include <shellapi.h>
 #include <stdio.h>
 #ifndef _WIN64
@@ -27,7 +26,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR line, int show
     if (!argv)
         return 1;
     if (argc == 1 || (argc == 2 && !wcscmp(argv[1], L"--preview")))
-        result = w_shell_result(w_host_run(instance, argc == 2));
+        result = w_shell_result(w_session_run(instance, argc == 2));
     else if (argc == 2 && (!wcscmp(argv[1], L"--session") || !wcscmp(argv[1], L"--preview-session")))
         result = w_shell_result(w_session_run(instance, !wcscmp(argv[1], L"--preview-session")));
     else if (argc == 2 && !wcsncmp(argv[1], L"--tool-", 7))

@@ -47,11 +47,10 @@ src/model/model.c
 src/os_win32/explorer.c
 src/os_win32/modifier_map.c
 src/os_win32/os_win32.c
-src/os_win32/work_area.c
 src/palette/palette.c
 src/providers/audio.c
 src/providers/providers.c
-src/shell_host/main.c
+src/shell_host/attach.c
 src/win_platform/snapshot.c
 src/win_platform/cpu.c
 src/win_platform/percent_slider.c
@@ -81,5 +80,4 @@ src/win_platform/win_platform.c
 -lpdh
 -lmfuuid
 -lcomdlg32
--lrstrtmgr
 -lusp10

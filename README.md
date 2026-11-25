@@ -1,12 +1,14 @@
 # winwm
 
-Tiling window manager and shell for Windows x64.
+Tiling window manager for Windows x64. Runs alongside Explorer.
 
 | Task | PowerShell |
 | --- | --- |
 | Build (MinGW-w64 GCC and windres) | `.\build.bat` |
-| Install for next sign-in | `.\bin\winwm_install.exe /install` |
-| Run as shell | `.\bin\winwm.exe` |
+| Start with Windows at sign-in | `.\bin\winwm_install.exe /install` |
+| Uninstall | `.\bin\winwm_install.exe /uninstall` |
+| Run | `.\bin\winwm.exe` |
+| Exit to Windows | Menu → Session → Exit winwm, or `.\bin\winwm.exe ctl run quit` |
 | Preview alongside Explorer | `.\bin\winwm.exe --preview` |
 
 ## Features

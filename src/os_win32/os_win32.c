@@ -415,6 +415,19 @@ bool w_os_candidate(HWND w) {
 // Properties are owned by the HWND lifetime. A reused handle never inherits recovery data.
 static const wchar_t *const coords[] = {L"winwm.x", L"winwm.y", L"winwm.w",
                                         L"winwm.h"};
+static const wchar_t *const placement_fields[] = {L"winwm.normal_lt", L"winwm.normal_rb",
+    L"winwm.min_pos", L"winwm.max_pos", L"winwm.show_flags"};
+
+// winwm is x64. Keep the values on the foreign HWND so a separate process
+// can recover them after termination, even when the owner reuses an HWND.
+static HANDLE w_pair(LONG x, LONG y) {
+    return (HANDLE)(uintptr_t)(((uint64_t)(DWORD)y << 32) | (DWORD)x);
+}
+
+static POINT w_unpack(HANDLE value) {
+    uint64_t bits = (uintptr_t)value;
+    return (POINT){(LONG)(DWORD)bits, (LONG)(DWORD)(bits >> 32)};
+}
 
 ////////////////
 //~ Window recovery
@@ -432,11 +445,12 @@ bool w_os_remember(HWND w, w_rect *original) {
         return true;
     }
     w_rect r = w_os_bounds(w);
-    bool zoomed = IsZoomed(w) != 0;
     WINDOWPLACEMENT placement = {.length = sizeof(placement)};
+    if (!GetWindowPlacement(w, &placement))
+        return false;
+    bool zoomed = placement.showCmd == SW_SHOWMAXIMIZED;
     MONITORINFO mi = {.cbSize = sizeof(mi)};
-    if (zoomed && GetWindowPlacement(w, &placement) &&
-        GetMonitorInfoW(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi)) {
+    if (zoomed && GetMonitorInfoW(MonitorFromWindow(w, MONITOR_DEFAULTTONEAREST), &mi)) {
         RECT normal = placement.rcNormalPosition;
         OffsetRect(&normal, mi.rcWork.left - mi.rcMonitor.left, mi.rcWork.top - mi.rcMonitor.top);
         r = (w_rect){normal.left, normal.top, normal.right - normal.left, normal.bottom - normal.top};
@@ -451,14 +465,28 @@ bool w_os_remember(HWND w, w_rect *original) {
             return false;
         }
     }
-    if (SetPropW(w, L"winwm.managed", (HANDLE)1)) {
-        *original = r;
-        if (zoomed)
-            SetPropW(w, L"winwm.zoomed", (HANDLE)1);
-        return true;
+    HANDLE values[] = {w_pair(placement.rcNormalPosition.left, placement.rcNormalPosition.top),
+        w_pair(placement.rcNormalPosition.right, placement.rcNormalPosition.bottom),
+        w_pair(placement.ptMinPosition.x, placement.ptMinPosition.y),
+        w_pair(placement.ptMaxPosition.x, placement.ptMaxPosition.y),
+        w_pair(placement.showCmd, placement.flags)};
+    for (size_t i = 0; i < count_of(values); i++) {
+        if (!SetPropW(w, placement_fields[i], values[i]))
+            goto failed;
     }
+    if (zoomed && !SetPropW(w, L"winwm.zoomed", (HANDLE)1))
+        goto failed;
+    // Publish the complete journal before the first layout or appearance change.
+    if (!SetPropW(w, L"winwm.managed", (HANDLE)2))
+        goto failed;
+    *original = r;
+    return true;
+failed:
     for (int i = 0; i < 4; i++)
         RemovePropW(w, coords[i]);
+    for (size_t i = 0; i < count_of(placement_fields); i++)
+        RemovePropW(w, placement_fields[i]);
+    RemovePropW(w, L"winwm.zoomed");
     return false;
 }
 
@@ -508,16 +536,70 @@ bool w_os_set_visible(HWND w, bool wanted) {
 }
 
 static void w_release_visibility(HWND w) {
-    if (RemovePropW(w, visibility_prop))
-        SetWindowPos(w, NULL, 0, 0, 0, 0,
+    if (GetPropW(w, visibility_prop) && SetWindowPos(w, NULL, 0, 0, 0, 0,
                      SWP_ASYNCWINDOWPOS | SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE |
-                         SWP_SHOWWINDOW);
+                         SWP_SHOWWINDOW))
+        RemovePropW(w, visibility_prop);
 }
 
 static const wchar_t dim_prop[] = L"winwm.dim_added";
+#define dim_releasing ((HANDLE)2)
 static void w_remove_dim(HWND w) {
-    if (RemovePropW(w, dim_prop))
-        SetWindowLongPtrW(w, GWL_EXSTYLE, GetWindowLongPtrW(w, GWL_EXSTYLE) & ~WS_EX_LAYERED);
+    if (GetPropW(w, dim_prop)) {
+        LONG_PTR ex = GetWindowLongPtrW(w, GWL_EXSTYLE);
+        if (!(ex & WS_EX_LAYERED) || SetWindowLongPtrW(w, GWL_EXSTYLE, ex & ~WS_EX_LAYERED))
+            RemovePropW(w, dim_prop);
+    }
+}
+
+// Changing a foreign extended style sends synchronous WM_STYLECHANGING messages.
+// A stalled client must not hold up other clients or the interactive shell.
+static SRWLOCK layer_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE layers_done = CONDITION_VARIABLE_INIT;
+static unsigned restoring_layers;
+
+static void w_layer_finished(void) {
+    AcquireSRWLockExclusive(&layer_lock);
+    if (!--restoring_layers) WakeAllConditionVariable(&layers_done);
+    ReleaseSRWLockExclusive(&layer_lock);
+}
+
+static DWORD WINAPI w_release_layer(void *arg) {
+    HWND w = arg;
+    wchar_t name[80];
+    swprintf(name, count_of(name), L"Local\\winwm.layer.%p", (void *)w);
+    HANDLE lock = CreateMutexW(NULL, FALSE, name);
+    if (lock) {
+        DWORD wait = WaitForSingleObject(lock, 0);
+        if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) {
+            if (GetPropW(w, dim_prop) == dim_releasing) {
+                SetLayeredWindowAttributes(w, 0, 255, LWA_ALPHA);
+                w_remove_dim(w);
+            }
+            ReleaseMutex(lock);
+        }
+        CloseHandle(lock);
+    }
+    w_layer_finished();
+    return 0;
+}
+
+static BOOL CALLBACK w_queue_layer(HWND w, LPARAM unused) {
+    (void)unused;
+    if (GetPropW(w, dim_prop) && SetPropW(w, dim_prop, dim_releasing)) {
+        AcquireSRWLockExclusive(&layer_lock);
+        ++restoring_layers;
+        ReleaseSRWLockExclusive(&layer_lock);
+        if (!QueueUserWorkItem(w_release_layer, w, WT_EXECUTELONGFUNCTION)) w_layer_finished();
+    }
+    return TRUE;
+}
+
+void w_os_wait_layer_cleanup(void) {
+    AcquireSRWLockExclusive(&layer_lock);
+    while (restoring_layers)
+        SleepConditionVariableSRW(&layers_done, &layer_lock, INFINITE, 0);
+    ReleaseSRWLockExclusive(&layer_lock);
 }
 
 void w_os_window_appearance(HWND w, DWORD color, DWORD corner) {
@@ -533,7 +615,8 @@ void w_os_window_appearance(HWND w, DWORD color, DWORD corner) {
 }
 
 bool w_os_direct_surface(HWND w) {
-    if ((GetWindowLongPtrW(w, GWL_EXSTYLE) & (WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP)) ||
+    if (GetPropW(w, dim_prop) == dim_releasing ||
+        (GetWindowLongPtrW(w, GWL_EXSTYLE) & (WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP)) ||
         (GetClassLongPtrW(w, GCL_STYLE) & (CS_OWNDC | CS_CLASSDC)))
         return true;
     // A foreign GetDC can return a common DC with no pixel format even when
@@ -558,6 +641,8 @@ bool w_os_direct_surface(HWND w) {
 }
 
 bool w_os_window_opacity(HWND w, BYTE alpha, bool retain_layer) {
+    if (GetPropW(w, dim_prop) == dim_releasing)
+        return false;
     if (alpha == 255 && !retain_layer) {
         w_remove_dim(w);
         return true;
@@ -582,63 +667,182 @@ bool w_os_window_opacity(HWND w, BYTE alpha, bool retain_layer) {
     return false;
 }
 
-void w_os_restore(HWND w) {
-    if (!GetPropW(w, L"winwm.managed")) {
-        w_release_visibility(w);
-        return;
-    }
-    w_remove_dim(w);
-    HANDLE corner = RemovePropW(w, L"winwm.corner");
-    if (corner) {
-        DWORD preference = (DWORD)((uintptr_t)corner - 1);
-        DwmSetWindowAttribute(w, 33, &preference, sizeof(preference));
-    }
-    HANDLE border = RemovePropW(w, L"winwm.border");
-    if (border) {
-        DWORD color = (DWORD)((uintptr_t)border - 1);
-        DwmSetWindowAttribute(w, 34, &color, sizeof(color));
-    }
-    w_rect r = w_remembered_bounds(w);
-    bool zoomed = GetPropW(w, L"winwm.zoomed") != NULL;
-    bool iconic = IsIconic(w) != 0;
+static bool w_restore_placement(HWND w, bool native) {
     bool visible = IsWindowVisible(w) || w_os_shell_hidden(w);
-    bool restored;
-    if (iconic || IsZoomed(w) || (visible && zoomed)) {
-        WINDOWPLACEMENT placement = {.length = sizeof(placement)};
+    bool iconic = IsIconic(w) != 0;
+    WINDOWPLACEMENT placement = {.length = sizeof(placement)};
+    if (native) {
+        POINT lt = w_unpack(GetPropW(w, placement_fields[0])), rb = w_unpack(GetPropW(w, placement_fields[1]));
+        POINT show = w_unpack(GetPropW(w, placement_fields[4]));
+        placement.ptMinPosition = w_unpack(GetPropW(w, placement_fields[2]));
+        bool zoomed = IsZoomed(w) != 0;
+        bool offscreen_min = placement.ptMinPosition.x == -32000 && placement.ptMinPosition.y == -32000;
+        if (!iconic && ((show.x == SW_SHOWNORMAL && !zoomed) ||
+            (visible && offscreen_min && (show.x == SW_SHOWNORMAL || show.x == SW_SHOWMAXIMIZED)))) {
+            // A geometry change preserves native minimize coordinates. Passing an
+            // offscreen minimize position to SetWindowPlacement resets it to (-1,-1).
+            w_rect r = w_remembered_bounds(w);
+            if (zoomed && !ShowWindowAsync(w,SW_SHOWNOACTIVATE)) return false;
+            if (!SetWindowPos(w, NULL, r.x, r.y, r.w, r.h, SWP_ASYNCWINDOWPOS |
+                              SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOZORDER)) return false;
+            return show.x != SW_SHOWMAXIMIZED || ShowWindowAsync(w,SW_SHOWMAXIMIZED);
+        }
+        placement.rcNormalPosition = (RECT){lt.x, lt.y, rb.x, rb.y};
+        placement.ptMaxPosition = w_unpack(GetPropW(w, placement_fields[3]));
+        placement.flags = (UINT)show.y;
+        placement.showCmd = (UINT)show.x;
+        if (placement.ptMinPosition.x != -1 || placement.ptMinPosition.y != -1)
+            placement.flags |= WPF_SETMINPOSITION;
+    } else {
+        // Earlier releases stored only the normal screen rectangle and a maximize marker.
+        w_rect r = w_remembered_bounds(w);
         RECT normal = w_os_to_rect(r);
         MONITORINFO mon = {.cbSize = sizeof(mon)};
-        restored = GetWindowPlacement(w, &placement) &&
-                   GetMonitorInfoW(MonitorFromRect(&normal, MONITOR_DEFAULTTONEAREST), &mon);
-        if (restored) {
-            // WINDOWPLACEMENT uses workspace coordinates for managed top-level windows.
-            OffsetRect(&normal, mon.rcMonitor.left-mon.rcWork.left, mon.rcMonitor.top-mon.rcWork.top);
-            placement.rcNormalPosition = normal;
-            placement.flags |= WPF_ASYNCWINDOWPLACEMENT;
-            placement.showCmd = !visible ? SW_HIDE : iconic ? SW_SHOWMINNOACTIVE : SW_SHOWMAXIMIZED;
-            if (iconic && zoomed)
-                placement.flags |= WPF_RESTORETOMAXIMIZED;
-            restored = SetWindowPlacement(w, &placement) != 0;
-        }
-    } else
-        restored = SetWindowPos(w, NULL, r.x, r.y, r.w, r.h,
-                                SWP_ASYNCWINDOWPOS | SWP_NOZORDER | SWP_NOACTIVATE) != 0;
-    w_release_visibility(w);
-    if (restored) {
-        for (int i = 0; i < 4; i++)
-            RemovePropW(w, coords[i]);
-        RemovePropW(w, L"winwm.zoomed");
-        RemovePropW(w, L"winwm.managed");
+        if (!GetWindowPlacement(w, &placement) ||
+            !GetMonitorInfoW(MonitorFromRect(&normal, MONITOR_DEFAULTTONEAREST), &mon))
+            return false;
+        OffsetRect(&normal, mon.rcMonitor.left-mon.rcWork.left, mon.rcMonitor.top-mon.rcWork.top);
+        placement.rcNormalPosition = normal;
+        placement.flags = 0;
+        placement.showCmd = GetPropW(w, L"winwm.zoomed") ? SW_SHOWMAXIMIZED : SW_SHOWNORMAL;
+    }
+    // Respect applications that withdrew themselves and user-minimized windows.
+    // A winwm workspace hide, including one still queued, must be reversed.
+    if (!visible) placement.showCmd = SW_HIDE;
+    else if (iconic) {
+        if (placement.showCmd == SW_SHOWMAXIMIZED) placement.flags |= WPF_RESTORETOMAXIMIZED;
+        placement.showCmd = SW_SHOWMINNOACTIVE;
+    } else if (placement.showCmd == SW_SHOWNORMAL)
+        placement.showCmd = SW_SHOWNOACTIVATE;
+    placement.flags |= WPF_ASYNCWINDOWPLACEMENT;
+    return SetWindowPlacement(w, &placement) != 0;
+}
+
+static void w_restore_attribute(HWND w, const wchar_t *name, DWORD attribute) {
+    HANDLE saved = GetPropW(w, name);
+    if (saved) {
+        DWORD value = (DWORD)((uintptr_t)saved - 1);
+        if (SUCCEEDED(DwmSetWindowAttribute(w, attribute, &value, sizeof(value))))
+            RemovePropW(w, name);
     }
 }
 
+static void w_restore_window(HWND w) {
+    HANDLE journal = GetPropW(w, L"winwm.managed");
+    w_restore_attribute(w, L"winwm.corner", 33);
+    w_restore_attribute(w, L"winwm.border", 34);
+    if (!journal) {
+        w_release_visibility(w);
+        return;
+    }
+    bool restored = w_restore_placement(w, journal == (HANDLE)2);
+    w_release_visibility(w);
+    if (restored) {
+        RemovePropW(w, L"winwm.managed");
+        for (int i = 0; i < 4; i++)
+            RemovePropW(w, coords[i]);
+        for (size_t i = 0; i < count_of(placement_fields); i++)
+            RemovePropW(w, placement_fields[i]);
+        RemovePropW(w, L"winwm.zoomed");
+    }
+}
+
+void w_os_restore(HWND w) {
+    w_restore_window(w);
+    w_queue_layer(w, 0);
+}
+
+static const wchar_t stack_prop[] = L"winwm.initial_order", focus_prop[] = L"winwm.initial_foreground";
+static const wchar_t anchor_prop[] = L"winwm.initial_above", anchor_pid_prop[] = L"winwm.initial_above_pid";
+
+typedef struct w_stack_capture {
+    unsigned rank;
+    HWND unrelated[2];
+} w_stack_capture;
+
+static BOOL CALLBACK w_save_order(HWND w, LPARAM arg) {
+    w_stack_capture *capture = (w_stack_capture *)arg;
+    if (w_os_same_process(w)) return TRUE;
+    int band = (GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+    if (!GetPropW(w, L"winwm.managed")) {
+        capture->unrelated[band] = w;
+    } else if (capture->rank < window_limit) {
+        HWND anchor = capture->unrelated[band];
+        if (SetPropW(w, stack_prop, (HANDLE)(uintptr_t)++capture->rank) && anchor) {
+            DWORD pid = 0;
+            if (GetWindowThreadProcessId(anchor, &pid) && SetPropW(w, anchor_pid_prop, (HANDLE)(uintptr_t)pid))
+                SetPropW(w, anchor_prop, anchor);
+        }
+        capture->unrelated[band] = NULL;
+    }
+    return TRUE;
+}
+
+void w_os_remember_stack(void) {
+    w_stack_capture capture = {0};
+    EnumWindows(w_save_order, (LPARAM)&capture);
+    HWND foreground = GetForegroundWindow();
+    if (foreground && GetPropW(w_os_app_window(foreground), L"winwm.managed"))
+        SetPropW(foreground, focus_prop, (HANDLE)1);
+}
+
+typedef struct w_recovery_stack {
+    HWND windows[window_limit], foreground;
+    unsigned count, last_rank[2];
+    bool changed[2];
+} w_recovery_stack;
+
 static BOOL CALLBACK w_restore_one(HWND w, LPARAM arg) {
-    (void)arg;
-    w_os_restore(w);
+    w_recovery_stack *stack = (w_recovery_stack *)arg;
+    uintptr_t rank = (uintptr_t)GetPropW(w, stack_prop);
+    if (rank && rank <= window_limit) {
+        stack->windows[rank-1] = w;
+        if (stack->count < rank) stack->count = (unsigned)rank;
+        int band = (GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+        // Reversing a workspace hide or a maximize can also raise the app later,
+        // when its thread handles the asynchronous placement.
+        if (rank < stack->last_rank[band] || w_os_shell_hidden(w) ||
+            (IsZoomed(w) != 0) != (GetPropW(w,L"winwm.zoomed") != NULL))
+            stack->changed[band] = true;
+        stack->last_rank[band] = (unsigned)rank;
+    }
+    if (GetPropW(w, focus_prop)) stack->foreground = w;
+    w_restore_window(w);
     return TRUE;
 }
 
 void w_os_restore_all(void) {
-    EnumWindows(w_restore_one, 0);
+    w_recovery_stack stack = {0};
+    HWND foreground = GetForegroundWindow();
+    bool restore_focus = !foreground || w_os_desktop_surface(foreground) || w_os_same_process(foreground) ||
+                         GetPropW(w_os_app_window(foreground), L"winwm.managed");
+    EnumWindows(w_restore_one, (LPARAM)&stack);
+    HWND previous[2] = {0};
+    for (unsigned i = 0; i < stack.count; i++) {
+        HWND w = stack.windows[i];
+        if (!w || (uintptr_t)GetPropW(w, stack_prop) != i+1) continue;
+        int band = (GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0;
+        if (!stack.changed[band]) continue;
+        HWND above = GetPropW(w, anchor_prop);
+        DWORD pid = 0;
+        if (!above || !GetWindowThreadProcessId(above, &pid) || pid != (uintptr_t)GetPropW(w, anchor_pid_prop) ||
+            ((GetWindowLongPtrW(above, GWL_EXSTYLE) & WS_EX_TOPMOST) != 0) != band)
+            above = previous[band];
+        if (above)
+            SetWindowPos(w, above, 0, 0, 0, 0, SWP_ASYNCWINDOWPOS | SWP_NOSIZE | SWP_NOMOVE |
+                         SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+        previous[band] = w;
+    }
+    if (stack.foreground && RemovePropW(stack.foreground, focus_prop) && restore_focus &&
+        IsWindowVisible(stack.foreground) && !IsIconic(stack.foreground))
+        SetForegroundWindow(stack.foreground);
+    for (unsigned i = 0; i < stack.count; i++)
+        if (stack.windows[i]) {
+            RemovePropW(stack.windows[i], stack_prop);
+            RemovePropW(stack.windows[i], anchor_prop);
+            RemovePropW(stack.windows[i], anchor_pid_prop);
+        }
+    EnumWindows(w_queue_layer, 0);
 }
 
 int w_os_error(wchar_t *dst, int cap) {

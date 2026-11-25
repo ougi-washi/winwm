@@ -765,8 +765,8 @@ bool w_bar_create(w_bar_window *b, int output, const w_desktop_config *cfg, bar_
     return b->hwnd != NULL;
 }
 
-w_rect w_bar_position(w_bar_window *b, w_rect screen, int dpi, bool hidden) {
-    w_rect work = screen, area = screen;
+w_rect w_bar_position(w_bar_window *b, w_rect screen, w_rect available, int dpi, bool hidden) {
+    w_rect work = available, area = available;
     if (!b->hwnd)
         return work;
     b->screen = screen;
@@ -798,6 +798,7 @@ w_rect w_bar_position(w_bar_window *b, w_rect screen, int dpi, bool hidden) {
     }
     const char *edge = b->docked_edge ? b->docked_edge : b->config->edge;
     if (!strcmp(edge, "left") || !strcmp(edge, "right")) {
+        n = min(n, max(0,work.w-1));
         area.w = n;
         work.w -= n;
         if (!strcmp(edge, "left"))
@@ -805,6 +806,7 @@ w_rect w_bar_position(w_bar_window *b, w_rect screen, int dpi, bool hidden) {
         else
             area.x += work.w;
     } else {
+        n = min(n, max(0,work.h-1));
         area.h = n;
         work.h -= n;
         if (!strcmp(edge, "top"))

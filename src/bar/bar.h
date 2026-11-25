@@ -78,7 +78,7 @@ typedef struct w_bar_window {
 //~ Bar Interface
 
 bool w_bar_create(w_bar_window *b, int output, const w_desktop_config *config, bar_action invoke);
-w_rect w_bar_position(w_bar_window *b, w_rect screen, int dpi, bool hidden);
+w_rect w_bar_position(w_bar_window *b, w_rect screen, w_rect available, int dpi, bool hidden);
 void w_bar_invalidate(w_bar_window *b, const char *module);
 void w_bar_set_audio(w_bar_window *b, int percent, bool muted);
 void w_bar_update(w_bar_window *b, const w_bar_view *v);

@@ -1,46 +1,38 @@
 #include "os_win32/os_win32.h"
-#include <restartmanager.h>
 #include <wchar.h>
 
-////////////////
-//~ Explorer
+static bool w_named_user_object(HANDLE object, const wchar_t *expected) {
+    wchar_t name[64];
+    DWORD bytes;
+    return GetUserObjectInformationW(object,UOI_NAME,name,sizeof(name),&bytes) && !_wcsicmp(name,expected);
+}
 
-// Restart Manager receives one process identity, including creation time, and may report a veto.
-DWORD w_os_exit_explorer(void) {
-    HWND shell = GetShellWindow();
-    if (!shell)
-        return ERROR_NOT_FOUND;
-    DWORD pid = 0, own_session, session, error = ERROR_INVALID_OWNER;
-    GetWindowThreadProcessId(shell, &pid);
-    if (!pid || !ProcessIdToSessionId(pid, &session) ||
-        !ProcessIdToSessionId(GetCurrentProcessId(), &own_session) || own_session != session)
-        return error;
-    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
-    if (!process)
+DWORD w_os_ensure_shell(void) {
+    if (GetShellWindow()) return ERROR_SUCCESS;
+    if (GetSystemMetrics(SM_SHUTTINGDOWN)) return ERROR_SHUTDOWN_IN_PROGRESS;
+    if (!w_named_user_object(GetProcessWindowStation(),L"WinSta0") ||
+        !w_named_user_object(GetThreadDesktop(GetCurrentThreadId()),L"Default"))
+        return ERROR_REQUIRES_INTERACTIVE_WINDOWSTATION;
+
+    wchar_t directory[MAX_PATH], exe[MAX_PATH];
+    UINT n = GetSystemWindowsDirectoryW(directory,count_of(directory));
+    if (!n) return GetLastError();
+    if (n+count_of(L"\\explorer.exe") > count_of(exe)) return ERROR_FILENAME_EXCED_RANGE;
+    wcscpy(exe,directory);
+    wcscat(exe,L"\\explorer.exe");
+    STARTUPINFOW startup = {.cb=sizeof(startup)};
+    PROCESS_INFORMATION child = {0};
+    if (!CreateProcessW(exe,NULL,NULL,NULL,FALSE,0,NULL,directory,&startup,&child))
         return GetLastError();
-    wchar_t path[os_path_cap], expected[os_path_cap];
-    DWORD size = count_of(path);
-    UINT len = GetSystemWindowsDirectoryW(expected, count_of(expected));
-    RM_UNIQUE_PROCESS app = {.dwProcessId = pid};
-    FILETIME end, kernel, user;
-    if (len && len + 14 < count_of(expected) && QueryFullProcessImageNameW(process, 0, path, &size) &&
-        !_wcsicmp(path, wcscat(expected, L"\\explorer.exe")) &&
-        GetProcessTimes(process, &app.ProcessStartTime, &end, &kernel, &user)) {
-        DWORD handle;
-        wchar_t key[CCH_RM_SESSION_KEY + 1] = {0};
-        error = RmStartSession(&handle, 0, key);
-        if (error == ERROR_SUCCESS) {
-            error = RmRegisterResources(handle, 0, NULL, 1, &app, 0, NULL);
-            if (!error)
-                error = RmShutdown(handle, 0, NULL);
-            RmEndSession(handle);
-            if (!error) {
-                DWORD wait = WaitForSingleObject(process, 30000);
-                if (wait != WAIT_OBJECT_0)
-                    error = wait == WAIT_TIMEOUT ? ERROR_TIMEOUT : GetLastError();
-            }
-        }
+    CloseHandle(child.hThread);
+    CloseHandle(child.hProcess);
+    // Explorer may delegate shell startup to another process. The shell window
+    // identifies a usable desktop even when the initial executable has exited.
+    ULONGLONG deadline = GetTickCount64()+10000;
+    while (!GetShellWindow()) {
+        if (GetSystemMetrics(SM_SHUTTINGDOWN)) return ERROR_SHUTDOWN_IN_PROGRESS;
+        if (GetTickCount64() >= deadline) return ERROR_TIMEOUT;
+        Sleep(50);
     }
-    CloseHandle(process);
-    return error;
+    return ERROR_SUCCESS;
 }

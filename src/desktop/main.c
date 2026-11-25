@@ -1,5 +1,6 @@
 #include "theme/theme.h"
 #include "desktop/entry.h"
+#include "shell_host/entry.h"
 #include "desktop/desktop.h"
 #include "providers/audio.h"
 #include <stdio.h>
@@ -12,7 +13,7 @@
 w_desktop_state desk;
 static bool event_overflow, preview_mode, loaded_programs;
 static int pending_events;
-static UINT shell_notification;
+static UINT shell_notification, taskbar_created;
 enum { discovery_timer = 29 };
 
 ////////////////
@@ -24,7 +25,6 @@ static void w_invalidate_language(void) {
             w_bar_invalidate(&desk.outputs[i].bar, "keyboard");
 }
 
-static DWORD explorer_status = ERROR_IO_PENDING;
 typedef struct w_config_result {
     w_desktop_config cfg;
     LONG revision;
@@ -137,20 +137,17 @@ static void w_discover_initial(void) {
     }
     w_os_restore_all();
     w_desktop_scan(false);
+    w_os_remember_stack();
     desk.ready = true;
     for (int i = 0; i < command_count; i++)
         w_desktop_run_on(&pending_commands[i].action, pending_commands[i].output, false);
     command_count = 0;
 }
 
-static DWORD WINAPI w_handoff_explorer(void *root) {
-    DWORD error = w_os_exit_explorer();
-    PostMessageW((HWND)root, msg_shell_exit, error, 0);
-    return 0;
-}
-
 static void w_position_desktop(void) {
-    if (!preview_mode)
+    if (preview_mode || GetShellWindow())
+        ShowWindow(desk.root, SW_HIDE);
+    else
         SetWindowPos(desk.root, HWND_BOTTOM, GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN),
                      GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN),
                      SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -159,12 +156,10 @@ static void w_position_desktop(void) {
 static void w_initialize(void) {
     w_position_desktop();
     shell_notification = RegisterWindowMessageW(L"SHELLHOOK");
+    taskbar_created = RegisterWindowMessageW(L"TaskbarCreated");
     if (shell_notification)
         RegisterShellHookWindow(desk.root);
-    w_os_area_open(false);
     w_desktop_outputs();
-    if (!preview_mode && !QueueUserWorkItem(w_handoff_explorer, desk.root, WT_EXECUTEDEFAULT))
-        explorer_status = GetLastError();
     wchar_t pipe_name[96];
     desk.ipc_live = w_ipc_name(pipe_name, count_of(pipe_name)) && w_ipc_start(desk.channels, pipe_name);
     if (!desk.ipc_live)
@@ -227,14 +222,8 @@ void w_desktop_request(const char *s, char *reply, size_t cap) {
         if (n >= 0 && (size_t)n + 200 < cap)
             n += snprintf(reply + n, cap - n, "user shell policy: %s\n",
                           policy_status == ERROR_SUCCESS ? "configured" : "absent or managed elsewhere");
-        if (n >= 0 && (size_t)n + 120 < cap) {
-            const char *state = preview_mode                      ? "preview"
-                                : explorer_status == ERROR_IO_PENDING ? "pending"
-                                : explorer_status == ERROR_NOT_FOUND  ? "no existing shell"
-                                : explorer_status == ERROR_SUCCESS    ? "exited"
-                                                                      : "shutdown declined or unavailable";
-            n += snprintf(reply + n, cap - n, "Explorer handoff: %s (Win32 %lu)\n", state, explorer_status);
-        }
+        if (n >= 0 && (size_t)n + 100 < cap)
+            n += snprintf(reply + n, cap - n, "Windows shell desktop: %s\n",GetShellWindow() ? "present" : "absent");
         if (exit_code && n >= 0 && (size_t)n + 120 < cap)
             n += snprintf(reply + n, cap - n, "previous desktop exit: %lu\n",
                           (DWORD)((uintptr_t)exit_code - 1));
@@ -257,6 +246,11 @@ void w_desktop_request(const char *s, char *reply, size_t cap) {
 }
 
 static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (taskbar_created && msg == taskbar_created) {
+        w_position_desktop();
+        if (desk.ready) w_desktop_outputs();
+        return 0;
+    }
     if (shell_notification && msg == shell_notification) {
         if (wp == HSHELL_LANGUAGE)
             w_invalidate_language();
@@ -328,11 +322,6 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         if ((DWORD)(uintptr_t)GetPropW(hwnd, L"winwm.binding_generation") == (DWORD)lp &&
             wp < (WPARAM)desk.config.binding_count)
             w_desktop_run(&desk.config.bindings[wp].action);
-        return 0;
-    case msg_shell_exit:
-        explorer_status = (DWORD)wp;
-        if (explorer_status == ERROR_SUCCESS)
-            w_desktop_outputs();
         return 0;
     case msg_init:
         w_initialize();
@@ -452,6 +441,8 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             w_desktop_outputs();
         return 0;
     case WM_SETTINGCHANGE:
+        if (desk.ready && wp == SPI_SETWORKAREA)
+            w_desktop_outputs();
         InvalidateRect(hwnd, NULL, FALSE);
         w_effects_preferences();
         w_theme_colors(desk.config.background, desk.config.foreground, desk.config.accent);
@@ -516,13 +507,22 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
 int w_session_run(HINSTANCE instance, bool preview) {
     preview_mode = preview;
     DWORD host = w_os_instance_status(os_host_instance);
-    if (host != ERROR_SUCCESS && host != ERROR_ALREADY_EXISTS)
+    if (host != ERROR_SUCCESS)
         return (int)host;
     w_os_instance_lock lock;
     DWORD error = w_os_instance_claim(os_interactive_instance, &lock);
     if (error)
         return (int)error;
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    HANDLE recovery = w_recovery_attach(preview);
+    if (!recovery) {
+        error = GetLastError();
+        if (!preview && !GetShellWindow()) w_os_ensure_shell();
+        w_os_instance_release(&lock);
+        MessageBoxW(NULL,L"Could not start winwm. Check that Windows Explorer can start and that winwm_recovery.exe is beside winwm.exe.",
+                    L"winwm recovery unavailable",MB_OK|MB_ICONERROR);
+        return error ? (int)error : ERROR_PROCESS_ABORTED;
+    }
     w_os_mark(L"desktop_entry");
     w_model_init(&desk.model);
     w_config_defaults(&desk.config);
@@ -534,6 +534,7 @@ int w_session_run(HINSTANCE instance, bool preview) {
     desk.root = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"winwm events", WS_POPUP, 0, 0, 0, 0,
                                 NULL, NULL, instance, NULL);
     if (!desk.root) {
+        CloseHandle(recovery);
         w_os_instance_release(&lock);
         return 3;
     }
@@ -542,13 +543,15 @@ int w_session_run(HINSTANCE instance, bool preview) {
     PostMessageW(desk.root, msg_init, 0, 0);
     int result = 0;
     for (;;) {
-        HANDLE handles[2*ipc_slots];
-        DWORD count = desk.ipc_live ? count_of(handles) : 0;
+        HANDLE handles[2*ipc_slots+1];
+        DWORD count = desk.ipc_live ? 2*ipc_slots : 0;
         for (DWORD i = 0; i < count / 2; i++) {
             handles[2*i] = desk.channels[i].peer_event;
             handles[2*i+1] = desk.channels[i].event;
         }
-        DWORD wait = MsgWaitForMultipleObjectsEx(count, handles, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        handles[count] = recovery;
+        DWORD wait = MsgWaitForMultipleObjectsEx(count+1, handles, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        if (wait == WAIT_OBJECT_0+count) break;
         if (wait == WAIT_FAILED) {
             result = 4;
             break;
@@ -572,6 +575,11 @@ int w_session_run(HINSTANCE instance, bool preview) {
         }
     }
 done:
+    {
+        HWND host_window = FindWindowW(L"WinwmHost",NULL);
+        if ((DWORD)(uintptr_t)GetPropW(host_window,L"winwm.session_pid") == GetCurrentProcessId())
+            PostMessageW(host_window,recovery_session_closing,GetCurrentProcessId(),result);
+    }
     KillTimer(desk.root, animation_timer);
     for (int i = 0; i < window_limit; i++)
         w_effects_hide(i);
@@ -585,9 +593,8 @@ done:
     w_providers_stop();
     if (desk.ipc_live)
         w_ipc_close(desk.channels);
-    w_os_area_restore();
-    w_os_area_close();
     w_os_restore_all();
+    CloseHandle(recovery);
     w_os_instance_release(&lock);
     return result;
 }

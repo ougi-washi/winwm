@@ -1,8 +1,11 @@
 param([ValidateRange(1,3600)][int]$Seconds=600)
 $ErrorActionPreference='Stop'
 $session=[Diagnostics.Process]::GetCurrentProcess().SessionId
-$processes=@(Get-Process -Name winwm | Where-Object SessionId -eq $session)
-if ($processes.Count -ne 2) {throw 'Expected the winwm host and session processes in this session.'}
+$processes=@(Get-Process -Name winwm,winwm_recovery | Where-Object SessionId -eq $session)
+if (@($processes | Where-Object ProcessName -eq 'winwm').Count -ne 1 -or
+    @($processes | Where-Object ProcessName -eq 'winwm_recovery').Count -ne 1) {
+    throw 'Expected one winwm desktop and one recovery process in this session.'
+}
 $start=@{};foreach ($p in $processes) {$start[$p.Id]=$p.TotalProcessorTime.TotalSeconds}
 $clock=[Diagnostics.Stopwatch]::StartNew()
 Start-Sleep -Seconds $Seconds

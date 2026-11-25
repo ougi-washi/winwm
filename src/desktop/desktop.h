@@ -24,7 +24,6 @@ enum {
     msg_hover,
     msg_desktop_menu,
     msg_catalog,
-    msg_shell_exit,
     msg_pointer_select, msg_drag_preview, msg_drag_limits, msg_run_result
 };
 
@@ -32,7 +31,7 @@ typedef struct w_output_state {
     HMONITOR monitor;
     wchar_t device[32];
     bool live, bar_hidden;
-    w_rect screen, work;
+    w_rect screen, system_work, work;
     int dpi;
     w_bar_window bar;
 } w_output_state;
