@@ -453,7 +453,7 @@ static void w_draw_result(NMLVCUSTOMDRAW *draw) {
             label.right=hint.left-px(6);
         }
     } else if (selected && w_can_run_admin(source)) {
-        const wchar_t *hint = viewport.right >= px(365) ? L"Ctrl+Enter  Admin" : L"Ctrl+↵";
+        const wchar_t *hint = viewport.right >= px(365) ? L"Shift+Enter  Admin" : L"Shift+↵";
         SelectObject(dc, small_font);
         SIZE size;
         GetTextExtentPoint32W(dc, hint, (int)wcslen(hint), &size);
@@ -1023,11 +1023,11 @@ bool w_palette_message(MSG *msg) {
         return false;
     }
     if (msg->message == WM_SYSKEYDOWN) return false;
+    if (msg->wParam == VK_RETURN && shift && !ctrl && run_line && (msg->hwnd == edit || msg->hwnd == list)) {
+        if (!(msg->lParam & (1L << 30))) w_accept(true);
+        return true;
+    }
     if (ctrl && !shift) {
-        if (msg->wParam == VK_RETURN && run_line && (msg->hwnd == edit || msg->hwnd == list)) {
-            if (!(msg->lParam & (1L << 30))) w_accept(true);
-            return true;
-        }
         if (msg->wParam=='A' && msg->hwnd==edit) { SendMessageW(edit,EM_SETSEL,0,-1); return true; }
         if (msg->hwnd==edit && (msg->wParam==VK_BACK || msg->wParam==VK_DELETE)) {
             w_delete_word(msg->wParam==VK_BACK); return true;

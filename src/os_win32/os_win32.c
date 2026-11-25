@@ -361,13 +361,11 @@ bool w_os_launch_line(const char *command, bool admin, bool allow_shell_targets)
 bool w_os_launch_terminal_at(const char *name, const wchar_t *directory, bool admin) {
     wchar_t path[os_path_cap];
     if (!strcmp(name, "auto")) {
-        if (!w_os_provider("alacritty.exe", path, count_of(path)) &&
-            !w_os_provider("%ProgramFiles%\\Alacritty\\alacritty.exe", path, count_of(path)) &&
-            !w_os_provider("%SystemRoot%\\System32\\cmd.exe", path, count_of(path)))
-            return false;
-    } else if (!w_os_provider(name, path, count_of(path)))
-        return false;
-    return w_os_run_executable(path, NULL, directory, admin);
+        // Starting a console application lets Windows select its configured terminal host.
+        return w_os_provider("%SystemRoot%\\System32\\cmd.exe", path, count_of(path)) &&
+               w_os_shell_execute(path, NULL, directory, admin);
+    }
+    return w_os_provider(name, path, count_of(path)) && w_os_run_executable(path, NULL, directory, admin);
 }
 
 bool w_os_launch_terminal(const char *name, bool admin) {

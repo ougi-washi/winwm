@@ -22,6 +22,8 @@ MinGW-w64 GCC, windres, mingw32-make.
 
 Edit `~/.config/winwm/winwm.lua`. Reload with `Win+Shift+R`. [Hyprland Lua API subset](https://wiki.hypr.land/configuring/)
 
+`programs.terminal = "auto"` uses the Windows default terminal host. Set an executable path to override it.
+
 The toolbar editor saves module placement in `toolbar-layout.lua`. It loads last.
 
 Hover the tray arrow for minimized windows and background apps. Scroll for more icons. Right-click for app actions. Preview keeps native tray icons in Explorer.
