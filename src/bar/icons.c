@@ -81,12 +81,13 @@ static void w_stroke(HDC dc, const w_vertex *path, size_t count, int width) {
 
 void w_icons_free(w_icon_atlas *atlas) {
     free(atlas->coverage);
-    free(atlas->pixels);
+    if (atlas->source) DeleteDC(atlas->source);
+    if (atlas->image) DeleteObject(atlas->image);
     *atlas = (w_icon_atlas){0};
 }
 
-void w_icons_resize(w_icon_atlas *atlas, int dpi) {
-    const int size = w_clamp_int(MulDiv(17, dpi, 96), 8, 128);
+void w_icons_resize(w_icon_atlas *atlas, int pixels) {
+    const int size = w_clamp_int(pixels, 1, 128);
     if (atlas->coverage && atlas->size == size)
         return;
     w_icons_free(atlas);
@@ -106,8 +107,12 @@ void w_icons_resize(w_icon_atlas *atlas, int dpi) {
                             max(1, MulDiv(width, 2, 24)), &white, 0, NULL);
     atlas->size = size;
     atlas->coverage = calloc((size_t)icon_count * size * size, sizeof(BYTE));
-    atlas->pixels = malloc((size_t)size * size * sizeof(DWORD));
-    if (dc && dib && pen && atlas->coverage && atlas->pixels) {
+    atlas->source = CreateCompatibleDC(NULL);
+    info.bmiHeader.biWidth = size;
+    info.bmiHeader.biHeight = -size * icon_count;
+    atlas->image = CreateDIBSection(atlas->source,&info,DIB_RGB_COLORS,(void **)&atlas->pixels,NULL,0);
+    for (int i=0;i<icon_count;++i) atlas->tint[i]=CLR_INVALID;
+    if (dc && dib && pen && atlas->coverage && atlas->source && atlas->image && SelectObject(atlas->source,atlas->image)) {
         HGDIOBJ old_bitmap = SelectObject(dc, dib), old_pen = SelectObject(dc, pen);
         static const struct w_icon_shape {
             const w_vertex *path;
@@ -164,31 +169,28 @@ void w_icons_resize(w_icon_atlas *atlas, int dpi) {
     DeleteDC(dc);
 }
 
-void w_icons_draw(const w_icon_atlas *atlas, HDC dc, bar_icon icon, RECT box, COLORREF ink, COLORREF paper) {
+void w_icons_draw(w_icon_atlas *atlas, HDC dc, bar_icon icon, RECT box, COLORREF ink) {
     int n = atlas->size;
     if (!n || icon <= icon_none || icon >= icon_count)
         return;
-    const BYTE *mask = atlas->coverage + (size_t)icon * n * n;
-    for (int i = 0; i < n * n; ++i) {
-        int a = mask[i], b = 255 - a;
-        int r = (a * GetRValue(ink) + b * GetRValue(paper)) / 255;
-        int g = (a * GetGValue(ink) + b * GetGValue(paper)) / 255;
-        int blue = (a * GetBValue(ink) + b * GetBValue(paper)) / 255;
-        atlas->pixels[i] = (DWORD)(r << 16 | g << 8 | blue);
+    if (atlas->tint[icon]!=ink) {
+        size_t offset=(size_t)icon*n*n;
+        const BYTE *mask=atlas->coverage+offset;
+        DWORD *pixels=atlas->pixels+offset;
+        GdiFlush();
+        for (int i=0;i<n*n;++i) {
+            DWORD a=mask[i];
+            pixels[i]=a<<24 | (a*GetRValue(ink)/255)<<16 | (a*GetGValue(ink)/255)<<8 | a*GetBValue(ink)/255;
+        }
+        atlas->tint[icon]=ink;
     }
-    BITMAPINFO info = {.bmiHeader = {.biSize = sizeof(BITMAPINFOHEADER),
-                                     .biWidth = n,
-                                     .biHeight = -n,
-                                     .biPlanes = 1,
-                                     .biBitCount = 32,
-                                     .biCompression = BI_RGB}};
     int saved = 0;
     if (box.right - box.left < n || box.bottom - box.top < n) {
         saved = SaveDC(dc);
         if (!saved) return;
         IntersectClipRect(dc, box.left, box.top, box.right, box.bottom);
     }
-    SetDIBitsToDevice(dc, (box.left + box.right - n) / 2, (box.top + box.bottom - n) / 2, n, n, 0, 0, 0, n,
-                      atlas->pixels, &info, DIB_RGB_COLORS);
+    GdiAlphaBlend(dc,(box.left+box.right-n)/2,(box.top+box.bottom-n)/2,n,n,
+                  atlas->source,0,icon*n,n,n,(BLENDFUNCTION){AC_SRC_OVER,0,255,AC_SRC_ALPHA});
     if (saved) RestoreDC(dc, saved);
 }

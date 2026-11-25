@@ -1,3 +1,4 @@
+#include "theme/dialog.h"
 #include "theme/theme.h"
 #include "desktop/entry.h"
 #include "native_notifications/publish.h"
@@ -35,7 +36,7 @@ static void w_repaint_bars(void) {
     for (int i = 0; i < output_limit; ++i) {
         w_output_state *output = &desk.outputs[i];
         if (output->live && !output->bar_hidden && output->bar.hwnd)
-            InvalidateRect(output->bar.hwnd, NULL, FALSE);
+            w_bar_invalidate(&output->bar, NULL);
     }
 }
 
@@ -86,11 +87,15 @@ void w_desktop_schedule(void) {
         desk.refresh_pending = PostMessageW(desk.root, msg_refresh, 0, 0) != 0;
 }
 
-void w_desktop_bind(void) {
+void w_desktop_update_appearance(void) {
     w_effects_preferences();
     w_theme_configure(&desk.config);
     w_theme_publish(desk.root);
     w_desktop_notifications_configure();
+}
+
+void w_desktop_bind(void) {
+    w_desktop_update_appearance();
     w_input_bind(desk.root, msg_command, msg_hover, desk.preview ? 0 : msg_desktop_menu, msg_pointer_down,
                &desk.config, desk.registered, w_desktop_drag);
 }
@@ -525,7 +530,6 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         w_desktop_apply();
         return 0;
     case WM_DISPLAYCHANGE:
-        w_desktop_popup_cancel();
         w_position_desktop();
         if (desk.root)
             w_desktop_outputs();
@@ -535,13 +539,11 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             w_environment_refresh();
             return 0;
         }
-        if (desk.root && wp == SPI_SETWORKAREA)
+        if (desk.root && (wp == SPI_SETWORKAREA || wp == SPI_SETLOGICALDPIOVERRIDE))
             w_desktop_outputs();
         w_notification_refresh();
         InvalidateRect(hwnd, NULL, FALSE);
-        w_effects_preferences();
-        w_theme_configure(&desk.config);
-        w_desktop_notifications_configure();
+        w_desktop_update_appearance();
         w_desktop_schedule();
         return 0;
     case WM_SYSCOLORCHANGE:
@@ -628,7 +630,6 @@ int w_session_run(HINSTANCE instance, bool preview) {
     DWORD error = w_os_instance_claim(os_interactive_instance, &lock);
     if (error)
         return (int)error;
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     w_config_defaults(&desk.config);
     if (!w_os_cache_read(&desk.config)) {
         char detail[256] = {0};
@@ -638,7 +639,7 @@ int w_session_run(HINSTANCE instance, bool preview) {
             w_os_instance_release(&lock);
             if (!preview && !GetShellWindow()) w_os_ensure_shell();
             if (!w_notification_publish(L"Configuration error", message))
-                MessageBoxW(NULL, message, L"winwm configuration error", MB_OK | MB_ICONERROR);
+                w_dialog(NULL, message, L"winwm configuration error", MB_OK | MB_ICONERROR);
             return ERROR_INVALID_DATA;
         }
         startup_config_loaded = true;
@@ -649,7 +650,7 @@ int w_session_run(HINSTANCE instance, bool preview) {
         error = GetLastError();
         if (!preview && !GetShellWindow()) w_os_ensure_shell();
         w_os_instance_release(&lock);
-        MessageBoxW(NULL,L"Could not start the WinWM recovery process.",
+        w_dialog(NULL,L"Could not start the WinWM recovery process.",
                     L"winwm recovery unavailable",MB_OK|MB_ICONERROR);
         return error ? (int)error : ERROR_PROCESS_ABORTED;
     }

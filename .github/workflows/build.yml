@@ -12,11 +12,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Check module includes for cycles
-        run: |
-          grep -HE '^[[:space:]]*#[[:space:]]*include[[:space:]]*"' src/*/*.[ch] |
-            sed -nE 's|^src/([^/]+)/[^:]+:[[:space:]]*#[[:space:]]*include[[:space:]]*"([^"/]+)/[^"]+".*$|\1 \2|p' |
-            tsort > /dev/null
+      - name: Check file and module includes for cycles
+        run: python3 tools/check_includes.py src
   winwm:
     runs-on: windows-latest
     steps:
@@ -28,6 +25,25 @@ jobs:
           path-type: inherit
       - shell: msys2 {0}
         run: cmd.exe //c build.bat
+      - name: Verify standalone runtime for both executables
+        shell: msys2 {0}
+        run: |
+          for exe in bin/winwm.exe bin/winwm_install.exe; do
+            imports=$(objdump -p "$exe")
+            if grep -Ei 'DLL Name: (libwinpthread|libgcc|libstdc\+\+)' <<< "$imports"; then
+              echo "$exe requires an unshipped compiler runtime"
+              exit 1
+            fi
+          done
+      - name: Check text rasterization, native panel geometry, and interaction
+        shell: msys2 {0}
+        run: |
+          gcc -std=c11 -Wall -Wextra -Werror -Isrc tools/test_text_rendering.c build/obj/theme/{metrics,fonts}.o -lgdi32 -o build/test_text_rendering.exe
+          ./build/test_text_rendering.exe
+          gcc -std=c11 -Wall -Wextra -Werror -municode -Isrc tools/test_panel_geometry.c build/obj/theme/{theme,metrics,fonts,native_controls,hover,control_hover,disclosure,icon_button}.o build/obj/config/config.o build/obj/command/command.o build/obj/win_platform/{material,percent_slider,layer}.o -lcomctl32 -ldwmapi -luxtheme -lgdi32 -lmsimg32 -o build/test_panel_geometry.exe
+          ./build/test_panel_geometry.exe bin/winwm.exe
+          gcc -std=c11 -Wall -Wextra -Werror -municode -Isrc tools/test_material.c build/obj/win_platform/layer.o build/obj/config/config.o build/obj/command/command.o -lcomctl32 -ldwmapi -lgdi32 -o build/test_material.exe
+          ./build/test_material.exe
       - name: Validate first startup with the shipped configuration
         shell: pwsh
         run: |

@@ -2,28 +2,31 @@
 #include "desktop_tools/tools.h"
 #include "win_platform/layer.h"
 #include "win_platform/popup.h"
+#include "win_platform/appearance.h"
 #include "theme/theme.h"
 #include <commctrl.h>
-#include <dwmapi.h>
 
-enum { popup_cancel = WM_APP + 0x431, popup_check_focus };
+enum { popup_cancel = WM_APP + 0x431, popup_check_focus, popup_font_changed };
 static w_popup_anchor anchor;
+static wchar_t placement_key[popup_event_chars];
 static HANDLE cancelled, manager, cancel_wait, manager_wait;
 static DWORD manager_pid;
-static w_transition enter, leave;
 static w_layer_fade fade;
 static bool motion, framed, closing, released;
 static HHOOK native_hook;
 static HWINEVENTHOOK modal_hook;
 static HWND dismissing;
+static SIZE preferred;
+static UINT preferred_dpi;
+static bool placing;
 static HFONT heading;
 static UINT heading_dpi;
 
-bool w_tools_set_popup(HWND owner, RECT button, const wchar_t *edge, HANDLE cancel) {
+bool w_tools_set_popup(HWND owner, const wchar_t *key, HANDLE cancel) {
     wchar_t cls[32];
-    if (!cancel || IsRectEmpty(&button) || !GetClassNameW(owner, cls, count_of(cls)) ||
-        wcscmp(cls,L"WinwmBar") || (wcscmp(edge,L"top") && wcscmp(edge,L"bottom") &&
-        wcscmp(edge,L"left") && wcscmp(edge,L"right")) ||
+    anchor.bar=owner;
+    if (!cancel || !GetClassNameW(owner, cls, count_of(cls)) ||
+        wcscmp(cls,L"WinwmBar") || !w_popup_read(&anchor,key) ||
         WaitForSingleObject(cancel,0) != WAIT_TIMEOUT)
         return false;
     DWORD pid = 0;
@@ -31,9 +34,7 @@ bool w_tools_set_popup(HWND owner, RECT button, const wchar_t *edge, HANDLE canc
     manager = OpenProcess(SYNCHRONIZE, FALSE, pid);
     if (!manager) return false;
     manager_pid = pid;
-    anchor.bar = owner;
-    anchor.button = button;
-    w_os_utf8(edge, anchor.edge, sizeof(anchor.edge));
+    lstrcpynW(placement_key,key,count_of(placement_key));
     cancelled = cancel;
     return true;
 }
@@ -42,20 +43,41 @@ HMONITOR w_tool_popup_monitor(void) {
     return anchor.bar ? MonitorFromWindow(anchor.bar, MONITOR_DEFAULTTONEAREST) : NULL;
 }
 
-void w_tool_popup_preferences(const w_desktop_config *cfg) {
-    if (!anchor.bar) return;
-    HIGHCONTRASTW contrast = {.cbSize=sizeof(contrast)};
-    BOOL animate = TRUE;
-    SystemParametersInfoW(SPI_GETHIGHCONTRAST,sizeof(contrast),&contrast,0);
-    SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION,0,&animate,0);
-    motion = !(contrast.dwFlags & HCF_HIGHCONTRASTON) &&
-        (cfg->animations == motion_on || (cfg->animations == motion_system && animate));
-    enter = cfg->motion[motion_layers_in];
-    leave = cfg->motion[motion_layers_out];
+int w_tool_feedback_height(HWND control,w_tool_feedback *flow,int width) {
+    if (!control) return 0;
+    width=max(1,width);
+    if (width!=flow->width) {
+        int n=GetWindowTextLengthW(control);
+        wchar_t local[512],*text=n<(int)count_of(local) ? local : malloc(((size_t)n+1)*sizeof(*text));
+        if (!text) return flow->height;
+        GetWindowTextW(control,text,n+1);
+        flow->height=*text ? w_theme_wrapped_height((HFONT)SendMessageW(control,WM_GETFONT,0,0),text,width) : 0;
+        flow->width=width;
+        if (text!=local) free(text);
+    }
+    return flow->height;
 }
 
-static int w_px(HWND w, int value) {
-    return MulDiv(value, GetDpiForWindow(w), 96);
+static LRESULT CALLBACK w_feedback_proc(HWND w,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PTR data) {
+    if (msg==WM_NCDESTROY) RemoveWindowSubclass(w,w_feedback_proc,id);
+    LRESULT result=DefSubclassProc(w,msg,wp,lp);
+    if (msg==WM_SETTEXT || msg==WM_SETFONT) {
+        w_tool_feedback *flow=(w_tool_feedback *)data;
+        int width=flow->width,old=flow->height;
+        flow->width=0;
+        if (width && w_tool_feedback_height(w,flow,width)!=old)
+            PostMessageW(GetParent(w),w_tool_feedback_changed,0,0);
+    }
+    return result;
+}
+
+void w_tool_track_feedback(HWND control,w_tool_feedback *flow) {
+    SetWindowSubclass(control,w_feedback_proc,1,(DWORD_PTR)flow);
+}
+
+static int w_heading_height(HWND window) {
+    UINT dpi = GetDpiForWindow(window);
+    return w_theme_role_line_height(dpi,text_heading)+2*w_theme_spacing(dpi)+1;
 }
 
 static void w_draw_heading(HWND w) {
@@ -64,31 +86,32 @@ static void w_draw_heading(HWND w) {
     OffsetRect(&bounds,-bounds.left,-bounds.top);
     HDC dc = GetWindowDC(w);
     if (!dc) return;
-    RECT band = {0,0,bounds.right,min(bounds.bottom,w_px(w,42))};
+    RECT band = {0,0,bounds.right,min(bounds.bottom,w_heading_height(w))};
     FillRect(dc,&band,w_theme_brush());
     HBRUSH brush = GetStockObject(DC_BRUSH);
     SetDCBrushColor(dc,w_theme_separator());
-    FrameRect(dc,&bounds,brush);
-    RECT divider = {w_px(w,12),band.bottom-1,bounds.right-w_px(w,12),band.bottom};
+    w_theme_frame(dc,&bounds,GetDpiForWindow(w));
+    SetDCBrushColor(dc,w_theme_separator());
+    int padding = 2*w_theme_spacing(GetDpiForWindow(w));
+    RECT divider = {padding,band.bottom-1,bounds.right-padding,band.bottom};
     FillRect(dc,&divider,brush);
-    SetDCBrushColor(dc,w_theme_accent());
-    RECT accent = {w_px(w,13),w_px(w,13),w_px(w,16),w_px(w,29)};
-    FillRect(dc,&accent,brush);
     UINT dpi = GetDpiForWindow(w);
-    if (heading_dpi != dpi) {
-        DeleteObject(heading);
-        heading = CreateFontW(-w_px(w,15),0,0,0,FW_SEMIBOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
-                              0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
-        heading_dpi = dpi;
+    if (!heading || heading_dpi != dpi) {
+        HFONT next=w_theme_role_font(dpi,text_heading);
+        if (next) {
+            DeleteObject(heading);
+            heading=next;
+            heading_dpi=dpi;
+        }
     }
     HGDIOBJ old = SelectObject(dc,heading ? heading : GetStockObject(DEFAULT_GUI_FONT));
     wchar_t title[160];
     GetWindowTextW(w,title,count_of(title));
-    band.left = w_px(w,25);
-    band.right -= w_px(w,12);
+    band.left = padding;
+    band.right -= padding;
     SetTextColor(dc,w_theme_foreground());
     SetBkMode(dc,TRANSPARENT);
-    DrawTextW(dc,title,-1,&band,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
+    w_theme_draw_text(dc,title,-1,&band,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
     SelectObject(dc,old);
     ReleaseDC(w,dc);
 }
@@ -147,10 +170,51 @@ static void CALLBACK w_modal_shown(HWINEVENTHOOK hook, DWORD event, HWND dialog,
 
 static LRESULT CALLBACK w_popup_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR id, DWORD_PTR data) {
     (void)data;
+    if (framed && msg==WM_SETTINGCHANGE && wp==SPI_SETNONCLIENTMETRICS) {
+        heading_dpi=0;
+        LRESULT result=DefSubclassProc(w,msg,wp,lp);
+        // Query the minimum after the panel has measured its new control fonts.
+        if (IsWindow(w)) PostMessageW(w,popup_font_changed,0,0);
+        return result;
+    }
+    if (framed && (msg==winwm_motion_updated || msg==WM_SYSCOLORCHANGE ||
+        (msg==WM_SETTINGCHANGE && (wp==SPI_SETCLIENTAREAANIMATION || w_appearance_setting(wp,lp))))) {
+        motion=w_theme_motion_enabled();
+        if (fade.start && !w_layer_fade_to(w,&fade,fade.target,w_theme_layer_timing(!closing),motion) && closing)
+            PostMessageW(w,WM_CLOSE,0,0);
+    }
+    if ((msg==winwm_popup_moved || msg==winwm_theme_updated || msg==popup_font_changed) && !closing && preferred_dpi) {
+        if (!w_popup_read(&anchor,placement_key)) { PostMessageW(w,popup_cancel,0,0);return 0; }
+        RECT old;
+        if (GetWindowRect(w,&old)) {
+            UINT dpi=GetDpiForWindow(anchor.bar);
+            int width=MulDiv(preferred.cx,dpi,preferred_dpi), height=MulDiv(preferred.cy,dpi,preferred_dpi);
+            if (framed) {
+                // A popup has a custom nonclient heading. Tool minima describe its client content.
+                MINMAXINFO limits={0};
+                SendMessageW(w,WM_GETMINMAXINFO,0,(LPARAM)&limits);
+                UINT current_dpi=GetDpiForWindow(w);
+                width=max(width,MulDiv(limits.ptMinTrackSize.x+2,dpi,current_dpi));
+                int minimum=MulDiv(limits.ptMinTrackSize.y+w_heading_height(w)+1,dpi,current_dpi);
+                // Fixed-height tools express their new row budget through both track limits.
+                height=limits.ptMinTrackSize.y>0 && limits.ptMaxTrackSize.y==limits.ptMinTrackSize.y ?
+                       minimum : max(height,minimum);
+            }
+            RECT next=w_popup_bounds(&anchor,w_popup_area(anchor.bar),width,height,w_theme_spacing(dpi));
+            if (!EqualRect(&old,&next) || msg==popup_font_changed) {
+                placing=true;
+                UINT flags=SWP_NOACTIVATE|SWP_NOZORDER;
+                if (msg==popup_font_changed) flags|=SWP_FRAMECHANGED;
+                SetWindowPos(w,NULL,next.left,next.top,next.right-next.left,next.bottom-next.top,flags);
+                placing=false;
+            }
+        }
+        if (msg!=winwm_theme_updated) return 0;
+    }
     if (framed && msg == WM_NCCALCSIZE) {
         RECT *r = wp ? &((NCCALCSIZE_PARAMS *)lp)->rgrc[0] : (RECT *)lp;
         InflateRect(r,-1,-1);
-        r->top = min(r->bottom,r->top + w_px(w,42)-1);
+        r->top = min(r->bottom,r->top + w_heading_height(w)-1);
         return 0;
     }
     if (framed && (msg == WM_NCPAINT || msg == WM_NCACTIVATE)) {
@@ -165,10 +229,14 @@ static LRESULT CALLBACK w_popup_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UIN
     if (msg == WM_WINDOWPOSCHANGING && !closing) {
         WINDOWPOS *pos = (WINDOWPOS *)lp;
         if (!(pos->flags & SWP_NOSIZE) || !(pos->flags & SWP_NOMOVE)) {
+            if (!placing && !(pos->flags&SWP_NOSIZE)) {
+                preferred=(SIZE){pos->cx,pos->cy};
+                preferred_dpi=GetDpiForWindow(w);
+            }
             RECT current; GetWindowRect(w,&current);
             RECT r = w_popup_bounds(&anchor,w_popup_area(anchor.bar),
                 (pos->flags & SWP_NOSIZE) ? current.right-current.left : pos->cx,
-                (pos->flags & SWP_NOSIZE) ? current.bottom-current.top : pos->cy,w_px(w,6));
+                (pos->flags & SWP_NOSIZE) ? current.bottom-current.top : pos->cy,w_theme_spacing(GetDpiForWindow(anchor.bar)));
             pos->x=r.left; pos->y=r.top; pos->cx=r.right-r.left; pos->cy=r.bottom-r.top;
             pos->flags &= ~(SWP_NOSIZE|SWP_NOMOVE);
         }
@@ -205,7 +273,7 @@ static LRESULT CALLBACK w_popup_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UIN
             closing = true;
             if (framed && IsWindowVisible(w)) {
                 SetWindowLongPtrW(w,GWL_EXSTYLE,GetWindowLongPtrW(w,GWL_EXSTYLE)|WS_EX_TRANSPARENT);
-                if (w_layer_fade_to(w,&fade,0,leave,motion)) return 0;
+                if (w_layer_fade_to(w,&fade,0,w_theme_layer_timing(false),motion)) return 0;
             }
         }
         LRESULT result = DefSubclassProc(w,msg,wp,lp);
@@ -213,7 +281,7 @@ static LRESULT CALLBACK w_popup_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UIN
             closing = false;
             if (framed) {
                 SetWindowLongPtrW(w,GWL_EXSTYLE,GetWindowLongPtrW(w,GWL_EXSTYLE)&~(LONG_PTR)WS_EX_TRANSPARENT);
-                w_layer_fade_to(w,&fade,255,enter,motion);
+                w_layer_fade_to(w,&fade,255,w_theme_layer_timing(true),motion);
             }
         } else w_release_popup();
         return result;
@@ -226,6 +294,7 @@ static LRESULT CALLBACK w_popup_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UIN
         dismissing=NULL;
         w_release_popup();
         w_stop_waits();
+        if (GetPropW(anchor.bar,w_popup_child_property)==w) RemovePropW(anchor.bar,w_popup_child_property);
         RemovePropW(w,L"winwm.popup_bar");
         RemoveWindowSubclass(w,w_popup_proc,id);
     }
@@ -236,24 +305,29 @@ static bool w_attach(HWND w, bool tool_frame) {
     if (tool_frame && (!IsWindow(anchor.bar) || WaitForSingleObject(cancelled,0) != WAIT_TIMEOUT ||
         WaitForSingleObject(manager,0) != WAIT_TIMEOUT)) return false;
     RECT size;
-    if (tool_frame) GetClientRect(w,&size); else GetWindowRect(w,&size);
+    if (tool_frame) w_theme_content_rect(w,&size); else GetWindowRect(w,&size);
     framed = tool_frame;
     if (!SetWindowSubclass(w,w_popup_proc,1,0)) return false;
-    if (!SetPropW(w,L"winwm.popup_bar",anchor.bar) ||
+    // Register before reading: a change racing startup is either in the property
+    // snapshot or posted to this HWND after the manager publishes it.
+    if (!SetPropW(anchor.bar,w_popup_child_property,w) || !w_popup_read(&anchor,placement_key) ||
+        !SetPropW(w,L"winwm.popup_bar",anchor.bar) ||
         !RegisterWaitForSingleObject(&cancel_wait,cancelled,w_cancelled,w,INFINITE,WT_EXECUTEONLYONCE) ||
         !RegisterWaitForSingleObject(&manager_wait,manager,w_cancelled,w,INFINITE,WT_EXECUTEONLYONCE))
         return false;
-    if (tool_frame) {
+    if (tool_frame)
         SetWindowLongPtrW(w,GWL_STYLE,WS_POPUP|WS_CLIPCHILDREN);
-        SetWindowLongPtrW(w,GWL_EXSTYLE,GetWindowLongPtrW(w,GWL_EXSTYLE)|WS_EX_LAYERED);
-        DWORD rounding=2;
-        DwmSetWindowAttribute(w,33,&rounding,sizeof(rounding));
-    }
     int width=size.right-size.left + (tool_frame ? 2 : 0);
-    int height=size.bottom-size.top + (tool_frame ? w_px(w,42)+1 : 0);
-    RECT r=w_popup_bounds(&anchor,w_popup_area(anchor.bar),width,height,w_px(w,6));
+    int height=size.bottom-size.top + (tool_frame ? w_heading_height(w)+1 : 0);
+    preferred=(SIZE){width,height};
+    preferred_dpi=GetDpiForWindow(w);
+    UINT dpi=GetDpiForWindow(anchor.bar);
+    RECT r=w_popup_bounds(&anchor,w_popup_area(anchor.bar),MulDiv(width,dpi,preferred_dpi),
+                          MulDiv(height,dpi,preferred_dpi),w_theme_spacing(dpi));
+    placing=true;
     SetWindowPos(w,HWND_TOPMOST,r.left,r.top,r.right-r.left,r.bottom-r.top,
                  SWP_NOACTIVATE|SWP_FRAMECHANGED);
+    placing=false;
     // Native modal creation is already in progress; its registered waits drive Cancel even
     // if another button was clicked between the launch and the first dialog activation.
     return !tool_frame || WaitForSingleObject(cancelled,0)==WAIT_TIMEOUT;
@@ -267,7 +341,8 @@ bool w_tool_show(HWND w) {
             return false;
         }
         w_theme_material(w);
-        w_layer_fade_to(w,&fade,255,enter,motion);
+        motion=w_theme_motion_enabled();
+        w_layer_fade_to(w,&fade,255,w_theme_layer_timing(true),motion);
     }
     ShowWindow(w,SW_SHOW);
     if (anchor.bar) SetForegroundWindow(w);

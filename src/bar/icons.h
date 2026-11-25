@@ -35,12 +35,15 @@ typedef enum bar_icon {
 typedef struct w_icon_atlas {
     BYTE *coverage;
     DWORD *pixels;
+    HDC source;
+    HBITMAP image;
+    COLORREF tint[icon_count];
     int size;
 } w_icon_atlas;
 
 ////////////////
 //~ Icons Interface
 
-void w_icons_resize(w_icon_atlas *atlas, int dpi);
+void w_icons_resize(w_icon_atlas *atlas, int pixels);
 void w_icons_free(w_icon_atlas *atlas);
-void w_icons_draw(const w_icon_atlas *atlas, HDC dc, bar_icon icon, RECT box, COLORREF ink, COLORREF paper);
+void w_icons_draw(w_icon_atlas *atlas, HDC dc, bar_icon icon, RECT box, COLORREF ink);

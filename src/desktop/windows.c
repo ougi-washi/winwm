@@ -81,9 +81,13 @@ static bool w_module_detail(const char *name, wchar_t *text, int cap) {
 
 static void w_dock_bar(int output) {
     w_output_state *o = &desk.outputs[output];
+    if ((int)GetDpiForWindow(o->bar.hwnd) != o->dpi) {
+        w_desktop_outputs();
+        return;
+    }
     o->work = w_bar_position(&o->bar, o->screen, o->available, o->dpi, o->bar_hidden);
     w_notice_reposition();
-    InvalidateRect(o->bar.hwnd, NULL, FALSE);
+    w_bar_invalidate(&o->bar, NULL);
     w_desktop_schedule();
 }
 
@@ -124,6 +128,7 @@ static BOOL CALLBACK w_visit_monitor(HMONITOR mon, HDC dc, LPRECT bounds, LPARAM
     o->bar.custom = w_custom_text;
     o->bar.detail = w_module_detail;
     o->bar.dock = w_dock_bar;
+    o->bar.anchors_changed = w_desktop_popup_layout;
     w_desktop_tray_bind(&o->bar);
     o->bar_hidden = desk.hide_bars;
     o->work = w_bar_position(&o->bar, o->screen, o->available, o->dpi, desk.hide_bars);
@@ -167,8 +172,10 @@ void w_desktop_outputs(void) {
     }
     for (int i = 0; i < output_limit; i++) {
         w_output_state *output = &desk.outputs[i];
-        if (!output->live && output->bar.hwnd)
+        if (!output->live && output->bar.hwnd) {
+            w_desktop_popup_bar_hidden(output->bar.hwnd);
             ShowWindow(output->bar.hwnd, SW_HIDE);
+        }
         if (!output->live && output->tabs) {
             DestroyWindow(output->tabs);
             output->tabs = NULL;
@@ -780,11 +787,9 @@ void w_desktop_apply(void) {
                     color = 0xfffffffeu; // DWMWA_COLOR_NONE
                 BYTE corner = w->fullscreen || !desk.config.rounding ? 1 : desk.config.rounding <= 4 ? 3 : 2;
                 w_effects_opacity(i,focused,entering || !s->presented);
-                if (!s->decorated || corner != s->corner || focused != s->active || color != s->applied_border ||
-                    s->alpha != desk.config.inactive_alpha) {
+                if (!s->decorated || corner != s->corner || focused != s->active || color != s->applied_border) {
                     w_os_window_appearance(hwnd, color, corner);
                     s->corner = corner;
-                    s->alpha = desk.config.inactive_alpha;
                     s->active = focused;
                     s->applied_border = color;
                     s->decorated = true;

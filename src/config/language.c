@@ -328,6 +328,10 @@ bool w_config_language_set(w_config_language *l, const char *key, char *v) {
         return w_switch(v,&c->panel_material.blur);
     if (!strcmp(key,"decoration:panels.shadow"))
         return w_switch(v,&c->panel_material.shadow);
+    if (!strcmp(key,"decoration:panels.button_size"))
+        return w_number(v, button_size_min, button_size_max, &c->panel_metrics.button_size);
+    if (!strcmp(key,"decoration:panels.spacing"))
+        return w_number(v, panel_spacing_min, panel_spacing_max, &c->panel_metrics.spacing);
     if (!strcmp(key,"decoration:inactive_opacity") || !strcmp(key,"decoration:panels.opacity")) {
         char *end;
         double f = strtod(v, &end);

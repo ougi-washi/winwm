@@ -1,6 +1,16 @@
 @compile.rsp
 build/config_res.o
 src/theme/theme.c
+src/theme/hover.c
+src/theme/disclosure.c
+src/theme/control_hover.c
+src/theme/controls.c
+src/theme/caption.c
+src/theme/menu.c
+src/theme/native_controls.c
+src/theme/dialog.c
+src/theme/metrics.c
+src/theme/fonts.c
 src/theme/icon_button.c
 src/app/main.c
 src/bar/bar.c
@@ -45,6 +55,7 @@ src/desktop_tools/project.c
 src/desktop_tools/display.c
 src/desktop_tools/bluetooth.c
 src/desktop_tools/clock.c
+src/desktop_tools/calendar.c
 src/desktop_tools/color.c
 src/desktop_tools/main.c
 src/desktop_tools/popup.c

@@ -1,5 +1,6 @@
 #include "bar/tray.h"
 #include "bar/tooltip.h"
+#include "theme/theme.h"
 #include <shellapi.h>
 #include <stdio.h>
 
@@ -38,6 +39,7 @@ static void toggle(w_bar_window *b,int source,bool open) {
         b->tray.position=open ? 1 : 0;
         KillTimer(b->hwnd,bar_tray_timer);
     }
+    b->tray.dirty=true;
     InvalidateRect(b->hwnd,NULL,FALSE);
 }
 
@@ -131,7 +133,7 @@ void w_bar_tray_layout(w_bar_window *b,RECT client,bool vertical,int margin) {
     int direction=right>=left ? 1 : -1;
     int room=max(left,right);
     if (room<=0) return;
-    int unit=max(1,min(room,MulDiv(28,b->dpi,96)));
+    int unit=max(1,min(room,w_theme_button_size(b->dpi)));
     int slots=max(1,min(bar_tray_slots,min(room,max(unit,length/2))/unit));
     int page=min(b->tray.total,slots);
     bool more=b->tray.total>page && slots>1;
@@ -149,12 +151,13 @@ void w_bar_tray_layout(w_bar_window *b,RECT client,bool vertical,int margin) {
     memmove(&b->hits[insert+visible],&b->hits[insert],(b->hit_count-insert)*sizeof(*b->hits));
     b->hit_count+=visible;
     for (int j=0;j<visible;++j) {
-        int offset=j*unit,last=min(reveal,offset+unit);
+        int offset=j*unit;
         int i=direction>0 ? insert+j : insert+visible-j-1;
         struct w_bar_hit *h=&b->hits[i];
-        *h=(struct w_bar_hit){.box=base,.source=b->tray.source,.tray_hide_tip=hide_tip};
-        set_axis(&h->box,vertical,direction>0 ? anchor+offset : anchor-last,
-                                  direction>0 ? anchor+last : anchor-offset);
+        *h=(struct w_bar_hit){.tray_slot=base,.source=b->tray.source,.tray_hide_tip=hide_tip};
+        int start=direction>0 ? anchor+offset : anchor-offset-unit;
+        set_axis(&h->tray_slot,vertical,start,start+unit);
+        IntersectRect(&h->box,&h->tray_slot,&b->tray.strip);
         strcpy(h->module,"tray");
         if (j==page) {
             h->tray_more=true;
@@ -171,7 +174,6 @@ void w_bar_tray_layout(w_bar_window *b,RECT client,bool vertical,int margin) {
             lstrcpynW(h->tooltip,*item.tooltip ? item.tooltip : L"Application",count_of(h->tooltip));
         }
         wcscpy(h->text,h->tooltip);
-        if (last-offset<min(unit,max(1,MulDiv(12,b->dpi,96)))) SetRectEmpty(&h->box);
     }
     int used=0;
     for (int i=0;i<b->hit_count;++i) if (!IsRectEmpty(&b->hits[i].box)) {
@@ -183,10 +185,14 @@ void w_bar_tray_layout(w_bar_window *b,RECT client,bool vertical,int margin) {
 
 bool w_bar_tray_scroll(w_bar_window *b,int index,int steps) {
     if (index<0 || index>=b->hit_count || !is_tray(&b->hits[index])) return false;
-    if (!b->tray.open) toggle(b,b->hits[index].source,true);
-    int last=max(0,b->tray.total-max(1,b->tray.page));
-    b->tray.first=w_clamp_int(b->tray.first-steps,0,last);
     w_bar_tip_hide(b);
+    if (!b->tray.total) return true;
+    if (!b->tray.open || b->tray.source!=b->hits[index].source) toggle(b,b->hits[index].source,true);
+    int last=max(0,b->tray.total-max(1,b->tray.page));
+    int first=w_clamp_int(b->tray.first-steps,0,last);
+    if (b->tray.first==first) return true;
+    b->tray.first=first;
+    b->tray.dirty=true;
     InvalidateRect(b->hwnd,NULL,FALSE);
     return true;
 }
@@ -209,6 +215,7 @@ bool w_bar_tray_action(w_bar_window *b,int index,UINT event) {
     } else if (hit->tray_more || (b->tray.open && b->tray.page==1 && b->tray.total>1 && event==NIN_KEYSELECT)) {
         int page=max(1,b->tray.page),last=max(0,b->tray.total-page);
         b->tray.first=b->tray.first>=last ? 0 : (int)min((int64_t)last,(int64_t)b->tray.first+page);
+        b->tray.dirty=true;
         InvalidateRect(b->hwnd,NULL,FALSE);
     } else if (event==WM_LBUTTONUP || event==NIN_KEYSELECT) {
         bool open=!(b->tray.open && b->tray.source==hit->source);

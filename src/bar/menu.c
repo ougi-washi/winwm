@@ -1,7 +1,10 @@
 #include "bar/menu.h"
 #include "theme/icon_button.h"
+#include "theme/hover.h"
+#include "theme/control_hover.h"
 #include "theme/theme.h"
 #include "win_platform/percent_slider.h"
+#include "win_platform/appearance.h"
 #include <stdio.h>
 #include <commctrl.h>
 #include <windowsx.h>
@@ -34,15 +37,16 @@ typedef struct w_flyout {
     w_bar_window *bar;
     HWND window, list, slider, previous, language_target;
     HWND mute, transport[count_of(playback)];
-    HFONT heading, symbols;
-    COLORREF surface, ink, accent, border, selected, selected_ink;
+    HFONT font, heading, symbols;
+    COLORREF surface, ink, accent, border;
     DWORD language_thread;
-    int count, pressed_row, source;
+    int count, pressed_row, button, gap, dpi, glyph_size, header_height, row_height, percent_width;
     w_popup_anchor anchor;
+    RECT area;
     bar_icon icon;
-    bool closing, owns_memory;
+    bool closing, owns_memory, motion_enabled, pointer_selection;
     w_layer_fade fade;
-    char module[56], instance[56];
+    char module[56];
     w_menu_row rows[];
 } w_flyout;
 
@@ -54,26 +58,11 @@ static DWORD last_foreground_thread;
 ////////////////
 //~ Menu Functions
 
-static COLORREF w_color(uint32_t rgb) {
-    return RGB(rgb >> 16, rgb >> 8, rgb);
-}
-
-static int w_scale(const w_bar_window *bar, int pixels) {
-    return MulDiv(pixels, bar->dpi, 96);
-}
-
 static void w_menu_colors(w_flyout *menu) {
-    const w_desktop_config *cfg = menu->bar->config;
-    bool contrast = menu->bar->high_contrast;
-    menu->surface = contrast ? GetSysColor(COLOR_WINDOW) : w_color(cfg->background);
-    menu->ink = contrast ? GetSysColor(COLOR_WINDOWTEXT) : w_color(cfg->foreground);
-    menu->accent = contrast ? menu->ink : w_color(cfg->accent);
-    menu->border = contrast ? menu->ink : w_color(cfg->inactive_border);
-    menu->selected = contrast ? GetSysColor(COLOR_HIGHLIGHT) :
-        RGB((3*GetRValue(menu->surface)+GetRValue(menu->accent))/4,
-            (3*GetGValue(menu->surface)+GetGValue(menu->accent))/4,
-            (3*GetBValue(menu->surface)+GetBValue(menu->accent))/4);
-    menu->selected_ink = contrast ? GetSysColor(COLOR_HIGHLIGHTTEXT) : menu->ink;
+    menu->surface = w_theme_background();
+    menu->ink = w_theme_foreground();
+    menu->accent = w_theme_accent();
+    menu->border = w_theme_separator();
 }
 
 bool w_bar_menu_active(void) {
@@ -81,8 +70,8 @@ bool w_bar_menu_active(void) {
 }
 
 bool w_bar_menu_at(const w_bar_window *bar, const struct w_bar_hit *hit) {
-    return open_menu && open_menu->bar == bar && open_menu->source == hit->source &&
-           !strcmp(open_menu->instance,hit->instance);
+    return open_menu && open_menu->bar == bar && open_menu->anchor.source == hit->source &&
+           open_menu->anchor.workspace==hit->workspace && !strcmp(open_menu->anchor.instance,hit->instance);
 }
 
 HWND w_bar_remember_foreground(void) {
@@ -122,7 +111,7 @@ static void w_dismiss(w_flyout *menu, bool restore) {
     if (restore && had_focus && target && IsWindowVisible(target))
         SetForegroundWindow(target);
     if (GetForegroundWindow() == hwnd ||
-        !w_layer_fade_to(hwnd,&menu->fade,0,menu->bar->config->motion[motion_layers_out],menu->bar->motion_allowed))
+        !w_layer_fade_to(hwnd,&menu->fade,0,w_theme_layer_timing(false),menu->motion_enabled))
         DestroyWindow(hwnd);
 }
 
@@ -167,10 +156,22 @@ static void w_pick(w_flyout *menu, int index) {
         bar->invoke(bar->output, selected.action, &anchor);
 }
 
+static void w_release_row(w_flyout *menu) {
+    int previous=menu->pressed_row;
+    menu->pressed_row=-1;
+    RECT bounds;
+    if (previous>=0 && SendMessageW(menu->list,LB_GETITEMRECT,previous,(LPARAM)&bounds)!=LB_ERR)
+        InvalidateRect(menu->list,&bounds,FALSE);
+}
+
 static LRESULT CALLBACK w_flyout_control(HWND control, UINT message, WPARAM wp, LPARAM lp, UINT_PTR id,
                                        DWORD_PTR data) {
     w_flyout *menu = (w_flyout *)data;
     if (message == WM_KEYDOWN) {
+        if (control==menu->list && menu->pointer_selection) {
+            menu->pointer_selection=false;
+            InvalidateRect(control,NULL,FALSE);
+        }
         if (wp == VK_ESCAPE) {
             w_dismiss(menu, true);
             return 0;
@@ -189,24 +190,30 @@ static LRESULT CALLBACK w_flyout_control(HWND control, UINT message, WPARAM wp, 
             return 0;
         }
     }
-    if (control == menu->list && (message == WM_MOUSEMOVE || message == WM_LBUTTONDOWN)) {
+    if (control == menu->list && (message == WM_MOUSEMOVE || message == WM_LBUTTONDOWN || message==WM_LBUTTONUP)) {
         LRESULT hit = SendMessageW(control, LB_ITEMFROMPOINT, 0, lp);
-        if (message == WM_LBUTTONDOWN)
-            menu->pressed_row = HIWORD(hit) ? -1 : (int)LOWORD(hit);
-        else if (!HIWORD(hit))
-            SendMessageW(control, LB_SETCURSEL, LOWORD(hit), 0);
+        int row=(int)LOWORD(hit);
+        RECT bounds;
+        bool enabled=!HIWORD(hit) && row<menu->count-1 && !menu->rows[row+1].disabled &&
+            SendMessageW(control,LB_GETITEMRECT,row,(LPARAM)&bounds)!=LB_ERR &&
+            PtInRect(&bounds,(POINT){GET_X_LPARAM(lp),GET_Y_LPARAM(lp)});
+        if (message == WM_LBUTTONDOWN) {
+            menu->pressed_row=enabled ? row : -1;
+            if (enabled) InvalidateRect(control,&bounds,FALSE);
+        } else if (message==WM_LBUTTONUP) {
+            bool pick=enabled && menu->pressed_row==row;
+            w_release_row(menu);
+            LRESULT result=DefSubclassProc(control,message,wp,lp);
+            if (pick && menu==open_menu) w_pick(menu,row);
+            return result;
+        } else if (enabled) {
+            bool keyboard=!menu->pointer_selection;
+            menu->pointer_selection=true;
+            if (SendMessageW(control,LB_GETCURSEL,0,0)!=row) SendMessageW(control,LB_SETCURSEL,row,0);
+            else if (keyboard) InvalidateRect(control,&bounds,FALSE);
+        }
     }
-    if (control == menu->list && message == WM_LBUTTONUP) {
-        LRESULT hit = SendMessageW(control, LB_ITEMFROMPOINT, 0, lp);
-        int pressed = menu->pressed_row;
-        menu->pressed_row = -1;
-        LRESULT result = DefSubclassProc(control, message, wp, lp);
-        if (menu == open_menu && !HIWORD(hit) && pressed == (int)LOWORD(hit))
-            w_pick(menu, LOWORD(hit));
-        return result;
-    }
-    if (control == menu->list && (message == WM_CANCELMODE || message == WM_CAPTURECHANGED))
-        menu->pressed_row = -1;
+    if (control == menu->list && (message == WM_CANCELMODE || message == WM_CAPTURECHANGED)) w_release_row(menu);
     if (message == WM_NCDESTROY)
         RemoveWindowSubclass(control, w_flyout_control, id);
     return DefSubclassProc(control, message, wp, lp);
@@ -217,19 +224,6 @@ static void w_fill(HDC dc, RECT r, COLORREF value) {
     FillRect(dc, &r, GetStockObject(DC_BRUSH));
 }
 
-static void w_rounded_fill(HDC dc, RECT r, COLORREF color, int radius) {
-    if (!radius) {
-        w_fill(dc,r,color);
-        return;
-    }
-    HGDIOBJ brush = SelectObject(dc,GetStockObject(DC_BRUSH));
-    HGDIOBJ pen = SelectObject(dc,GetStockObject(NULL_PEN));
-    SetDCBrushColor(dc,color);
-    RoundRect(dc,r.left,r.top,r.right,r.bottom,2*radius,2*radius);
-    SelectObject(dc,pen);
-    SelectObject(dc,brush);
-}
-
 // Owner drawing supplies the glyphs. Keep their meaning in the native list's
 // accessible text as well, including when the keyboard focus is on another row.
 static void w_row_name(const w_menu_row *row, wchar_t text[256]) {
@@ -238,14 +232,19 @@ static void w_row_name(const w_menu_row *row, wchar_t text[256]) {
 }
 
 static void w_volume_header(w_flyout *menu, int percent) {
-    wchar_t *label = menu->rows[0].label;
+    wchar_t label[64];
     if (percent < 0)
         wcscpy(label, L"No audio output");
     else
-        swprintf(label, count_of(menu->rows[0].label), L"%ls   %d%%",
+        swprintf(label, count_of(label), L"%ls   %d%%",
                  menu->bar->audio_muted ? L"Muted" : L"Output volume", percent);
+    if (!wcscmp(menu->rows[0].label,label)) return;
+    wcscpy(menu->rows[0].label,label);
     SetWindowTextW(menu->window, label);
-    InvalidateRect(menu->window, NULL, FALSE);
+    RECT header;
+    GetClientRect(menu->window,&header);
+    header.bottom = menu->header_height + menu->gap;
+    InvalidateRect(menu->window, &header, FALSE);
 }
 
 static void w_request_volume(w_flyout *menu, int percent) {
@@ -259,13 +258,138 @@ static const wchar_t *w_mute_label(const w_bar_window *bar) {
     return bar->audio_percent < 0 ? L"No audio output" : bar->audio_muted ? L"Unmute output" : L"Mute output";
 }
 
-static HWND w_flyout_button(w_flyout *menu, const wchar_t *glyph, const wchar_t *label,
-                            int x, int y, int width, int height) {
+static HWND w_flyout_button(w_flyout *menu, const wchar_t *glyph, const wchar_t *label) {
     HWND button = CreateWindowW(L"BUTTON", label, WS_CHILD|WS_VISIBLE|WS_TABSTOP|BS_OWNERDRAW,
-                                x, y, width, height, menu->window, NULL, GetModuleHandleW(NULL), NULL);
+                                0, 0, 0, 0, menu->window, NULL, GetModuleHandleW(NULL), NULL);
     if (!button || !SetWindowSubclass(button,w_flyout_control,1,(DWORD_PTR)menu)) return NULL;
     w_icon_button(button,glyph,label);
     return button;
+}
+
+static int w_transport_columns(int width, int button, int gap) {
+    return max(1,min((int)count_of(playback),(width-gap)/(button+gap)));
+}
+
+static void w_flyout_fonts(w_flyout *menu) {
+    w_bar_window *bar=menu->bar;
+    if (menu->dpi!=bar->dpi || !menu->font || !menu->heading) {
+        HFONT font=w_bar_create_label_font(bar->dpi);
+        HFONT heading=w_theme_role_font(bar->dpi,text_heading);
+        if (font && heading) {
+            if (menu->list) SendMessageW(menu->list,WM_SETFONT,(WPARAM)font,FALSE);
+            DeleteObject(menu->font);
+            DeleteObject(menu->heading);
+            menu->font=font;
+            menu->heading=heading;
+            menu->dpi=bar->dpi;
+        } else {
+            DeleteObject(font);
+            DeleteObject(heading);
+        }
+    }
+    int size=w_theme_icon_size(bar->dpi);
+    if (menu->glyph_size!=size) {
+        HFONT symbols=w_theme_font(L"Segoe MDL2 Assets",size,FW_NORMAL);
+        if (symbols) {
+            DeleteObject(menu->symbols);
+            menu->symbols=symbols;
+            menu->glyph_size=size;
+        }
+    }
+}
+
+static RECT w_flyout_bounds(w_flyout *menu) {
+    w_bar_window *bar = menu->bar;
+    int gap = menu->gap = w_theme_spacing(bar->dpi), button = menu->button = w_theme_button_size(bar->dpi);
+    bool audio = !strcmp(menu->module,"audio"), media = !strcmp(menu->module,"media");
+    int width=audio ? 7*button+3*gap : media ? (int)count_of(playback)*(button+gap)+gap : button+4*gap;
+    int options_width=0;
+    HFONT font=menu->font ? menu->font : bar->font,heading=menu->heading ? menu->heading : bar->heading_font;
+    menu->header_height=max(button,w_theme_line_height(heading));
+    menu->row_height=max(button,w_theme_line_height(font));
+    menu->percent_width=w_theme_text_width(heading,L"100%",DT_NOPREFIX);
+    HDC dc = GetDC(bar->hwnd);
+    if (dc) {
+        HGDIOBJ old = SelectObject(dc,font ? font : GetStockObject(DEFAULT_GUI_FONT));
+        int glyph=w_theme_icon_size(bar->dpi);
+        for (int i = 1; i < menu->count; ++i) {
+            SIZE size;
+            if (w_theme_text_extent(dc,menu->rows[i].label,(int)wcslen(menu->rows[i].label),&size))
+                options_width=max(options_width,size.cx+5*gap+glyph+(menu->rows[i].opens_panel ? glyph+gap : 0));
+        }
+        const wchar_t *title=audio && bar->audio_percent>=0 ? L"Output volume" : menu->rows[0].label;
+        int header=w_theme_text_width(heading,title,DT_NOPREFIX)+4*gap+(menu->icon ? bar->icons.size+gap : 0);
+        if (audio && bar->audio_percent>=0) header+=menu->percent_width+gap;
+        width=max(width,max(header,options_width));
+        SelectObject(dc,old);
+        ReleaseDC(bar->hwnd,dc);
+    }
+    RECT area = menu->area = w_popup_area(bar->hwnd);
+    RECT available = w_popup_bounds(&menu->anchor,area,area.right-area.left,area.bottom-area.top,gap);
+    int columns = w_transport_columns(available.right-available.left,button,gap);
+    int controls = media ? ((int)count_of(playback)+columns-1)/columns : audio;
+    int chrome=menu->header_height+2*gap+controls*(button+gap);
+    int room=max(0,available.bottom-available.top-chrome);
+    int rows=min(min(10,menu->count-1),room/menu->row_height);
+    if (rows<menu->count-1) width=max(width,options_width+GetSystemMetricsForDpi(SM_CXVSCROLL,bar->dpi));
+    int height=chrome+(rows ? rows*menu->row_height : menu->count>1 ? room : 0);
+    return w_popup_bounds(&menu->anchor,area,width,height,gap);
+}
+
+void w_bar_menu_reanchor(w_bar_window *bar) {
+    w_flyout *menu = open_menu;
+    if (!menu || menu->bar != bar) return;
+    w_popup_anchor next;
+    if (!w_bar_resolve_anchor(bar,&menu->anchor,&next)) {
+        w_dismiss(menu,false);
+        return;
+    }
+    RECT area=w_popup_area(bar->hwnd);
+    bool moved=menu->dpi!=bar->dpi || !EqualRect(&next.button,&menu->anchor.button) ||
+               !EqualRect(&area,&menu->area) || strcmp(next.edge,menu->anchor.edge);
+    menu->anchor=next;
+    if (moved) {
+        if (menu->dpi!=bar->dpi) w_flyout_fonts(menu);
+        RECT r=w_flyout_bounds(menu);
+        SetWindowPos(menu->window,NULL,r.left,r.top,r.right-r.left,r.bottom-r.top,SWP_NOACTIVATE|SWP_NOZORDER);
+    }
+}
+
+static void w_layout_flyout(w_flyout *menu) {
+    if (!menu->list) return;
+    int dpi=menu->bar->dpi;
+    bool text_changed=menu->dpi != dpi;
+    w_flyout_fonts(menu);
+    if (text_changed || menu->gap != w_theme_spacing(dpi) || menu->button != w_theme_button_size(dpi)) {
+        RECT next = w_flyout_bounds(menu);
+        RECT old;
+        if (GetWindowRect(menu->window,&old) && !EqualRect(&old,&next)) {
+            bool resizing=old.right-old.left!=next.right-next.left || old.bottom-old.top!=next.bottom-next.top;
+            if (SetWindowPos(menu->window,NULL,next.left,next.top,next.right-next.left,next.bottom-next.top,
+                             SWP_NOZORDER|SWP_NOACTIVATE) && resizing) return;
+        }
+    }
+    RECT r;
+    GetClientRect(menu->window,&r);
+    int gap = menu->gap, button = menu->button, y = menu->header_height+gap;
+    UINT flags = SWP_NOZORDER|SWP_NOACTIVATE;
+    if (menu->slider) {
+        SetWindowPos(menu->mute,NULL,gap,y,button,button,flags);
+        SetWindowPos(menu->slider,NULL,button+2*gap,y,max(1,r.right-button-3*gap),button,flags);
+        y += button+gap;
+    } else if (menu->transport[0]) {
+        int count = (int)count_of(playback);
+        int columns = w_transport_columns(r.right,button,gap);
+        for (int i = 0; i < count; ++i) {
+            int row = i/columns, items = min(columns,count-row*columns);
+            int x = max(0,(r.right-(button+gap)*items+gap)/2) + (i%columns)*(button+gap);
+            SetWindowPos(menu->transport[i],NULL,x,y+row*(button+gap),button,button,flags);
+        }
+        y += ((count+columns-1)/columns)*(button+gap);
+    }
+    SetWindowPos(menu->list,NULL,gap,y,max(1,r.right-2*gap),max(1,r.bottom-y-gap),flags);
+    SendMessageW(menu->list,LB_SETITEMHEIGHT,0,menu->row_height);
+    InvalidateRect(menu->window,NULL,FALSE);
 }
 
 ////////////////
@@ -282,11 +406,35 @@ static LRESULT CALLBACK w_flyout_proc(HWND w, UINT message, WPARAM wp, LPARAM lp
     if (!menu)
         return DefWindowProcW(w, message, wp, lp);
     w_bar_window *bar = menu->bar;
+    if (message==winwm_motion_updated || message==WM_SYSCOLORCHANGE ||
+        (message==WM_SETTINGCHANGE && (wp==SPI_SETCLIENTAREAANIMATION || w_appearance_setting(wp,lp)))) {
+        menu->motion_enabled=w_theme_motion_enabled();
+        if (menu->fade.start && !w_layer_fade_to(w,&menu->fade,menu->fade.target,
+            w_theme_layer_timing(!menu->closing),menu->motion_enabled) && menu->closing) {
+            DestroyWindow(w);
+            return 0;
+        }
+    }
     switch (message) {
+    case WM_FONTCHANGE:
+        w_theme_surface_message(w,message,wp,lp);
+        menu->dpi=0;
+        if (!menu->closing) w_layout_flyout(menu);
+        return 0;
+    case WM_SHOWWINDOW:
+        if (wp) w_theme_native_controls(w);
+        break;
+    case WM_SIZE:
+        w_layout_flyout(menu);
+        return 0;
     case WM_DISPLAYCHANGE:
     case WM_DPICHANGED:
-        // The anchor and its fonts belong to the bar's output.
-        if (menu == open_menu) w_dismiss(menu,true);
+        // The owner reanchors from its new monitor geometry during the next bar layout.
+        w_bar_invalidate(bar,NULL);
+        return 0;
+    case winwm_theme_updated:
+        w_menu_colors(menu);
+        if (!menu->closing) w_layout_flyout(menu);
         return 0;
     case WM_COMMAND:
         if (menu->closing || HIWORD(wp) != BN_CLICKED || !lp) break;
@@ -301,14 +449,21 @@ static LRESULT CALLBACK w_flyout_proc(HWND w, UINT message, WPARAM wp, LPARAM lp
             }
         }
         break;
-    case WM_SYSCOLORCHANGE:
     case WM_SETTINGCHANGE:
+        if (wp==SPI_SETNONCLIENTMETRICS) {
+            menu->dpi=0;
+            w_layout_flyout(menu);
+            return 0;
+        }
+        if (!w_appearance_setting(wp,lp)) break;
+        /* fall through */
+    case WM_SYSCOLORCHANGE:
         w_menu_colors(menu);
         RedrawWindow(w,NULL,NULL,RDW_INVALIDATE|RDW_ALLCHILDREN);
         break;
     case WM_TIMER:
         if (wp == layer_fade_timer && menu->fade.start &&
-            !w_layer_fade_tick(w,&menu->fade,bar->motion_allowed) && menu->closing)
+            !w_layer_fade_tick(w,&menu->fade,menu->motion_enabled) && menu->closing)
             DestroyWindow(w);
         return 0;
     case WM_CLOSE:
@@ -321,7 +476,8 @@ static LRESULT CALLBACK w_flyout_proc(HWND w, UINT message, WPARAM wp, LPARAM lp
         return 0;
     case WM_NOTIFY:
         if (lp && menu->slider && ((NMHDR *)lp)->hwndFrom == menu->slider && ((NMHDR *)lp)->code == NM_CUSTOMDRAW)
-            return w_percent_slider_draw(menu->slider,(NMCUSTOMDRAW *)lp,menu->surface,menu->border,menu->accent,menu->ink);
+            return w_percent_slider_draw(menu->slider,(NMCUSTOMDRAW *)lp,menu->surface,menu->border,menu->accent,menu->ink,
+                                         w_native_slider_feedback(menu->slider));
         break;
     case WM_ACTIVATE:
         if (LOWORD(wp) == WA_INACTIVE)
@@ -339,38 +495,38 @@ static LRESULT CALLBACK w_flyout_proc(HWND w, UINT message, WPARAM wp, LPARAM lp
         HDC dc = message == WM_PAINT ? BeginPaint(w,&ps) : (HDC)wp;
         RECT r;
         GetClientRect(w, &r);
-        w_fill(dc, r, menu->border);
-        InflateRect(&r, -1, -1);
-        w_rounded_fill(dc,r,menu->surface,w_scale(bar,min(12,bar->config->rounding)));
+        w_fill(dc,r,menu->surface);
+        w_theme_frame(dc,&r,bar->dpi);
         RECT list_rect;
         if (menu->list && GetWindowRect(menu->list,&list_rect)) {
             MapWindowPoints(HWND_DESKTOP,w,(POINT *)&list_rect,2);
-            RECT line = {r.left+w_scale(bar,14),list_rect.top-1,r.right-w_scale(bar,14),list_rect.top};
+            RECT line = {r.left+2*menu->gap,list_rect.top-1,r.right-2*menu->gap,list_rect.top};
             w_fill(dc,line,menu->border);
         }
-        r.left += w_scale(bar, 16);
-        r.right -= w_scale(bar, 16);
-        r.bottom = w_scale(bar, 38);
-        HGDIOBJ old = SelectObject(dc, menu->heading ? menu->heading : bar->font);
+        r.left += 2*menu->gap;
+        r.right -= 2*menu->gap;
+        r.bottom = menu->header_height + menu->gap;
+        HFONT heading_font=menu->heading ? menu->heading : menu->font;
+        HGDIOBJ old = SelectObject(dc,heading_font ? heading_font : GetStockObject(DEFAULT_GUI_FONT));
         SetTextColor(dc, menu->ink);
         SetBkMode(dc, TRANSPARENT);
         if (menu->icon && bar->icons.size > 0) {
             RECT glyph = r;
             glyph.right = glyph.left + bar->icons.size;
-            w_icons_draw(&bar->icons,dc,menu->icon,glyph,menu->accent,menu->surface);
-            r.left = glyph.right + w_scale(bar,9);
+            w_icons_draw(&bar->icons,dc,menu->icon,glyph,menu->accent);
+            r.left = glyph.right + menu->gap;
         }
         const wchar_t *heading = menu->rows[0].label;
         if (menu->slider && bar->audio_percent >= 0 && wcschr(heading, L'%')) {
             wchar_t percentage[12];
             swprintf(percentage, count_of(percentage), L"%d%%", (int)SendMessageW(menu->slider, TBM_GETPOS, 0, 0));
             SetTextColor(dc, menu->accent);
-            DrawTextW(dc, percentage, -1, &r, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
+            w_theme_draw_text(dc, percentage, -1, &r, DT_RIGHT | DT_SINGLELINE | DT_VCENTER);
             SetTextColor(dc, menu->ink);
-            r.right -= w_scale(bar, 52);
+            r.right-=menu->percent_width+menu->gap;
             heading = bar->audio_muted ? L"Output muted" : L"Output volume";
         }
-        DrawTextW(dc, heading, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        w_theme_draw_text(dc, heading, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
         SelectObject(dc, old);
         if (message == WM_PAINT) EndPaint(w,&ps);
         return 0;
@@ -385,30 +541,28 @@ static LRESULT CALLBACK w_flyout_proc(HWND w, UINT message, WPARAM wp, LPARAM lp
             return FALSE;
         w_menu_row *row = &menu->rows[item->itemID + 1];
         RECT r = item->rcItem;
-        bool selected = !!(item->itemState & ODS_SELECTED);
-        w_fill(item->hDC, r, menu->surface);
-        if (selected) {
-            InflateRect(&r, -w_scale(bar, 2), -w_scale(bar, 2));
-            w_rounded_fill(item->hDC,r,menu->selected,w_scale(bar,min(7,bar->config->rounding)));
-        }
+        bool selected = (item->itemState & ODS_SELECTED) && !menu->pointer_selection;
+        int hover=row->disabled ? 0 : w_hover_amount(menu->list,item->itemID);
+        COLORREF ink=w_hover_row(item->hDC,&r,selected,hover,!row->disabled && menu->pressed_row==(int)item->itemID);
         SetBkMode(item->hDC, TRANSPARENT);
-        COLORREF ink = row->disabled ? GetSysColor(COLOR_GRAYTEXT) : selected ? menu->selected_ink : menu->ink;
-        SetTextColor(item->hDC, selected || row->disabled ? ink : menu->accent);
-        HGDIOBJ old = SelectObject(item->hDC, menu->symbols ? menu->symbols : bar->font);
-        r.left = item->rcItem.left + w_scale(bar,12);
-        r.right = item->rcItem.right - w_scale(bar,12);
+        if (row->disabled) ink=GetSysColor(COLOR_GRAYTEXT);
+        SetTextColor(item->hDC, selected || row->disabled || (hover && w_theme_high_contrast()) ? ink : menu->accent);
+        r.left = item->rcItem.left + menu->gap;
+        r.right = item->rcItem.right - menu->gap;
         wchar_t symbol = row->checked ? 0xe73e : row->glyph;
-        if (symbol) DrawTextW(item->hDC,&symbol,1,&r,DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
-        if (row->opens_panel) DrawTextW(item->hDC,L"\xe76c",1,&r,DT_SINGLELINE|DT_VCENTER|DT_RIGHT);
+        if (menu->symbols) {
+            HGDIOBJ old=SelectObject(item->hDC,menu->symbols);
+            if (symbol) DrawTextW(item->hDC,&symbol,1,&r,DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
+            if (row->opens_panel) DrawTextW(item->hDC,L"\xe76c",1,&r,DT_SINGLELINE|DT_VCENTER|DT_RIGHT);
+            SelectObject(item->hDC,old);
+        }
         SetTextColor(item->hDC,ink);
-        SelectObject(item->hDC,bar->font);
-        r.left += w_scale(bar,26);
-        if (row->opens_panel) r.right -= w_scale(bar,22);
-        DrawTextW(item->hDC, row->label, -1, &r, DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS);
+        r.left += w_theme_icon_size(bar->dpi) + menu->gap;
+        if (row->opens_panel) r.right -= w_theme_icon_size(bar->dpi) + menu->gap;
+        w_theme_draw_control_line(menu->list,item->hDC,row->label,&r,DT_VCENTER|DT_NOPREFIX|DT_END_ELLIPSIS);
         if ((item->itemState & (ODS_FOCUS|ODS_NOFOCUSRECT)) == ODS_FOCUS &&
             !(SendMessageW(menu->list,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS))
             DrawFocusRect(item->hDC,&item->rcItem);
-        SelectObject(item->hDC, old);
         return TRUE;
     }
     case WM_NCDESTROY:
@@ -417,6 +571,7 @@ static LRESULT CALLBACK w_flyout_proc(HWND w, UINT message, WPARAM wp, LPARAM lp
         if (fading_menu == w)
             fading_menu = NULL;
         SetWindowLongPtrW(w, GWLP_USERDATA, 0);
+        DeleteObject(menu->font);
         DeleteObject(menu->heading);
         DeleteObject(menu->symbols);
         if (menu->owns_memory)
@@ -427,11 +582,12 @@ static LRESULT CALLBACK w_flyout_proc(HWND w, UINT message, WPARAM wp, LPARAM lp
 }
 
 static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count, HWND language_target) {
-    if (count < 2)
+    w_popup_anchor source;
+    if (count < 2 || !w_bar_anchor(bar,hit,&source))
         return;
     HWND previous = w_bar_remember_foreground();
     if (open_menu) {
-        bool same = w_bar_menu_at(bar,&bar->hits[hit]);
+        bool same = w_popup_same_source(&open_menu->anchor,&source);
         w_dismiss(open_menu, true);
         if (same)
             return;
@@ -441,7 +597,8 @@ static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count
     if (!menu)
         return;
     menu->bar = bar;
-    w_bar_anchor(bar,hit,&menu->anchor);
+    menu->motion_enabled = bar->motion_allowed;
+    menu->anchor=source;
     menu->previous = previous;
     bar->invoke(bar->output,NULL,&menu->anchor);
     w_menu_colors(menu);
@@ -450,29 +607,14 @@ static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count
         menu->language_thread = GetWindowThreadProcessId(language_target, NULL);
     menu->count = count;
     menu->pressed_row = -1;
-    menu->source = bar->hits[hit].source;
     menu->icon = bar->hits[hit].icon;
     w_str_copy(menu->module, sizeof(menu->module), bar->hits[hit].module);
-    w_str_copy(menu->instance, sizeof(menu->instance), bar->hits[hit].instance);
     memcpy(menu->rows, rows, (size_t)count * sizeof(*rows));
 
     bool audio = !strcmp(menu->module, "audio");
     bool media = !strcmp(menu->module, "media");
-    int margin = w_scale(bar, 6), row_height = w_scale(bar, 35), header = w_scale(bar, audio || media ? 76 : 38);
-    HDC dc = GetDC(bar->hwnd);
-    HGDIOBJ old = SelectObject(dc, bar->font);
-    int width = w_scale(bar, audio ? 288 : 236);
-    for (int i = 0; i < count; ++i) {
-        SIZE size = {0};
-        GetTextExtentPoint32W(dc, rows[i].label, (int)wcslen(rows[i].label), &size);
-        width = max(width, size.cx + w_scale(bar, 84));
-    }
-    SelectObject(dc, old);
-    ReleaseDC(bar->hwnd, dc);
-    int height = header + min(10, count - 1) * row_height + margin + 1;
-    RECT bounds = w_popup_bounds(&menu->anchor,w_popup_area(bar->hwnd),width,height,margin);
-    width = bounds.right - bounds.left;
-    height = bounds.bottom - bounds.top;
+    RECT bounds = w_flyout_bounds(menu);
+    int width = bounds.right - bounds.left, height = bounds.bottom - bounds.top;
     HINSTANCE instance = GetModuleHandleW(NULL);
     WNDCLASSW wc = {.lpfnWndProc = w_flyout_proc,
                     .hInstance = instance,
@@ -480,62 +622,47 @@ static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count
                     .lpszClassName = L"WinwmBarFlyout"};
     RegisterClassW(&wc);
     HWND popup =
-        CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW, wc.lpszClassName, rows[0].label,
+        CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, wc.lpszClassName, rows[0].label,
                         WS_POPUP | WS_CLIPCHILDREN, bounds.left, bounds.top, width, height, bar->hwnd, NULL, instance, menu);
     if (!popup) {
         free(menu);
         return;
     }
     menu->owns_memory = true;
-    int radius = w_scale(bar,min(12,bar->config->rounding));
-    if (radius) {
-        HRGN shape = CreateRoundRectRgn(0,0,width+1,height+1,2*radius,2*radius);
-        if (shape && !SetWindowRgn(popup,shape,FALSE)) DeleteObject(shape);
-    }
     w_theme_material(popup);
-    menu->heading = CreateFontW(-w_scale(bar, 15), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
-                                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, L"Segoe UI");
-    menu->symbols = CreateFontW(-w_scale(bar,15),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
-                                OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,CLEARTYPE_QUALITY,0,L"Segoe MDL2 Assets");
+    w_flyout_fonts(menu);
     if (audio) {
-        int x = margin, y = w_scale(bar,36), size = min(w_scale(bar,34),max(1,width/4));
-        menu->mute = w_flyout_button(menu,bar->audio_muted ? L"\xe74f" : L"\xe767",w_mute_label(bar),
-                                     x,y,size,w_scale(bar,34));
+        menu->mute = w_flyout_button(menu,bar->audio_muted ? L"\xe74f" : L"\xe767",w_mute_label(bar));
         if (!menu->mute) { DestroyWindow(popup); return; }
         EnableWindow(menu->mute,bar->audio_percent >= 0);
         INITCOMMONCONTROLSEX init = {sizeof(init), ICC_BAR_CLASSES};
         InitCommonControlsEx(&init);
-        x += size + margin;
         menu->slider = CreateWindowExW(0, TRACKBAR_CLASSW, L"Output volume",
                         WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_HORZ | TBS_NOTICKS,
-                        x, y, max(1,width - margin - x), w_scale(bar, 34),
-                        popup, NULL, instance, NULL);
-        if (!w_percent_slider_init(menu->slider) || !SetWindowSubclass(menu->slider, w_flyout_control, 1, (DWORD_PTR)menu)) {
+                        0,0,0,0,popup,NULL,instance,NULL);
+        if (!w_percent_slider_init(menu->slider,slider_live) || !SetWindowSubclass(menu->slider, w_flyout_control, 1, (DWORD_PTR)menu)) {
             DestroyWindow(popup);
             return;
         }
-        SendMessageW(menu->slider, TBM_SETPOS, TRUE, max(0, bar->audio_percent));
+        w_percent_slider_sync(menu->slider,bar->audio_percent);
         EnableWindow(menu->slider, bar->audio_percent >= 0);
     } else if (media) {
-        int n = (int)count_of(playback), span = max(n,width-(n+1)*margin);
-        for (int i = 0; i < n; ++i) {
-            int x = (i+1)*margin + i*span/n;
-            menu->transport[i] = w_flyout_button(menu,playback[i].glyph,playback[i].label,x,w_scale(bar,36),
-                                                 (i+1)*span/n - i*span/n,w_scale(bar,34));
+        for (size_t i = 0; i < count_of(playback); ++i) {
+            menu->transport[i] = w_flyout_button(menu,playback[i].glyph,playback[i].label);
             if (!menu->transport[i]) { DestroyWindow(popup); return; }
         }
     }
     menu->list = CreateWindowExW(0, L"LISTBOX", rows[0].label,
                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_OWNERDRAWFIXED |
                                      LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,
-                                 margin, header, max(1,width - 2 * margin), max(1,height - header - margin), popup, NULL,
+                                 0, 0, 0, 0, popup, NULL,
                                  instance, NULL);
     if (!menu->list || !SetWindowSubclass(menu->list, w_flyout_control, 1, (DWORD_PTR)menu)) {
         DestroyWindow(popup);
         return;
     }
-    SendMessageW(menu->list, WM_SETFONT, (WPARAM)bar->font, FALSE);
-    SendMessageW(menu->list, LB_SETITEMHEIGHT, 0, row_height);
+    SendMessageW(menu->list, WM_SETFONT, (WPARAM)(menu->font ? menu->font : GetStockObject(DEFAULT_GUI_FONT)), FALSE);
+    w_layout_flyout(menu);
     int selected = 0;
     for (int i = 1; i < count; ++i) {
         wchar_t text[256];
@@ -550,7 +677,7 @@ static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count
     SendMessageW(menu->list, LB_SETCURSEL, selected, 0);
     open_menu = menu;
     InvalidateRect(bar->hwnd,&bar->hits[hit].box,FALSE);
-    w_layer_fade_to(popup,&menu->fade,255,bar->config->motion[motion_layers_in],bar->motion_allowed);
+    w_layer_fade_to(popup,&menu->fade,255,w_theme_layer_timing(true),menu->motion_enabled);
     ShowWindow(popup, SW_SHOW);
     SetForegroundWindow(popup);
     if (open_menu == menu && IsWindow(popup))
@@ -559,7 +686,7 @@ static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count
 
 void w_bar_menu_audio_error(void) {
     if (w_bar_menu_active() && !strcmp(open_menu->module, "audio")) {
-        SendMessageW(open_menu->slider, TBM_SETPOS, TRUE, max(0, open_menu->bar->audio_percent));
+        w_percent_slider_sync(open_menu->slider,open_menu->bar->audio_percent);
         wcscpy(open_menu->rows[0].label, L"Output rejected the change");
         SetWindowTextW(open_menu->window, open_menu->rows[0].label);
         InvalidateRect(open_menu->window, NULL, FALSE);
@@ -577,7 +704,7 @@ void w_bar_menu_audio_changed(w_bar_window *b) {
     EnableWindow(menu->mute,available);
     EnableWindow(menu->slider, available);
     if (!available || GetCapture() != menu->slider) {
-        SendMessageW(menu->slider, TBM_SETPOS, TRUE, max(0, b->audio_percent));
+        w_percent_slider_sync(menu->slider,b->audio_percent);
         w_volume_header(menu, b->audio_percent);
     }
 }

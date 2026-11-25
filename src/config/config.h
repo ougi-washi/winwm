@@ -73,9 +73,16 @@ typedef struct w_panel_material {
     bool blur, shadow;
 } w_panel_material;
 
+enum { button_size_min = 24, button_size_default = 32, button_size_max = 48,
+       panel_spacing_min = 2, panel_spacing_default = 6, panel_spacing_max = 12 };
+typedef struct w_panel_metrics {
+    int button_size, spacing;
+} w_panel_metrics;
+
 typedef struct w_desktop_config {
     w_notification_config notifications;
     w_panel_material panel_material;
+    w_panel_metrics panel_metrics;
     w_startup_entry startup[32];
     int startup_count;
     w_module_style styles[48];

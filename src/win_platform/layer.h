@@ -6,6 +6,7 @@ enum { layer_fade_timer = 0x574d };
 typedef struct w_layer_fade {
     uint64_t start;
     BYTE from, value, target;
+    int full_ms;
     w_transition timing;
 } w_layer_fade;
 

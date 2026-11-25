@@ -1,4 +1,8 @@
 #include "desktop_tools/display.h"
+#include "desktop_tools/tools.h"
+#include "desktop_tools/rows.h"
+#include "theme/icon_button.h"
+#include "win_platform/percent_slider.h"
 #include <commctrl.h>
 #include <physicalmonitorenumerationapi.h>
 #include <highlevelmonitorconfigurationapi.h>
@@ -23,6 +27,8 @@ static ULONGLONG deadline;
 static DWORD minimum, maximum, brightness;
 static bool adjustable, changing_mode;
 static bool refresh_posted, read_requested, closing, first_scan;
+static w_tool_choice display_choice = {.row=-1};
+static bool topology_after_close;
 static unsigned topology;
 typedef struct {
     LONG refs;
@@ -50,7 +56,7 @@ static bool scan_queued, topology_queued;
 enum { refresh_display = WM_APP + 60 };
 
 static int w_selected_display(void) {
-    return (int)SendMessageW(selector, CB_GETCURSEL, 0, 0);
+    return display_choice.row;
 }
 
 static bool w_same_mode(const DEVMODEW *a, const DEVMODEW *b) {
@@ -65,7 +71,6 @@ static void w_clear_displays(void) {
         if (displays[i].physical)
             DestroyPhysicalMonitor(displays[i].physical);
     display_count = 0;
-    SendMessageW(selector, CB_RESETCONTENT, 0, 0);
 }
 
 static BOOL CALLBACK w_add_display(HMONITOR monitor, HDC dc, LPRECT rect, LPARAM arg) {
@@ -113,13 +118,13 @@ static void w_brightness_label(int value) {
     wchar_t s[48];
     if (value >= 0)
         swprintf(s, count_of(s), L"Brightness   %d%%", value);
-    SetWindowTextW(level, value >= 0 ? s : L"Brightness unavailable");
+    w_tool_status(level,value >= 0 ? s : L"Brightness unavailable");
 }
 
 static void w_show_brightness(void) {
     int value = adjustable ? (int)(((uint64_t)(brightness - minimum)*100 + (maximum - minimum)/2)/(maximum - minimum)) : 0;
-    SendMessageW(slider, TBM_SETPOS, TRUE, value);
     EnableWindow(slider, adjustable);
+    value=w_percent_slider_sync(slider,value);
     w_brightness_label(adjustable ? value : -1);
 }
 
@@ -170,6 +175,7 @@ static void w_next_brightness(void) {
         brightness_job = job;
     } else {
         free(job);
+        if (i==selected && !scan_thread) w_show_brightness();
         SetWindowTextW(message_line,L"Could not start the brightness request.");
     }
 }
@@ -233,7 +239,6 @@ static DWORD WINAPI w_scan_displays(void *arg) {
 static void w_request_scan(bool full) {
     topology_queued |= full || (scan && scan->full);
     scan_queued = true;
-    mode_count = 0;
     adjustable = false;
     EnableWindow(preview_button,FALSE);
     EnableWindow(slider,FALSE);
@@ -260,11 +265,15 @@ static void w_request_scan(bool full) {
 }
 
 static void w_show_modes(const w_display_scan *s) {
-    int selected = -1;
+    static wchar_t shown_device[CCHDEVICENAME];
+    int before = (int)SendMessageW(modes_list,LB_GETCURSEL,0,0);
+    bool same_display = !wcscmp(shown_device,s->device);
+    bool restore = same_display && before >= 0 && before < mode_count;
+    DEVMODEW previous = restore ? modes[before] : (DEVMODEW){0};
+    lstrcpynW(shown_device,s->device,count_of(shown_device));
+    int selected = -1, current = -1;
+    w_tool_rows items = w_rows_begin(modes_list);
     mode_count = 0;
-    SendMessageW(modes_list,WM_SETREDRAW,FALSE,0);
-    SendMessageW(modes_list,LB_RESETCONTENT,0,0);
-    SendMessageW(modes_list,LB_INITSTORAGE,s->mode_count,(LPARAM)s->mode_count*64);
     for (int i = 0; i < s->mode_count; ++i) {
         const DEVMODEW *mode = &s->modes[i];
         bool active = w_same_mode(&s->current,mode);
@@ -272,14 +281,13 @@ static void w_show_modes(const w_display_scan *s) {
         swprintf(label,count_of(label),L"%lu × %lu   %lu Hz%ls%ls",mode->dmPelsWidth,mode->dmPelsHeight,
                  mode->dmDisplayFrequency,mode->dmDisplayFlags & DM_INTERLACED ? L"   Interlaced" : L"",
                  active ? L"   Current" : L"");
-        if (SendMessageW(modes_list,LB_ADDSTRING,0,(LPARAM)label) < 0) continue;
-        SendMessageW(modes_list,LB_SETITEMDATA,mode_count,mode_count);
-        if (active) selected=mode_count;
+        if (w_rows_put(&items,label,mode_count) < 0) continue;
+        if (active) current=mode_count;
+        if (restore && w_same_mode(&previous,mode)) selected=mode_count;
         modes[mode_count++] = *mode;
     }
-    SendMessageW(modes_list,LB_SETCURSEL,selected >= 0 ? selected : 0,0);
-    SendMessageW(modes_list,WM_SETREDRAW,TRUE,0);
-    InvalidateRect(modes_list,NULL,TRUE);
+    if (selected < 0) selected = current >= 0 ? current : 0;
+    w_rows_end(&items,selected,restore ? items.top : w_rows_show_selection);
     EnableWindow(preview_button,mode_count > 0);
     w_show_brightness();
     read_requested = true;
@@ -294,15 +302,26 @@ void w_display_finish(HANDLE completed) {
     scan = NULL;
     if (!scan_queued && !closing && !deadline) {
         if (s->full) {
+            bool same_choices = s->display_count == display_count;
+            for (int i = 0; same_choices && i < display_count; ++i)
+                same_choices = !wcscmp(displays[i].label,s->displays[i].label);
+            if (!same_choices && display_choice.open) {
+                topology_after_close = true;
+                w_release_scan(s);
+                return;
+            }
             w_clear_displays();
+            if (!same_choices) SendMessageW(selector,CB_RESETCONTENT,0,0);
             int preferred = 0;
             for (int i = 0; i < s->display_count; ++i) {
-                if (SendMessageW(selector,CB_ADDSTRING,0,(LPARAM)s->displays[i].label) < 0) continue;
+                if (!same_choices && SendMessageW(selector,CB_ADDSTRING,0,(LPARAM)s->displays[i].label) < 0) continue;
                 if (i == s->preferred) preferred = display_count;
                 displays[display_count++] = s->displays[i];
                 s->displays[i].physical = NULL;
             }
-            SendMessageW(selector,CB_SETCURSEL,preferred,0);
+            int row = display_count ? preferred : -1;
+            if (!same_choices || row != display_choice.row) SendMessageW(selector,CB_SETCURSEL,row,0);
+            display_choice.row = row;
         }
         int selected = w_selected_display();
         if (selected >= 0 && selected < display_count && wcscmp(displays[selected].device,s->device))
@@ -331,7 +350,7 @@ static void w_end_preview(bool keep, bool closing) {
     changing_mode = false;
     EnableWindow(selector, TRUE);
     EnableWindow(modes_list, TRUE);
-    SetWindowTextW(preview_button, L"Preview");
+    w_icon_button(preview_button,L"\uE7F4",L"Preview selected display mode");
     if (!closing) w_request_scan(true);
     SetWindowTextW(message_line, keep ? L"Display mode kept for this session." :
                    restored ? L"Original display mode restored." : L"Windows could not restore the previous display mode.");
@@ -344,7 +363,7 @@ void w_display_preview(void) {
                       !wcscmp(displays[index].device, preview_device), false);
         return;
     }
-    if (row < 0 || row >= mode_count || index < 0 || index >= display_count)
+    if (scan_thread || !IsWindowEnabled(preview_button) || row < 0 || row >= mode_count || index < 0 || index >= display_count)
         return;
     wcscpy(preview_device, displays[index].device);
     original = (DEVMODEW){.dmSize = sizeof(original)};
@@ -373,7 +392,7 @@ void w_display_preview(void) {
     deadline = GetTickCount64() + 12000;
     EnableWindow(selector, FALSE);
     EnableWindow(modes_list, FALSE);
-    SetWindowTextW(preview_button, L"Keep");
+    w_icon_button(preview_button,L"\uE8FB",L"Keep this display mode");
     SetFocus(preview_button);
     SetWindowTextW(message_line, L"Keep this mode within 12 seconds or press Escape to restore.");
     if (!SetTimer(panel, 1, 12000, NULL))
@@ -386,15 +405,14 @@ void w_display_create(HWND window, HWND list, HWND status, HWND apply) {
     message_line = status;
     preview_button = apply;
     HINSTANCE instance = GetModuleHandleW(NULL);
-    MoveWindow(list, 12, 50, 520, 198, FALSE);
-    selector = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST | WS_VSCROLL,
+    w_icon_button(preview_button,L"\uE7F4",L"Preview selected display mode");
+    selector = CreateWindowW(L"COMBOBOX", L"", WS_CHILD | WS_VISIBLE | WS_TABSTOP | w_tool_dropdown_list | WS_VSCROLL,
                            12, 10, 520, 200, window, NULL, instance, NULL);
     SendMessageW(selector, CB_SETMINVISIBLE, 8, 0);
-    level = CreateWindowW(L"STATIC", L"Brightness", WS_CHILD | WS_VISIBLE, 162, 306, 158, 26, window, NULL, instance, NULL);
+    level = CreateWindowW(L"STATIC", L"Brightness", WS_CHILD | WS_VISIBLE | SS_CENTERIMAGE | SS_ENDELLIPSIS, 162, 306, 158, 26, window, NULL, instance, NULL);
     slider = CreateWindowW(TRACKBAR_CLASSW, L"Brightness", WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_NOTICKS,
                          320, 300, 212, 32, window, NULL, instance, NULL);
-    SendMessageW(slider, TBM_SETRANGE, TRUE, MAKELPARAM(0, 100));
-    SendMessageW(slider, TBM_SETPAGESIZE, 0, 5);
+    w_percent_slider_init(slider,slider_preview);
     EnableWindow(preview_button,FALSE);
     EnableWindow(slider,FALSE);
     SetWindowTextW(status,L"Reading displays…");
@@ -405,15 +423,43 @@ void w_display_start(void) {
     w_request_scan(true);
 }
 
-bool w_display_stretches(HWND control) {
-    return control == selector || control == slider;
+void w_display_layout(int pad, int width, int footer, int side, int gap,bool update_font) {
+    static int ink;
+    if (!ink || update_font) {
+        HFONT font=(HFONT)SendMessageW(level,WM_GETFONT,0,0);
+        const wchar_t *const captions[]={L"Brightness   100%",L"Brightness unavailable"};
+        ink=w_tool_widest_option(font,captions,count_of(captions));
+    }
+    int caption=min(ink,max(1,(width-side-2*gap)/2));
+    w_tool_place_combo(selector,pad,pad,width,side,6);
+    w_tool_place(level,pad+side+gap,footer,caption,side);
+    w_tool_place(slider,pad+side+caption+2*gap,footer,width-side-caption-2*gap,side);
+}
+
+bool w_display_slider(HWND control) { return control == slider; }
+
+bool w_display_key(HWND focus,WPARAM key) {
+    if (key == VK_ESCAPE && deadline) {
+        w_end_preview(false,false);
+        SetFocus(modes_list);
+        return true;
+    }
+    if (key == VK_RETURN && focus == selector && !SendMessageW(selector,CB_GETDROPPEDSTATE,0,0)) {
+        SetFocus(modes_list);
+        return true;
+    }
+    return false;
 }
 
 bool w_display_message(UINT msg, WPARAM wp, LPARAM lp) {
     if (!panel)
         return false;
-    if (msg == WM_COMMAND && (HWND)lp == selector && HIWORD(wp) == CBN_SELCHANGE) {
-        if (!deadline) w_request_scan(false);
+    if (msg == WM_COMMAND && selector && (HWND)lp == selector) {
+        bool changed = w_tool_choice_changed(&display_choice,selector,HIWORD(wp));
+        if (HIWORD(wp) == CBN_CLOSEUP && topology_after_close) {
+            topology_after_close = false;
+            if (!deadline) w_request_scan(true);
+        } else if (changed && !deadline) w_request_scan(false);
     } else if (msg == WM_HSCROLL && (HWND)lp == slider && adjustable) {
         int percent = (int)SendMessageW(slider, TBM_GETPOS, 0, 0), i = w_selected_display();
         if (i < 0 || i >= display_count)

@@ -1,6 +1,7 @@
 #include "bar/tooltip.h"
 #include "bar/menu.h"
 #include "theme/theme.h"
+#include "win_platform/appearance.h"
 #include <stdio.h>
 
 static const w_bar_description descriptions[] = {
@@ -135,28 +136,35 @@ static void w_tip_text(w_bar_window *b, wchar_t *heading, wchar_t *body, wchar_t
     } else w_hint(help,320,L"Scroll",wheel,NULL);
 }
 
-static COLORREF w_rgb(uint32_t value) { return RGB(value >> 16, value >> 8, value); }
+static HFONT w_tip_font(const w_bar_window *b,int part) {
+    if (!part && b->heading_font) return b->heading_font;
+    return b->font ? b->font : GetStockObject(DEFAULT_GUI_FONT);
+}
 
 static void w_tip_paint(w_bar_window *b, HDC dc, RECT r) {
-    const w_desktop_config *c = b->config;
-    COLORREF fg = b->high_contrast ? GetSysColor(COLOR_INFOTEXT) : w_rgb(c->foreground);
-    COLORREF bg = b->high_contrast ? GetSysColor(COLOR_INFOBK) : w_rgb(c->background);
-    COLORREF accent = b->high_contrast ? fg : w_rgb(c->accent);
+    COLORREF fg = w_theme_foreground();
+    COLORREF bg = w_theme_background();
+    COLORREF accent = w_theme_accent();
     SetDCBrushColor(dc,bg);
     FillRect(dc,&r,GetStockObject(DC_BRUSH));
-    SetDCBrushColor(dc,b->high_contrast ? fg : RGB((GetRValue(accent)+GetRValue(bg))/2,
-                             (GetGValue(accent)+GetGValue(bg))/2,(GetBValue(accent)+GetBValue(bg))/2));
-    FrameRect(dc,&r,GetStockObject(DC_BRUSH));
+    w_theme_frame(dc,&r,b->dpi);
     SetBkMode(dc,TRANSPARENT);
-    HFONT previous = SelectObject(dc,b->heading_font);
+    HFONT previous = GetCurrentObject(dc,OBJ_FONT);
     const wchar_t *parts[] = {b->tip.heading,b->tip.body,b->tip.help};
     for (int i=0;i<3;i++) {
         if (!*parts[i]) continue;
-        SelectObject(dc,i ? b->font : b->heading_font);
+        SelectObject(dc,w_tip_font(b,i));
         SetTextColor(dc,i == 2 ? accent : fg);
-        DrawTextW(dc,parts[i],-1,&b->tip.parts[i],DT_WORDBREAK|DT_NOPREFIX|DT_EDITCONTROL|DT_END_ELLIPSIS);
+        w_theme_draw_text(dc,parts[i],-1,&b->tip.parts[i],DT_WORDBREAK|DT_NOPREFIX|DT_EDITCONTROL|DT_END_ELLIPSIS);
     }
     SelectObject(dc,previous);
+}
+
+static void w_tip_layout(w_bar_window *b);
+
+static bool w_tip_fade(w_bar_window *b,bool entering) {
+    return w_layer_fade_to(b->tip.window,&b->tip.fade,entering ? 255 : 0,
+                           w_theme_layer_timing(entering),w_theme_motion_enabled());
 }
 
 static LRESULT CALLBACK w_tip_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
@@ -166,6 +174,24 @@ static LRESULT CALLBACK w_tip_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_MOUSEACTIVATE) return MA_NOACTIVATE;
     if (msg == WM_NCHITTEST) return HTTRANSPARENT;
     if (msg == WM_ERASEBKGND) return 1;
+    if (b && (msg==WM_FONTCHANGE || msg==winwm_theme_updated)) {
+        if (msg==WM_FONTCHANGE) w_theme_fonts_changed();
+        if (b->tip.showing) w_tip_layout(b);
+        return 0;
+    }
+    if (b && msg==WM_TIMER && wp==layer_fade_timer) {
+        if (b->tip.fade.start && !w_layer_fade_tick(w,&b->tip.fade,true) && !b->tip.showing) ShowWindow(w,SW_HIDE);
+        return 0;
+    }
+    if (b && b->tip.fade.start && (msg==winwm_motion_updated || msg==WM_SYSCOLORCHANGE ||
+        (msg==WM_SETTINGCHANGE && (wp==SPI_SETCLIENTAREAANIMATION || w_appearance_setting(wp,lp))))) {
+        if (!w_tip_fade(b,b->tip.showing) && !b->tip.showing) ShowWindow(w,SW_HIDE);
+    }
+    if (b && msg==WM_SHOWWINDOW && !wp) {
+        KillTimer(w,layer_fade_timer);
+        b->tip.fade=(w_layer_fade){0};
+        b->tip.showing=false;
+    }
     if (b && (msg == WM_PRINTCLIENT || msg == WM_PAINT)) {
         PAINTSTRUCT ps;
         HDC dc = msg == WM_PAINT ? BeginPaint(w,&ps) : (HDC)wp;
@@ -188,34 +214,55 @@ static HWND w_tip_create(w_bar_window *b) {
     return tip;
 }
 
-static POINT w_tip_position(w_bar_window *b, POINT anchor, RECT area, int width, int height) {
-    RECT bar;
-    GetWindowRect(b->hwnd,&bar);
-    int gap=MulDiv(7,b->dpi,96), x=anchor.x+gap*2,y=anchor.y+gap*2;
-    if (bar.right-bar.left > bar.bottom-bar.top) {
-        y=bar.bottom+gap+height<=area.bottom ? bar.bottom+gap : bar.top-gap-height;
-        if (x+width>area.right) x=anchor.x-gap*2-width;
-    } else {
-        x=bar.right+gap+width<=area.right ? bar.right+gap : bar.left-gap-width;
-        if (y+height>area.bottom) y=anchor.y-gap*2-height;
-    }
-    b->tip.anchor=anchor;
-    return (POINT){max(area.left,min(x,area.right-width)),max(area.top,min(y,area.bottom-height))};
-}
-
 void w_bar_tip_move(w_bar_window *b) {
     if (!b->tip.showing) return;
-    POINT p=b->pointer;
-    if (!ClientToScreen(b->hwnd,&p)) return;
-    int step=max(1,MulDiv(6,b->dpi,96));
-    if (abs(p.x-b->tip.anchor.x)<step && abs(p.y-b->tip.anchor.y)<step) return;
+    w_popup_anchor anchor;
     RECT box;
     MONITORINFO mi={.cbSize=sizeof(mi)};
-    if (!GetWindowRect(b->tip.window,&box) ||
-        !GetMonitorInfoW(MonitorFromPoint(p,MONITOR_DEFAULTTONEAREST),&mi)) return;
-    POINT pos=w_tip_position(b,p,mi.rcWork,box.right-box.left,box.bottom-box.top);
-    if (box.left!=pos.x || box.top!=pos.y)
-        SetWindowPos(b->tip.window,NULL,pos.x,pos.y,0,0,SWP_NOSIZE|SWP_NOZORDER|SWP_NOACTIVATE);
+    if (!w_bar_anchor(b,b->tip.index,&anchor) || !GetWindowRect(b->tip.window,&box) ||
+        !GetMonitorInfoW(MonitorFromWindow(b->hwnd,MONITOR_DEFAULTTONEAREST),&mi)) return;
+    RECT pos=w_popup_bounds(&anchor,mi.rcWork,box.right-box.left,box.bottom-box.top,w_theme_spacing(b->dpi));
+    if (!EqualRect(&box,&pos)) SetWindowPos(b->tip.window,NULL,pos.left,pos.top,pos.right-pos.left,pos.bottom-pos.top,
+                                           SWP_NOZORDER|SWP_NOACTIVATE);
+}
+
+static void w_tip_layout(w_bar_window *b) {
+    w_popup_anchor anchor;
+    MONITORINFO mi = {.cbSize=sizeof(mi)};
+    if (!w_bar_anchor(b,b->tip.index,&anchor) || !GetMonitorInfoW(MonitorFromWindow(b->hwnd,MONITOR_DEFAULTTONEAREST),&mi)) return;
+    int gap=w_theme_spacing(b->dpi), pad=2*gap;
+    RECT area=w_popup_bounds(&anchor,mi.rcWork,mi.rcWork.right-mi.rcWork.left,mi.rcWork.bottom-mi.rcWork.top,gap);
+    int limit=max(1,min(MulDiv(336,b->dpi,96),area.right-area.left-2*pad));
+    const wchar_t *text[]={b->tip.heading,b->tip.body,b->tip.help};
+    HDC dc=GetDC(b->tip.window);
+    if (!dc) return;
+    HFONT previous=GetCurrentObject(dc,OBJ_FONT);
+    int width=0,height=pad;
+    for (int i=0;i<3;i++) {
+        RECT line={0,0,limit,0};
+        if (!*text[i]) continue;
+        SelectObject(dc,w_tip_font(b,i));
+        w_theme_draw_text(dc,text[i],-1,&line,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX|DT_EDITCONTROL);
+        b->tip.parts[i]=(RECT){pad,height,pad+limit,height+line.bottom};
+        width=max(width,min(limit,line.right));
+        height+=line.bottom+gap;
+    }
+    SelectObject(dc,previous);
+    ReleaseDC(b->tip.window,dc);
+    width=min(width+pad*2,area.right-area.left);
+    height=min(height-gap+pad,area.bottom-area.top);
+    for (int i=0;i<3;i++) {
+        b->tip.parts[i].right=width-pad;
+        b->tip.parts[i].bottom=min(b->tip.parts[i].bottom,height-pad);
+    }
+    RECT pos=w_popup_bounds(&anchor,mi.rcWork,width,height,gap);
+    if (!b->tip.showing) {
+        b->tip.showing=true;
+        if (!IsWindowVisible(b->tip.window)) b->tip.fade.value=0;
+        w_tip_fade(b,true);
+    }
+    SetWindowPos(b->tip.window,HWND_TOPMOST,pos.left,pos.top,width,height,SWP_SHOWWINDOW|SWP_NOACTIVATE);
+    InvalidateRect(b->tip.window,NULL,FALSE);
 }
 
 static void w_tip_present(w_bar_window *b, bool first) {
@@ -228,48 +275,20 @@ static void w_tip_present(w_bar_window *b, bool first) {
     wcscpy(b->tip.help,help);
     if (!b->tip.window) b->tip.window = w_tip_create(b);
     if (!b->tip.window) return;
-    POINT anchor = b->pointer;
-    if (!ClientToScreen(b->hwnd,&anchor)) return;
-    MONITORINFO mi = {.cbSize=sizeof(mi)};
-    if (!GetMonitorInfoW(MonitorFromPoint(anchor,MONITOR_DEFAULTTONEAREST),&mi)) return;
-    RECT area = mi.rcWork;
-    int pad=MulDiv(12,b->dpi,96), gap=MulDiv(7,b->dpi,96);
-    int limit=max(1,min(MulDiv(336,b->dpi,96),area.right-area.left-2*pad));
-    const wchar_t *text[]={heading,body,help};
-    HDC dc=GetDC(b->tip.window);
-    if (!dc) return;
-    HFONT previous=SelectObject(dc,b->font);
-    int width=0,height=pad;
-    for (int i=0;i<3;i++) {
-        RECT line={0,0,limit,0};
-        if (!*text[i]) continue;
-        SelectObject(dc,i ? b->font : b->heading_font);
-        DrawTextW(dc,text[i],-1,&line,DT_CALCRECT|DT_WORDBREAK|DT_NOPREFIX|DT_EDITCONTROL);
-        b->tip.parts[i]=(RECT){pad,height,pad+limit,height+line.bottom};
-        width=max(width,min(limit,line.right));
-        height+=line.bottom+gap;
-    }
-    SelectObject(dc,previous);
-    ReleaseDC(b->tip.window,dc);
-    width=min(width+pad*2,area.right-area.left);
-    height=min(height-gap+pad,area.bottom-area.top);
-    for (int i=0;i<3;i++) b->tip.parts[i].right=width-pad;
-    POINT pos=w_tip_position(b,anchor,area,width,height);
     wchar_t accessible[count_of(heading)+count_of(body)+count_of(help)+2];
     swprintf(accessible,count_of(accessible),L"%ls\n%ls\n%ls",heading,body,help);
     SetWindowTextW(b->tip.window,accessible);
-    SetWindowPos(b->tip.window,HWND_TOPMOST,pos.x,pos.y,width,height,SWP_SHOWWINDOW|SWP_NOACTIVATE);
-    InvalidateRect(b->tip.window,NULL,FALSE);
-    b->tip.showing=true;
+    w_tip_layout(b);
 }
 
 void w_bar_tip_hide(w_bar_window *b) {
     if (b->tip.pending) KillTimer(b->hwnd,bar_tip_show_timer);
     if (b->tip.showing) {
+        b->tip.showing=false;
         KillTimer(b->hwnd,bar_tip_hide_timer);
-        ShowWindow(b->tip.window,SW_HIDE);
+        if (!IsWindowVisible(b->hwnd) || !w_tip_fade(b,false)) ShowWindow(b->tip.window,SW_HIDE);
     }
-    b->tip.showing = b->tip.pending = false;
+    b->tip.pending=false;
 }
 
 void w_bar_tip_track(w_bar_window *b, int index) {

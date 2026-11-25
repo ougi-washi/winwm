@@ -1,4 +1,5 @@
 #include "desktop/desktop.h"
+#include "theme/metrics.h"
 
 ////////////////
 //~ Navigation
@@ -13,7 +14,7 @@ void w_desktop_select(int i) {
 void w_desktop_measure_output(int output) {
     w_output_state *o = &desk.outputs[output];
     w_layout_compute_margins(&desk.model, output, o->work, o->screen, MulDiv(desk.config.gap, o->dpi, 96),
-                           MulDiv(desk.config.outer_gap, o->dpi, 96), MulDiv(30, o->dpi, 96), &o->tab_layout);
+                           MulDiv(desk.config.outer_gap, o->dpi, 96), w_theme_button_size(o->dpi), &o->tab_layout);
 }
 
 void w_desktop_resize_axis(enum split_axis axis, int delta) {

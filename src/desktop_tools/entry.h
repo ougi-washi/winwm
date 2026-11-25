@@ -5,4 +5,4 @@
 //~ Desktop Tools
 
 int w_tools_run(const wchar_t *mode);
-bool w_tools_set_popup(HWND owner, RECT button, const wchar_t *edge, HANDLE cancel);
+bool w_tools_set_popup(HWND owner, const wchar_t *placement_key, HANDLE cancel);

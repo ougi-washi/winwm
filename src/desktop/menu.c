@@ -1,4 +1,5 @@
 #include "desktop/desktop.h"
+#include "providers/providers.h"
 #include <stdio.h>
 
 static wchar_t clip_rows[count_of(desk.clips)][count_of(desk.clips[0])];
@@ -191,7 +192,7 @@ static const w_menu_item menu_items[] = {
     {palette_tools, "Copy display screenshot", "capture"},
     {palette_tools, "Copy window screenshot", "capture_window"},
     {palette_tools, "Copy region screenshot", "capture_region"},
-    {palette_tools, "Record screen region", "record"},
+    {palette_tools, "Start or stop monitor recording", "record"},
     {palette_tools, "Pick screen color", "pick_color"},
     {palette_settings, "Windows Security", "windows_security"},
     {palette_settings, "Windows Settings", "windows_settings"},
@@ -228,7 +229,6 @@ static const w_menu_item menu_items[] = {
     {palette_tools, "Activity monitor", "activity"},
     {palette_settings, "Edit winwm configuration", "edit_config"},
     {palette_settings, "Reload configuration", "reload"},
-    {palette_settings, "Refresh toolbar providers", "provider_refresh"},
     {palette_tools, "Keyboard shortcuts", "shortcuts"},
     {palette_tools, "Open configured task manager", "open_tasks"},
     {palette_session, "Lock computer", "lock"},
@@ -292,6 +292,8 @@ static void w_menu_actions(bool run) {
         if (row_count>previous) entries[previous].keywords=w_menu_keywords(actions[previous].kind);
     }
     group = run ? palette_settings : palette_flat;
+    if (w_providers_need_manual_refresh())
+        w_action_row("Refresh toolbar providers", "provider_refresh");
     w_device_rows();
     group = run ? palette_settings : palette_flat;
     w_action_row(desk.motion_allowed ? "Disable animations" : "Enable animations", "animations_toggle");
@@ -366,14 +368,8 @@ static void w_installed_row(int index, w_palette_entry *row) {
 }
 
 static void w_open_palette(enum command_kind kind, int output, const w_popup_anchor *anchor) {
-    w_palette_site site = {.monitor = desk.outputs[output].monitor};
-    if (anchor) {
-        site.anchor = *anchor;
-        if (desk.motion_allowed) {
-            site.enter = desk.config.motion[motion_layers_in];
-            site.leave = desk.config.motion[motion_layers_out];
-        }
-    }
+    w_palette_site site = {.monitor=desk.outputs[output].monitor,.follow_theme_motion=true};
+    if (anchor) site.anchor=*anchor;
     // A submenu opens after its parent hides. Keep the original application for its actions.
     if (!w_palette_shown() && !dispatching_row) {
         menu_target = GetForegroundWindow();
@@ -454,8 +450,7 @@ void w_desktop_palette(enum command_kind kind, int output) {
 
 void w_desktop_bar_palette(enum command_kind kind, int output, const w_popup_anchor *anchor) {
     const w_popup_anchor *open = w_palette_anchor();
-    if (w_palette_shown() && open && current_palette == kind && open->bar == anchor->bar &&
-        open->source == anchor->source) {
+    if (w_palette_shown() && open && current_palette == kind && w_popup_same_source(open,anchor)) {
         w_palette_close();
         return;
     }
@@ -488,7 +483,7 @@ void w_desktop_focus_menu(int output) {
     if ((unsigned)output >= output_limit || !desk.outputs[output].live) output = palette_output;
     if (output != palette_output || w_palette_anchor()) {
         palette_output = output;
-        w_palette_site site = {.monitor = desk.outputs[output].monitor};
+        w_palette_site site = {.monitor=desk.outputs[output].monitor,.follow_theme_motion=true};
         w_palette_position(&site);
     }
     w_palette_focus();

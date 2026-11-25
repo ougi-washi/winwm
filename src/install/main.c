@@ -1,4 +1,5 @@
 #define WIN32_LEAN_AND_MEAN
+#include "theme/dialog.h"
 #include "os_win32/os_win32.h"
 #include <shlobj.h>
 #include <shellapi.h>
@@ -383,7 +384,7 @@ static void w_report(bool interactive, enum operation op, bool files_busy, DWORD
                             : L"");
     }
     if (interactive)
-        MessageBoxW(NULL, message, L"winwm setup", MB_OK | (error ? MB_ICONERROR : MB_ICONINFORMATION));
+        w_dialog(NULL, message, L"winwm setup", MB_OK | (error ? MB_ICONERROR : MB_ICONINFORMATION));
     else if (AttachConsole(ATTACH_PARENT_PROCESS)) {
         FILE *stream = _wfopen(L"CONOUT$", L"w");
         if (stream) {
@@ -417,7 +418,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show
             : rollback
                 ? L"Use the previous installed winwm release at the next sign-in?"
                 : L"Install winwm and start it alongside Windows each time this account signs in?";
-        if (MessageBoxW(NULL, question, L"winwm setup", MB_YESNO | MB_ICONQUESTION) != IDYES)
+        if (w_dialog(NULL, question, L"winwm setup", MB_YESNO | MB_ICONQUESTION) != IDYES)
             return ERROR_CANCELLED;
     }
     bool files_busy = false;

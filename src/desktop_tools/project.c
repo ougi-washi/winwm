@@ -1,5 +1,6 @@
 #define COBJMACROS
 #include "desktop_tools/tools.h"
+#include "desktop_tools/rows.h"
 #include "theme/theme.h"
 #include "theme/icon_button.h"
 #include <shobjidl.h>
@@ -20,6 +21,7 @@ typedef struct {
 static const wchar_t projects_key[] = L"Software\\winwm\\Projects";
 static HWND panel, label, folder, browse, recent_label, recent, forget, status, terminal, files, editor;
 static HFONT font;
+static w_tool_feedback project_feedback;
 static const w_desktop_config *programs;
 static HANDLE worker;
 static LONG closing;
@@ -78,12 +80,41 @@ static bool w_update_recent(const wchar_t *path, bool remove) {
     return saved;
 }
 
-static void w_recent_list(void) {
+static void w_layout_project(bool resize_font);
+
+static int w_project_height(UINT dpi,int rows,int width) {
+    int side=w_theme_button_size(dpi),gap=w_theme_spacing(dpi);
+    int line=w_theme_role_line_height(dpi,text_body);
+    int feedback=w_tool_feedback_height(status,&project_feedback,width);
+    return line+2*side+6*gap+(rows ? (1+rows)*side+2*gap : 0)+
+           (feedback ? feedback+gap : 0);
+}
+
+static void w_fit_project(bool opening) {
+    bool attached=w_tool_popup_monitor()!=NULL;
+    int count=max(0,(int)SendMessageW(recent,LB_GETCOUNT,0,0));
+    RECT client;
+    w_theme_content_rect(panel,&client);
+    int rows=min(count,attached ? 5 : opening ? 8 : 1);
+    UINT dpi=GetDpiForWindow(panel);
+    int height=w_project_height(dpi,rows,client.right-4*w_theme_spacing(dpi));
+    if (attached || opening || height>client.bottom) w_tool_fit_height(panel,height-client.bottom,opening);
+}
+
+static void w_recent_list(bool opening) {
     w_recent history;
     w_load_recent(&history);
-    SendMessageW(recent,LB_RESETCONTENT,0,0);
-    for (int i=0; i<history.count; i++) SendMessageW(recent,LB_ADDSTRING,0,(LPARAM)history.paths[i]);
+    w_tool_rows items = w_rows_begin(recent);
+    for (int i=0; i<history.count; i++) w_rows_put(&items,history.paths[i],0);
+    w_rows_end(&items,-1,items.top);
+    if (GetFocus()==forget || (!items.written && GetFocus()==recent))
+        SetFocus(items.written ? recent : folder);
     EnableWindow(forget,FALSE);
+    w_tool_visible(recent,items.written>0);
+    w_tool_visible(recent_label,items.written>0);
+    w_tool_visible(forget,items.written>0);
+    w_fit_project(opening);
+    w_layout_project(false);
 }
 
 // Resolve user input without changing the process working directory or interpreting shell commands.
@@ -187,14 +218,14 @@ static void w_start_job(enum project_action action) {
     wchar_t text[os_path_cap];
     GetWindowTextW(folder,text,count_of(text));
     if (!w_project_path(text,job.folder)) {
-        SetWindowTextW(status,L"Enter a valid project folder.");
+        w_tool_status(status,L"Enter a valid project folder.");
         SetFocus(folder);
         return;
     }
     worker = CreateThread(NULL,0,w_project_launch,panel,0,NULL);
-    if (!worker) { SetWindowTextW(status,L"Could not start the project action."); return; }
+    if (!worker) { w_tool_status(status,L"Could not start the project action."); return; }
     w_buttons(true);
-    SetWindowTextW(status,L"Opening project…");
+    w_tool_status(status,L"Opening project…");
 }
 
 static bool w_selected_folder(wchar_t out[os_path_cap]) {
@@ -206,32 +237,36 @@ static bool w_selected_folder(wchar_t out[os_path_cap]) {
 static void w_layout_project(bool resize_font) {
     if (!editor) return;
     UINT dpi = GetDpiForWindow(panel);
-    if (resize_font) {
-        HFONT next = CreateFontW(-MulDiv(15,dpi,96),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,
-                                 DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+    HFONT next = resize_font ? w_theme_message_font(dpi) : NULL;
+    if (next) {
         HWND controls[] = {label,folder,browse,recent_label,recent,forget,status,terminal,files,editor};
         for (size_t i=0; i<count_of(controls); i++) SendMessageW(controls[i],WM_SETFONT,(WPARAM)next,TRUE);
-        SendMessageW(recent,LB_SETITEMHEIGHT,0,MulDiv(32,dpi,96));
         DeleteObject(font);
         font = next;
     }
     RECT client;
-    GetClientRect(panel,&client);
-    int pad = MulDiv(16,dpi,96), gap = MulDiv(8,dpi,96), line = MulDiv(32,dpi,96);
-    int width = max(1,(int)client.right-2*pad), side = min(width/3,line), y = pad;
-    MoveWindow(label,pad,y,width,line,TRUE);
-    y += line;
-    MoveWindow(folder,pad,y,max(1,width-side-gap),line,TRUE);
-    MoveWindow(browse,pad+width-side,y,side,line,TRUE);
-    y += line+pad;
-    MoveWindow(recent_label,pad,y,max(1,width-side-gap),line,TRUE);
-    MoveWindow(forget,pad+width-side,y,side,line,TRUE);
+    w_theme_content_rect(panel,&client);
+    int gap=w_theme_spacing(dpi),pad=2*gap,side=w_theme_button_size(dpi),line=w_theme_role_line_height(dpi,text_body);
+    int width=max(1,(int)client.right-2*pad),y=pad;
+    int feedback=w_tool_feedback_height(status,&project_feedback,width);
+    if (SendMessageW(recent,LB_GETITEMHEIGHT,0,0)!=side) SendMessageW(recent,LB_SETITEMHEIGHT,0,side);
+    w_tool_place(label,pad,y,width,line);
     y += line+gap;
-    int last = client.bottom-pad-line;
-    MoveWindow(recent,pad,y,width,max(1,last-line-gap-y),TRUE);
-    MoveWindow(status,pad,last-line,width,line,TRUE);
+    w_tool_place(folder,pad,y,max(1,width-side-gap),side);
+    w_tool_place(browse,pad+width-side,y,side,side);
+    y += side+gap;
+    int last=y;
+    if (GetWindowLongW(recent,GWL_STYLE)&WS_VISIBLE) {
+        w_tool_place(recent_label,pad,y,max(1,width-side-gap),side);
+        w_tool_place(forget,pad+width-side,y,side,side);
+        y += side+gap;
+        last=client.bottom-pad-side-(feedback ? feedback+gap : 0);
+        w_tool_place(recent,pad,y,width,max(1,last-gap-y));
+    }
+    w_tool_visible(status,feedback);
+    if (feedback) w_tool_place(status,pad,last+side+gap,width,feedback);
     HWND actions[] = {terminal,files,editor};
-    for (int i = 0; i < 3; i++) MoveWindow(actions[i],pad+i*(side+gap),last,side,line,TRUE);
+    for (int i = 0; i < 3; i++) w_tool_place(actions[i],pad+i*(side+gap),last,side,side);
 }
 
 static LRESULT CALLBACK w_project_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
@@ -256,12 +291,12 @@ static LRESULT CALLBACK w_project_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             if (!w_project_path(text,path)) path[0] = 0;
             HRESULT hr = w_pick_path(true,path,text);
             if (SUCCEEDED(hr)) SetWindowTextW(folder,text);
-            else if (hr != HRESULT_FROM_WIN32(ERROR_CANCELLED)) SetWindowTextW(status,L"Folder picker unavailable. Enter a folder path.");
+            else if (hr != HRESULT_FROM_WIN32(ERROR_CANCELLED)) w_tool_status(status,L"Folder picker unavailable. Enter a folder path.");
         } else if (from == forget && HIWORD(wp) == BN_CLICKED && w_selected_folder(path)) {
             if (w_update_recent(path,true)) {
-                w_recent_list();
-                SetWindowTextW(status,L"Removed from recent folders.");
-            } else SetWindowTextW(status,L"Recent folders could not be saved.");
+                w_recent_list(false);
+                w_tool_status(status,L"Removed from recent folders.");
+            } else w_tool_status(status,L"Recent folders could not be saved.");
         } else if ((from == terminal && HIWORD(wp) == BN_CLICKED) || (from == recent && HIWORD(wp) == LBN_DBLCLK)) w_start_job(open_terminal);
         else if (from == files && HIWORD(wp) == BN_CLICKED) w_start_job(open_files);
         else if (from == editor && HIWORD(wp) == BN_CLICKED) w_start_job(choose_document);
@@ -272,24 +307,34 @@ static LRESULT CALLBACK w_project_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         CloseHandle(worker);
         worker = NULL;
         w_buttons(false);
-        if (job.error) SetWindowTextW(status,job.error);
+        if (job.error) w_tool_status(status,job.error);
         else if (job.action == choose_document) {
             HRESULT hr = w_pick_path(false,job.folder,job.file);
             if (SUCCEEDED(hr)) w_start_job(open_editor);
-            else SetWindowTextW(status,hr == HRESULT_FROM_WIN32(ERROR_CANCELLED) ? L"" : L"File picker unavailable.");
+            else w_tool_status(status,hr == HRESULT_FROM_WIN32(ERROR_CANCELLED) ? L"" : L"File picker unavailable.");
         } else if (job.launched && job.saved) DestroyWindow(w);
-        else if (job.launched) SetWindowTextW(status,L"Project opened. Recent folders could not be saved.");
+        else if (job.launched) w_tool_status(status,L"Project opened. Recent folders could not be saved.");
         return 0;
     }
     if (msg == WM_GETMINMAXINFO) {
         UINT dpi = GetDpiForWindow(w);
-        w_tool_minimum(w,(MINMAXINFO *)lp,MulDiv(390,dpi,96),MulDiv(330,dpi,96));
+        int count=recent ? max(0,(int)SendMessageW(recent,LB_GETCOUNT,0,0)) : 0;
+        bool attached=w_tool_popup_monitor()!=NULL;
+        MINMAXINFO *limits=(MINMAXINFO *)lp;
+        RECT client;
+        w_theme_content_rect(w,&client);
+        w_tool_minimum(w,limits,MulDiv(390,dpi,96),
+                       w_project_height(dpi,min(count,attached ? 5 : 1),client.right-4*w_theme_spacing(dpi)));
+        if (attached) limits->ptMaxTrackSize.y=limits->ptMinTrackSize.y;
         return 0;
     }
-    if (msg == WM_SIZE) { if (wp != SIZE_MINIMIZED) w_layout_project(false); return 0; }
-    if (msg == WM_DPICHANGED) {
-        w_tool_resize_for_dpi(w,(RECT *)lp);
+    if (msg==w_tool_feedback_changed || (msg==WM_SIZE && wp!=SIZE_MINIMIZED)) {
+        if (editor) { w_fit_project(false); w_layout_project(false); }
+        return 0;
+    }
+    if (w_tool_font_change(w,msg,wp,lp)) {
         w_layout_project(true);
+        if (editor) w_fit_project(false);
         return 0;
     }
     if (msg == WM_DESTROY) {
@@ -323,13 +368,14 @@ int w_project_run(const w_desktop_config *config) {
     if (!panel) { if (SUCCEEDED(apartment)) CoUninitialize(); return 1; }
     DWORD button = BS_OWNERDRAW | WS_TABSTOP;
     label = w_project_control(L"STATIC",L"Project &folder",SS_CENTERIMAGE,100);
-    folder = w_project_control(L"EDIT",L"",WS_TABSTOP|WS_BORDER|ES_AUTOHSCROLL,101);
+    folder = w_native_field(panel,101,WS_VISIBLE);
     SendMessageW(folder,EM_SETLIMITTEXT,os_path_cap-1,0);
     browse = w_project_control(L"BUTTON",L"Browse…",button,102);
     recent_label = w_project_control(L"STATIC",L"&Recent folders",SS_CENTERIMAGE,103);
     recent = w_project_control(L"LISTBOX",L"Recent folders",WS_TABSTOP|WS_VSCROLL|LBS_NOINTEGRALHEIGHT|LBS_OWNERDRAWFIXED|LBS_HASSTRINGS|LBS_NOTIFY,104);
     forget = w_project_control(L"BUTTON",L"Forget",button,105);
-    status = w_project_control(L"STATIC",L"",SS_CENTERIMAGE|SS_ENDELLIPSIS,106);
+    status = w_project_control(L"STATIC",L"",SS_EDITCONTROL|SS_NOPREFIX,106);
+    w_tool_track_feedback(status,&project_feedback);
     terminal = w_project_control(L"BUTTON",L"Open terminal",button,107);
     files = w_project_control(L"BUTTON",L"Open files",button,108);
     editor = w_project_control(L"BUTTON",L"Edit file…",button,109);
@@ -343,7 +389,7 @@ int w_project_run(const w_desktop_config *config) {
     w_icon_button(terminal,L"\uE756",L"Open terminal in project folder");
     w_icon_button(files,L"\uE8B7",L"Open project folder in file manager");
     w_icon_button(editor,L"\uE70F",L"Choose a project file to edit");
-    w_recent_list();
+    w_recent_list(true);
     wchar_t initial[os_path_cap] = {0};
     if (SendMessageW(recent,LB_SETCURSEL,0,0) != LB_ERR && w_selected_folder(initial)) SetWindowTextW(folder,initial);
     else {
@@ -356,7 +402,9 @@ int w_project_run(const w_desktop_config *config) {
     SendMessageW(folder,EM_SETSEL,0,-1);
     MSG msg;
     while (GetMessageW(&msg,NULL,0,0)>0) {
-        if (msg.message==WM_KEYDOWN && msg.wParam==VK_ESCAPE) { DestroyWindow(panel); continue; }
+        if (w_native_ime_key(&msg)) { TranslateMessage(&msg); DispatchMessageW(&msg); continue; }
+        if (w_tool_repeated_dialog_key(&msg)) continue;
+        if (msg.message==WM_KEYDOWN && msg.wParam==VK_ESCAPE) { SendMessageW(panel,WM_CLOSE,0,0); continue; }
         if (msg.message==WM_KEYDOWN && msg.wParam==VK_RETURN && (msg.hwnd==recent || msg.hwnd==folder)) {
             w_start_job(open_terminal); continue;
         }

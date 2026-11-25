@@ -15,7 +15,7 @@ hl.config({
     },
     decoration = {
         rounding = 2, inactive_opacity = 0.95,
-        panels = { opacity = 0.94, blur = true, shadow = true },
+        panels = { button_size = 32, spacing = 6, opacity = 0.94, blur = true, shadow = true },
     },
     animations = { enabled = "auto" },
     notifications = {

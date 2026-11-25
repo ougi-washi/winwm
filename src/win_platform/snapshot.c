@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <math.h>
-enum { cache_limit = 512 * 1024, cache_format = 14 };
+enum { cache_limit = 512 * 1024, cache_format = 15 };
 
 ////////////////
 //~ Snapshot
@@ -79,6 +79,11 @@ static void w_contents(w_cache_stream *s, w_desktop_config *c) {
     w_field(s, &c->border_size, sizeof(int));
     w_field(s, &c->rounding, sizeof(int));
     w_field(s,&c->panel_material.opacity,sizeof(int));
+    w_field(s, &c->panel_metrics.button_size, sizeof(int));
+    w_field(s, &c->panel_metrics.spacing, sizeof(int));
+    if (c->panel_metrics.button_size < button_size_min || c->panel_metrics.button_size > button_size_max ||
+        c->panel_metrics.spacing < panel_spacing_min || c->panel_metrics.spacing > panel_spacing_max)
+        s->ok = false;
     unsigned char panel_flags = s->writing ? c->panel_material.blur | (c->panel_material.shadow << 1) : 0;
     w_field(s,&panel_flags,sizeof(panel_flags));
     if ((unsigned)c->panel_material.opacity > 255 || panel_flags > 3) s->ok = false;

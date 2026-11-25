@@ -322,6 +322,12 @@ bool w_providers_value(const char *name, w_provider_value *value, char *action, 
     return false;
 }
 
+bool w_providers_need_manual_refresh(void) {
+    for (int i=0;i<slot_count;++i)
+        if (!slots[i].spec.interval && !slots[i].run && !slots[i].due) return true;
+    return false;
+}
+
 void w_providers_refresh(void) {
     for (int i = 0; i < slot_count; i++)
         if (!slots[i].run)

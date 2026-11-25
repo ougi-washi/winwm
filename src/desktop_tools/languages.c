@@ -1,9 +1,11 @@
 #define COBJMACROS
+#include "theme/dialog.h"
+#include "theme/disclosure.h"
 #include "desktop_tools/tools.h"
+#include "desktop_tools/rows.h"
 #include "theme/theme.h"
 #include "theme/icon_button.h"
 #include <commctrl.h>
-#include <imm.h>
 #include <msctf.h>
 #include <oleauto.h>
 #include <shellapi.h>
@@ -22,6 +24,11 @@ static w_input_choice *choices;
 static size_t used, capacity;
 static HWND panel, category, search, results, add, make_default, status, remove_lang, typing, test_label, methods, basic;
 static HFONT font;
+static const wchar_t *const categories[]={L"Languages",L"Keyboard layouts",L"Input methods"};
+static const wchar_t test_caption[]=L"Test input";
+static int category_ink,test_ink;
+static w_tool_feedback language_feedback;
+static void w_layout_test_row(void);
 static HANDLE applying;
 static ITfInputProcessorProfiles *profiles;
 static ITfThreadMgr *thread_manager;
@@ -31,6 +38,9 @@ typedef enum w_input_operation { language_add, language_remove, basic_typing } w
 static w_input_operation operation;
 static w_input_page page;
 static int dpi;
+static w_tool_choice category_choice;
+enum { test_row_timer=41 };
+static w_disclosure test_row;
 
 static int px(int n) { return MulDiv(n, dpi, 96); }
 
@@ -180,11 +190,11 @@ static void w_buttons(void) {
                   c && !c->enabled ? L"Enable and test input method" : L"Test input method");
 }
 
-static void w_filter_choices(void) {
+static void w_filter_choices(const w_input_choice *selection,bool editing_query) {
     wchar_t query[128];
     GetWindowTextW(search, query, count_of(query));
-    SendMessageW(results, WM_SETREDRAW, FALSE, 0);
-    SendMessageW(results, LB_RESETCONTENT, 0, 0);
+    w_tool_rows items=w_rows_begin(results);
+    int selected = -1;
     for (size_t i = 0; i < used; i++) {
         const w_input_choice *c = &choices[i];
         if (!w_contains(c->name, query) && !w_contains(c->id, query) && !w_contains(c->native, query))
@@ -193,15 +203,17 @@ static void w_filter_choices(void) {
         swprintf(row, count_of(row), L"%ls   \u00b7   %ls%ls", c->name,
                  page != input_languages && *c->native ? c->native : c->id,
                  c->enabled ? (page == input_languages ? L"   \u00b7   Added" : L"   \u00b7   Enabled") : L"");
-        LRESULT n = SendMessageW(results, LB_ADDSTRING, 0, (LPARAM)row);
-        if (n >= 0) SendMessageW(results, LB_SETITEMDATA, n, i);
+        int index = w_rows_put(&items,row,i);
+        if (selection && !_wcsicmp(c->id,selection->id) &&
+            IsEqualGUID(&c->service,&selection->service) && IsEqualGUID(&c->profile,&selection->profile))
+            selected = index;
     }
-    bool any = SendMessageW(results, LB_SETCURSEL, 0, 0) != LB_ERR;
-    SendMessageW(results, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(results, NULL, TRUE);
+    bool any = items.written > 0;
+    int top=selected<0 ? 0 : editing_query ? w_rows_show_selection : items.top;
+    w_rows_end(&items,selected >= 0 ? selected : any ? 0 : -1,top);
     w_buttons();
     if (!applying)
-        SetWindowTextW(status, !any ? (page == input_methods && !used ? L"No keyboard input methods are registered for your languages." :
+        w_tool_status(status,!any ? (page == input_methods && !used ? L"No keyboard input methods are registered for your languages." :
                           L"No matches") : page == input_methods ? L"Select an input method to try it here." :
                           page == input_languages ? L"Added languages appear first." : L"Select a keyboard layout.");
 }
@@ -221,6 +233,7 @@ static void w_load_choices(bool keep_query) {
     if (restore) saved = *selected;
     used = 0;
     page = (w_input_page)SendMessageW(category, CB_GETCURSEL, 0, 0);
+    category_choice.row = page;
     if (page == input_keyboards) w_keyboards();
     else if (page == input_methods) w_input_methods();
     else {
@@ -239,25 +252,14 @@ static void w_load_choices(bool keep_query) {
     ShowWindow(remove_lang, page == input_languages ? SW_SHOW : SW_HIDE);
     ShowWindow(make_default, page != input_languages ? SW_SHOW : SW_HIDE);
     ShowWindow(methods, page != input_methods ? SW_SHOW : SW_HIDE);
-    ShowWindow(typing, page == input_methods ? SW_SHOW : SW_HIDE);
-    ShowWindow(test_label, page == input_methods ? SW_SHOW : SW_HIDE);
+    if (page!=input_methods && GetFocus()==typing) SetFocus(search);
+    EnableWindow(typing,page==input_methods);
+    w_disclosure_to(panel,&test_row,test_row_timer,page==input_methods);
     ShowWindow(basic, page == input_methods ? SW_SHOW : SW_HIDE);
-    if (!keep_query) SetWindowTextW(search, L"");
-    w_filter_choices();
-    if (restore) {
-        LRESULT rows = SendMessageW(results, LB_GETCOUNT, 0, 0);
-        for (LRESULT row = 0; row < rows; row++) {
-            size_t i = (size_t)SendMessageW(results, LB_GETITEMDATA, row, 0);
-            if (i < used && !_wcsicmp(choices[i].id, saved.id) &&
-                IsEqualGUID(&choices[i].service, &saved.service) && IsEqualGUID(&choices[i].profile, &saved.profile)) {
-                SendMessageW(results, LB_SETCURSEL, row, 0);
-                w_buttons();
-                break;
-            }
-        }
-    }
+    if (!keep_query && GetWindowTextLengthW(search)) SetWindowTextW(search, L"");
+    w_filter_choices(restore ? &saved : NULL,false);
     w_layout();
-    SetFocus(search);
+    if (!keep_query) SetFocus(search);
 }
 
 // Keep the original International objects and their input tips, order and options.
@@ -294,20 +296,24 @@ static HANDLE w_change_language(const wchar_t *tag, bool remove) {
 
 static void w_try_method(w_input_choice *c) {
     if (!profiles || !thread_manager) {
-        SetWindowTextW(status, L"Windows Text Services could not start.");
+        w_tool_status(status,L"Windows Text Services could not start.");
         return;
     }
     if (!c->enabled) {
         if (ITfInputProcessorProfiles_EnableLanguageProfile(profiles, &c->service, c->lang, &c->profile, TRUE) != S_OK) {
-            SetWindowTextW(status, L"Windows could not enable this input method.");
+            w_tool_status(status,L"Windows could not enable this input method.");
             return;
         }
         w_load_choices(true);
         c = w_selected();
         if (!c || !c->enabled) {
-            SetWindowTextW(status, L"Windows did not enable this input method.");
+            w_tool_status(status,L"Windows did not enable this input method.");
             return;
         }
+    }
+    if (test_row.running) {
+        w_disclosure_stop(panel,&test_row,test_row_timer,true);
+        w_layout_test_row();
     }
     SetFocus(typing);
     HRESULT hr = ITfInputProcessorProfiles_ChangeCurrentLanguage(profiles, c->lang);
@@ -317,7 +323,7 @@ static void w_try_method(w_input_choice *c) {
     LANGID lang = 0;
     if (hr != S_OK || ITfInputProcessorProfiles_GetActiveLanguageProfile(profiles, &c->service, &lang, &active) != S_OK ||
             lang != c->lang || !IsEqualGUID(&active, &c->profile)) {
-        SetWindowTextW(status, L"Windows could not activate this method. Check that its language is added.");
+        w_tool_status(status,L"Windows could not activate this method. Check that its language is added.");
         return;
     }
     if (PRIMARYLANGID(c->lang) == LANG_JAPANESE) {
@@ -329,9 +335,9 @@ static void w_try_method(w_input_choice *c) {
                 ImmSetConversionStatus(ctx, (conversion & ~IME_CMODE_KATAKANA) | IME_CMODE_NATIVE | IME_CMODE_FULLSHAPE, sentence);
             ImmReleaseContext(typing, ctx);
         }
-        SetWindowTextW(status, L"Type kana, then Enter. If it stays Latin, select Hiragana or install basic typing.");
+        w_tool_status(status,L"Type kana, then Enter. If it stays Latin, select Hiragana or install basic typing.");
     } else {
-        SetWindowTextW(status, L"Input method active. Type in the field below.");
+        w_tool_status(status,L"Input method active. Type in the field below.");
     }
 }
 
@@ -340,7 +346,7 @@ static void w_busy(const wchar_t *message) {
     EnableWindow(search, FALSE);
     EnableWindow(results, FALSE);
     w_buttons();
-    SetWindowTextW(status, message);
+    w_tool_status(status,message);
 }
 
 static void w_install_typing(const w_input_choice *c) {
@@ -349,7 +355,7 @@ static void w_install_typing(const w_input_choice *c) {
     if (!*c->id || c->id[wcsspn(c->id, L"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-")] ||
         !n || n >= count_of(system) ||
         swprintf(exe, count_of(exe), L"%ls\\WindowsPowerShell\\v1.0\\powershell.exe", system) < 0) {
-        SetWindowTextW(status, L"Windows language servicing could not start.");
+        w_tool_status(status,L"Windows language servicing could not start.");
         return;
     }
     int len = swprintf(args, count_of(args),
@@ -367,7 +373,7 @@ static void w_install_typing(const w_input_choice *c) {
         .lpFile = exe, .lpParameters = args, .lpDirectory = system, .nShow = SW_HIDE,
         .fMask = SEE_MASK_NOCLOSEPROCESS | SEE_MASK_FLAG_NO_UI};
     if (!ShellExecuteExW(&launch) || !launch.hProcess) {
-        SetWindowTextW(status, GetLastError() == ERROR_CANCELLED ? L"Basic typing installation canceled." :
+        w_tool_status(status,GetLastError() == ERROR_CANCELLED ? L"Basic typing installation canceled." :
                                                                L"Windows could not start language servicing.");
         return;
     }
@@ -399,15 +405,15 @@ static void w_apply_choice(HWND action) {
         }
         HMODULE input = LoadLibraryExW(L"input.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
         typedef BOOL (WINAPI *update_fn)(LPCWSTR, DWORD);
-        update_fn install = input ? (update_fn)GetProcAddress(input, "InstallLayoutOrTip") : NULL;
-        update_fn set = input ? (update_fn)GetProcAddress(input, "SetDefaultLayoutOrTip") : NULL;
+        update_fn install = input ? (update_fn)(void *)GetProcAddress(input, "InstallLayoutOrTip") : NULL;
+        update_fn set = input ? (update_fn)(void *)GetProcAddress(input, "SetDefaultLayoutOrTip") : NULL;
         bool enabled = install && install(tip, 0);
         const wchar_t *message = enabled ? L"Keyboard enabled. Select it from the toolbar." : L"Windows could not enable this keyboard.";
         if (action == make_default && enabled)
             message = set && set(tip, 0) ? L"Default keyboard updated." : L"Keyboard enabled. Windows could not set the default.";
         if (input) FreeLibrary(input);
         if (enabled) w_load_choices(true);
-        SetWindowTextW(status, message);
+        w_tool_status(status,message);
         return;
     }
     bool removing = action == remove_lang;
@@ -415,70 +421,119 @@ static void w_apply_choice(HWND action) {
         if (!c->enabled || preferred_count <= 1) return;
         wchar_t prompt[384];
         swprintf(prompt, count_of(prompt), L"Remove %ls and its input methods from your preferred languages?", c->name);
-        if (MessageBoxW(panel, prompt, L"Remove language", MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION) != IDYES) return;
+        if (w_dialog(panel, prompt, L"Remove language", MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION) != IDYES) return;
     } else if (c->enabled) {
-        SetWindowTextW(status, L"This language is already in your preferred languages.");
+        w_tool_status(status,L"This language is already in your preferred languages.");
         return;
     }
     applying = w_change_language(c->id, removing);
     if (!applying) {
-        SetWindowTextW(status, L"Windows language setup could not start.");
+        w_tool_status(status,L"Windows language setup could not start.");
         return;
     }
     operation = removing ? language_remove : language_add;
     w_busy(removing ? L"Removing language\u2026" : L"Adding language\u2026");
 }
 
-static void w_place(HWND child, int x, int y, int width, int height) {
-    MoveWindow(child, x, y, max(1, width), max(1, height), TRUE);
+static void w_place_test_field(HWND field,int x,int y,int width,int height,int reveal) {
+    bool shown=(GetWindowLongW(field,GWL_STYLE)&WS_VISIBLE)!=0;
+    if (!reveal) {
+        if (shown) ShowWindow(field,SW_HIDE);
+        return;
+    }
+    w_tool_place(field,x,y,width,height);
+    RECT portion={0,height-reveal,width,height};
+    w_disclosure_clip(field,reveal<height ? &portion : NULL);
+    if (!shown) ShowWindow(field,SW_SHOWNA);
+}
+
+static void w_layout_test_row(void) {
+    if (!panel || !methods) return;
+    RECT r;
+    w_theme_content_rect(panel, &r);
+    int gap = w_theme_spacing(dpi), pad = 2*gap, width = r.right - 2*pad;
+    int icon = w_theme_button_size(dpi);
+    int actions_y = r.bottom-pad-icon;
+    int test_y = actions_y-gap-icon;
+    int extent=MulDiv(icon+gap,test_row.value,255);
+    int feedback_height=w_tool_feedback_height(status,&language_feedback,width);
+    int list_top=pad+icon+gap;
+    int status_height=min(feedback_height,max(1,actions_y-extent-2*gap-list_top-icon));
+    int status_y = actions_y-extent-gap-status_height;
+    w_tool_place(results,pad,list_top,width,status_y-gap-list_top);
+    w_tool_place(status, pad, status_y, width, status_height);
+    int label_width = min(test_ink,max(1,(width-gap)/2));
+    int reveal=max(0,extent-gap);
+    w_place_test_field(test_label,pad,test_y,label_width,icon,reveal);
+    w_place_test_field(typing,pad+label_width+gap,test_y,width-label_width-gap,icon,reveal);
 }
 
 static void w_layout(void) {
     if (!panel || !methods) return;
     RECT r;
-    GetClientRect(panel, &r);
-    int pad = px(16), gap = px(8), width = r.right - 2*pad;
-    int category_width = min(px(150), width/2);
-    int actions_y = r.bottom-pad-px(34);
-    int test_y = actions_y-gap-px(34);
-    int status_y = (page == input_methods ? test_y : actions_y)-gap-px(44);
-    int results_y = pad+px(32)+gap;
-    int icon = px(34);
-    w_place(category, pad, pad, category_width, px(180));
-    w_place(search, pad+category_width+gap, pad, width-category_width-gap, px(30));
-    w_place(results, pad, results_y, width, status_y-gap-results_y);
-    w_place(status, pad, status_y, width, px(44));
-    int label_width = px(78);
-    w_place(test_label, pad, test_y, label_width, px(34));
-    w_place(typing, pad+label_width+gap, test_y, width-label_width-gap, px(34));
-    w_place(add, pad, actions_y, icon, icon);
-    w_place(remove_lang, pad+icon+gap, actions_y, icon, icon);
-    w_place(make_default, pad+icon+gap, actions_y, icon, icon);
-    int more = min(px(172),width-2*(icon+gap));
-    w_place(methods, pad+width-more, actions_y, more, icon);
-    w_place(basic, pad+width-more, actions_y, more, icon);
+    w_theme_content_rect(panel,&r);
+    int gap=w_theme_spacing(dpi),pad=2*gap,width=r.right-2*pad;
+    int icon=w_theme_button_size(dpi),category_width=min(w_tool_selector_width(category,category_ink,dpi),width/2);
+    int actions_y=r.bottom-pad-icon;
+    if (SendMessageW(results,LB_GETITEMHEIGHT,0,0)!=icon) SendMessageW(results,LB_SETITEMHEIGHT,0,icon);
+    w_tool_place_combo(category,pad,pad,category_width,icon,4);
+    w_tool_place(search,pad+category_width+gap,pad,width-category_width-gap,icon);
+    w_layout_test_row();
+    w_tool_place(add, pad, actions_y, icon, icon);
+    w_tool_place(remove_lang, pad+icon+gap, actions_y, icon, icon);
+    w_tool_place(make_default, pad+icon+gap, actions_y, icon, icon);
+    int more = icon;
+    w_tool_place(methods, pad+width-more, actions_y, more, icon);
+    w_tool_place(basic, pad+width-more, actions_y, more, icon);
 }
 
 static void w_font(void) {
-    HFONT next = CreateFontW(-px(15),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+    HFONT next = w_theme_message_font(dpi);
     if (!next) return;
     for (HWND child = GetWindow(panel, GW_CHILD); child; child = GetWindow(child, GW_HWNDNEXT))
         SendMessageW(child, WM_SETFONT, (WPARAM)next, TRUE);
     if (font) DeleteObject(font);
     font = next;
-    SendMessageW(results, LB_SETITEMHEIGHT, 0, px(30));
+    category_ink=w_tool_widest_option(font,categories,count_of(categories));
+    test_ink=w_theme_text_width(font,test_caption,DT_NOPREFIX);
 }
 
 static LRESULT CALLBACK w_setup_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     LRESULT themed;
     if (w_theme_message(w, msg, wp, lp, &themed)) return themed;
+    if (msg==w_tool_feedback_changed) { w_layout_test_row(); return 0; }
+    if (msg==WM_TIMER && wp==test_row_timer) {
+        if (test_row.running) {
+            w_disclosure_tick(w,&test_row,test_row_timer);
+            w_layout_test_row();
+        }
+        return 0;
+    }
+    if (test_row.running && (msg==winwm_motion_updated ||
+        (msg==WM_SETTINGCHANGE && (wp==SPI_SETCLIENTAREAANIMATION || wp==SPI_SETHIGHCONTRAST)))) {
+        w_disclosure_to(w,&test_row,test_row_timer,page==input_methods);
+        w_layout_test_row();
+    }
+    if (msg==WM_SHOWWINDOW && !wp && test_row.running) {
+        w_disclosure_stop(w,&test_row,test_row_timer,page==input_methods);
+        w_layout_test_row();
+    }
+    // Resizing can synchronously request the minimum track size at the new DPI.
+    if (msg == WM_DPICHANGED) dpi = HIWORD(wp);
+    if (w_tool_font_change(w,msg,wp,lp)) {
+        if (panel) {
+            w_font();
+            w_layout();
+        }
+        return 0;
+    }
     switch (msg) {
     case WM_COMMAND: {
         HWND source = (HWND)lp;
-        if (source == category && HIWORD(wp) == CBN_SELCHANGE)
+        if (source == category && w_tool_choice_changed(&category_choice,category,HIWORD(wp)))
             w_load_choices(false);
         else if (source == search && HIWORD(wp) == EN_CHANGE)
-            w_filter_choices();
+            w_filter_choices(w_selected(),true);
         else if (source == results && HIWORD(wp) == LBN_SELCHANGE)
             w_buttons();
         else if (source == results && HIWORD(wp) == LBN_DBLCLK)
@@ -498,16 +553,13 @@ static LRESULT CALLBACK w_setup_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_SIZE:
         w_layout();
         return 0;
-    case WM_DPICHANGED:
-        dpi = HIWORD(wp);
-        w_font();
-        w_tool_resize_for_dpi(w, (const RECT *)lp);
-        w_layout();
+    case WM_GETMINMAXINFO: {
+        int minimum = 4*w_theme_button_size(dpi)+8*w_theme_spacing(dpi)+2*w_theme_role_line_height(dpi,text_body);
+        w_tool_minimum(w, (MINMAXINFO *)lp, px(435), minimum);
         return 0;
-    case WM_GETMINMAXINFO:
-        w_tool_minimum(w, (MINMAXINFO *)lp, px(435), px(345));
-        return 0;
+    }
     case WM_DESTROY:
+        w_disclosure_stop(w,&test_row,test_row_timer,false);
         PostQuitMessage(0);
         return 0;
     }
@@ -520,16 +572,6 @@ static HWND w_control(int id, const wchar_t *cls, const wchar_t *text, DWORD sty
                          panel, (HMENU)(INT_PTR)id, GetModuleHandleW(NULL), NULL);
 }
 
-static bool w_ime_composing(HWND edit) {
-    HIMC ctx = ImmGetContext(edit);
-    if (!ctx) return false;
-    DWORD lists = 0;
-    bool active = ImmGetCompositionStringW(ctx, GCS_COMPSTR, NULL, 0) > 0 ||
-                  (ImmGetCandidateListCountW(ctx, &lists) > 0 && lists);
-    ImmReleaseContext(edit, ctx);
-    return active;
-}
-
 int w_language_setup(w_input_page start_page) {
     HINSTANCE instance = GetModuleHandleW(NULL);
     WNDCLASSW wc = {.lpfnWndProc = w_setup_proc, .hInstance = instance,
@@ -537,22 +579,26 @@ int w_language_setup(w_input_page start_page) {
     RegisterClassW(&wc);
     MONITORINFO mi = {.cbSize = sizeof(mi)};
     dpi = (int)w_tool_work_area(&mi);
-    RECT r = {0, 0, px(540), px(430)};
-    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX;
-    AdjustWindowRectExForDpi(&r, style, FALSE, WS_EX_TOOLWINDOW, dpi);
+    int side=w_theme_button_size(dpi),gap=w_theme_spacing(dpi);
+    int height_hint=10*side+7*gap+w_theme_role_line_height(dpi,text_body);
+    if (start_page==input_methods) height_hint+=gap;
+    RECT r = {0, 0, px(540), height_hint};
+    DWORD style = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX | WS_CLIPCHILDREN;
+    w_theme_adjust_rect(&r, style, WS_EX_TOOLWINDOW, dpi);
     int width = min(r.right-r.left, mi.rcWork.right-mi.rcWork.left);
     int height = min(r.bottom-r.top, mi.rcWork.bottom-mi.rcWork.top);
     panel = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Input setup", style,
                             (mi.rcWork.left + mi.rcWork.right - width)/2, (mi.rcWork.top + mi.rcWork.bottom - height)/2,
                             width, height, NULL, NULL, instance, NULL);
     if (!panel) return 1;
-    category = w_control(101, L"COMBOBOX", L"Category", CBS_DROPDOWNLIST);
-    search = w_control(102, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL);
+    category = w_control(101, L"COMBOBOX", L"Category", w_tool_dropdown_list);
+    search = w_native_field(panel,102,WS_VISIBLE);
     results = w_control(103, L"LISTBOX", L"Available choices", WS_VSCROLL | LBS_NOINTEGRALHEIGHT |
                         LBS_NOTIFY | LBS_OWNERDRAWFIXED | LBS_HASSTRINGS);
-    status = w_control(107, L"STATIC", L"", SS_LEFT | SS_NOPREFIX);
-    test_label = w_control(109, L"STATIC", L"Test input", SS_CENTERIMAGE);
-    typing = w_control(108, L"EDIT", L"", WS_BORDER | ES_AUTOHSCROLL);
+    status = w_control(107,L"STATIC",L"",SS_EDITCONTROL|SS_NOPREFIX);
+    w_tool_track_feedback(status,&language_feedback);
+    test_label = w_control(109, L"STATIC", test_caption, SS_CENTERIMAGE);
+    typing = w_native_field(panel,108,WS_VISIBLE);
     add = w_control(104, L"BUTTON", L"Add language", BS_OWNERDRAW);
     remove_lang = w_control(105, L"BUTTON", L"Remove language", BS_OWNERDRAW);
     make_default = w_control(106, L"BUTTON", L"Set as default", BS_OWNERDRAW);
@@ -564,6 +610,8 @@ int w_language_setup(w_input_page start_page) {
     }
     w_icon_button(remove_lang,L"\uE738",L"Remove selected language");
     w_icon_button(make_default,L"\uE734",L"Set selected keyboard or input method as default");
+    w_icon_button(methods,L"\uE765",L"Manage input methods for the selected language");
+    w_icon_button(basic,L"\uE896",L"Install basic typing for the selected language…");
     HRESULT com = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     TfClientId client = 0;
     if (SUCCEEDED(com)) {
@@ -578,9 +626,7 @@ int w_language_setup(w_input_page start_page) {
     }
     w_font();
     SendMessageW(typing, EM_SETCUEBANNER, TRUE, (LPARAM)L"Type here to test your input method");
-    SendMessageW(category, CB_ADDSTRING, 0, (LPARAM)L"Languages");
-    SendMessageW(category, CB_ADDSTRING, 0, (LPARAM)L"Keyboard layouts");
-    SendMessageW(category, CB_ADDSTRING, 0, (LPARAM)L"Input methods");
+    for (size_t i=0;i<count_of(categories);i++) SendMessageW(category,CB_ADDSTRING,0,(LPARAM)categories[i]);
     SendMessageW(category, CB_SETCURSEL, start_page, 0);
     w_load_choices(false);
     if (w_tool_show(panel)) {
@@ -604,14 +650,14 @@ int w_language_setup(w_input_page start_page) {
             if (operation == basic_typing) {
                 wchar_t error[160];
                 swprintf(error, count_of(error), L"Basic typing could not be installed (0x%08lx). Check Windows Update or your servicing policy.", code);
-                SetWindowTextW(status, code == 0 ? L"Basic typing installed. Select the input method and try typing." :
+                w_tool_status(status,code == 0 ? L"Basic typing installed. Select the input method and try typing." :
                                code == 2 ? L"Basic typing is already installed." :
                                code == 4 ? L"Windows does not offer basic typing for this language." :
                                code == 5 ? L"Restart Windows to finish installing basic typing." :
                                code == 6 ? L"Restart Windows to finish the pending removal, then try again." : error);
             } else {
                 bool removing = operation == language_remove;
-                SetWindowTextW(status, code == 0 ? (removing ? L"Language removed." : L"Language added. Choose Input methods to try it.") :
+                w_tool_status(status,code == 0 ? (removing ? L"Language removed." : L"Language added. Choose Input methods to try it.") :
                                code == 2 ? (removing ? L"This language was already removed." : L"This language is already added.") :
                                code == 3 ? L"Keep at least one preferred language." : L"Windows could not update your preferred languages.");
             }
@@ -620,9 +666,10 @@ int w_language_setup(w_input_page start_page) {
             if (msg.message == WM_QUIT) { done = true; break; }
             bool navigation = msg.message == WM_KEYDOWN && (msg.wParam == VK_TAB || msg.wParam == VK_RETURN ||
                               msg.wParam == VK_ESCAPE || msg.wParam == VK_DOWN);
-            // Let native edit/IME processing commit, cancel or navigate candidates first.
-            if ((msg.hwnd == typing && !(navigation && msg.wParam == VK_TAB)) ||
-                (navigation && (msg.hwnd == search || msg.hwnd == typing) && w_ime_composing(msg.hwnd))) {
+            // An active IME gets the first chance to commit or dismiss its candidates.
+            bool composing = w_native_ime_key(&msg);
+            if (!composing && w_tool_repeated_dialog_key(&msg)) continue;
+            if (composing || (msg.hwnd == typing && !(navigation && (msg.wParam == VK_TAB || msg.wParam == VK_ESCAPE)))) {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
             } else if (msg.message == WM_KEYDOWN && msg.wParam == VK_ESCAPE &&

@@ -1,4 +1,5 @@
 #include "desktop/desktop.h"
+#include "theme/theme.h"
 #include <limits.h>
 #include <stdlib.h>
 
@@ -17,6 +18,8 @@ static struct {
 static HWND indicator;
 static bool preview_pending;
 static w_rect shown;
+static COLORREF indicator_color=CLR_INVALID;
+static bool indicator_contrast;
 
 bool w_desktop_resizing(void) {
     return grab.kind == drag_splits;
@@ -52,9 +55,18 @@ static LRESULT CALLBACK w_indicator_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM 
     if (msg == WM_PAINT) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(hwnd, &ps);
-        uint32_t color = desk.config.accent;
-        SetDCBrushColor(dc, RGB(color >> 16, color >> 8, color));
+        RECT r;GetClientRect(hwnd,&r);
+        SetDCBrushColor(dc,indicator_color ^ 0xffffffu);
         FillRect(dc, &ps.rcPaint, GetStockObject(DC_BRUSH));
+        int saved=SaveDC(dc);
+        SelectObject(dc,GetStockObject(DC_PEN));
+        SelectObject(dc,GetStockObject(indicator_contrast ? NULL_BRUSH : DC_BRUSH));
+        SetDCPenColor(dc,indicator_color);
+        SetDCBrushColor(dc,indicator_color);
+        int curve=2*w_theme_radius(GetDpiForWindow(hwnd));
+        if (curve) RoundRect(dc,0,0,r.right,r.bottom,curve,curve);
+        else Rectangle(dc,0,0,r.right,r.bottom);
+        RestoreDC(dc,saved);
         EndPaint(hwnd, &ps);
         return 0;
     }
@@ -80,11 +92,20 @@ void w_desktop_drag_preview(void) {
                                     wc.lpszClassName, NULL, WS_POPUP, 0,0,0,0, NULL,NULL,instance,NULL);
         if (!indicator)
             return;
-        SetLayeredWindowAttributes(indicator, 0, 82, LWA_ALPHA);
+    }
+    COLORREF color=desk.high_contrast ? GetSysColor(COLOR_HIGHLIGHT) : w_theme_accent();
+    if (color!=indicator_color || desk.high_contrast!=indicator_contrast) {
+        if (!SetLayeredWindowAttributes(indicator,color ^ 0xffffffu,desk.high_contrast ? 255 : 82,LWA_ALPHA|LWA_COLORKEY))
+            return;
+        indicator_color=color;
+        indicator_contrast=desk.high_contrast;
+        InvalidateRect(indicator,NULL,FALSE);
     }
     if (!w_rect_equal(next, shown) || !IsWindowVisible(indicator)) {
+        bool resized=next.w!=shown.w || next.h!=shown.h;
         shown = next;
         SetWindowPos(indicator, HWND_TOPMOST, next.x, next.y, next.w, next.h, SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        if (resized) InvalidateRect(indicator,NULL,FALSE);
     }
 }
 

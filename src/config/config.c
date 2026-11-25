@@ -163,6 +163,7 @@ void w_config_defaults(w_desktop_config *c) {
     c->resize_on_border = true;
     c->rounding = 2;
     c->panel_material = (w_panel_material){.opacity = 240, .blur = true, .shadow = true};
+    c->panel_metrics = (w_panel_metrics){button_size_default, panel_spacing_default};
     c->animations = motion_system;
     const int ms[motion_count] = {160, 190, 180, 140, 140, 160, 120, 160, 140};
     for (int i = 0; i < motion_count; i++)

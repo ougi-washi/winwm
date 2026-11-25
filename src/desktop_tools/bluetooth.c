@@ -1,4 +1,8 @@
+#include "theme/dialog.h"
 #include "desktop_tools/bluetooth.h"
+#include "desktop_tools/rows.h"
+#include "desktop_tools/tools.h"
+#include "theme/icon_button.h"
 #include <bluetoothapis.h>
 #include <setupapi.h>
 #include <cfgmgr32.h>
@@ -18,15 +22,18 @@ static struct {
 
 typedef struct {
     LONG refs;
-    bool inquire;
+    bool inquire, has_radio, complete;
     BLUETOOTH_DEVICE_INFO *devices;
     int count, capacity;
     wchar_t message[256];
 } w_bt_result;
 
-static HWND panel, devices_list, status_text, action_button, scan_button;
+static HWND panel, devices_list, status_text, action_button;
 static HANDLE scan_thread;
 static w_bt_result *pending, *shown;
+static bool refresh_after_action, device_changed;
+static ULONGLONG next_inquiry;
+enum { discovery_interval_ms = 60000 };
 
 static void w_release_result(w_bt_result *result) {
     if (result && !InterlockedDecrement(&result->refs)) {
@@ -59,14 +66,17 @@ static DWORD WINAPI w_query_devices(void *arg) {
     BLUETOOTH_FIND_RADIO_PARAMS params = {.dwSize = sizeof(params)};
     HBLUETOOTH_RADIO_FIND radios = api.first_radio(&params, &radio);
     if (!radios) {
+        DWORD error = GetLastError();
+        result->complete = error == ERROR_NO_MORE_ITEMS || error == ERROR_NOT_FOUND;
         wcscpy(result->message, L"No active Bluetooth radio. Check the adapter and its driver.");
         w_adapter_status(result->message, count_of(result->message));
     } else {
+        result->has_radio = true;
         CloseHandle(radio);
         api.close_radio(radios);
         // A null hRadio enumerates devices across all installed radios.
         BLUETOOTH_DEVICE_SEARCH_PARAMS search = {.dwSize = sizeof(search), .fReturnAuthenticated = TRUE,
-            .fReturnRemembered = TRUE, .fReturnConnected = TRUE, .fReturnUnknown = result->inquire,
+            .fReturnRemembered = TRUE, .fReturnConnected = TRUE, .fReturnUnknown = TRUE,
             .fIssueInquiry = result->inquire, .cTimeoutMultiplier = 4};
         BLUETOOTH_DEVICE_INFO info = {.dwSize = sizeof(info)};
         HBLUETOOTH_DEVICE_FIND find = api.first(&search, &info);
@@ -88,21 +98,21 @@ static DWORD WINAPI w_query_devices(void *arg) {
         }
         if (error && error != ERROR_NO_MORE_ITEMS && error != ERROR_NOT_FOUND)
             swprintf(result->message, count_of(result->message), L"Bluetooth search returned Windows error %lu.", error);
-        else if (result->inquire)
+        else {
+            result->complete = true;
             wcscpy(result->message, result->count ? L"Select a device to pair or manage it." :
-                   L"No nearby devices found. Make the device discoverable, then scan again.");
-        else wcscpy(result->message, L"Scan for nearby devices. Use More devices for Bluetooth LE.");
+                   L"Make your device discoverable. For Bluetooth LE, open Windows device pairing.");
+        }
     }
     w_release_result(result);
     return 0;
 }
 
-void w_bluetooth_open(HWND window, HWND list, HWND status, HWND action, HWND scan) {
+void w_bluetooth_open(HWND window, HWND list, HWND status, HWND action) {
     panel = window;
     devices_list = list;
     status_text = status;
     action_button = action;
-    scan_button = scan;
     // These optional system components may be absent on minimal Windows installations.
     HMODULE dll = LoadLibraryExW(L"bthprops.cpl", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (dll) {
@@ -116,16 +126,23 @@ void w_bluetooth_open(HWND window, HWND list, HWND status, HWND action, HWND sca
         BT_PROC(forget, BluetoothRemoveDevice);
 #undef BT_PROC
     }
-    w_bluetooth_scan(false);
+    w_bluetooth_poll(false);
 }
 
-void w_bluetooth_scan(bool inquire) {
-    if (scan_thread) return;
-    if (!api.first_radio || !api.close_radio || !api.first || !api.next || !api.close) {
-        SetWindowTextW(status_text, L"Windows Bluetooth discovery is unavailable.");
-        EnableWindow(scan_button, FALSE);
+void w_bluetooth_poll(bool change) {
+    if (!IsWindowVisible(panel) || IsIconic(panel) || !IsWindowEnabled(panel)) return;
+    if (scan_thread) {
+        device_changed |= change;
         return;
     }
+    if (!api.first_radio || !api.close_radio || !api.first || !api.next || !api.close) {
+        w_tool_status(status_text, L"Windows Bluetooth discovery is unavailable.");
+        return;
+    }
+    // Read the OS cache first. Only an open panel with an active radio issues
+    // periodic discovery; device notifications coalesce into cheap cache reads.
+    ULONGLONG now = GetTickCount64();
+    bool inquire = !change && shown && shown->has_radio && now >= next_inquiry;
     pending = calloc(1, sizeof(*pending));
     if (pending) {
         pending->refs = 2;
@@ -138,9 +155,11 @@ void w_bluetooth_scan(bool inquire) {
         SetWindowTextW(status_text, L"Bluetooth search could not start.");
         return;
     }
-    EnableWindow(scan_button, FALSE);
-    EnableWindow(action_button, FALSE);
-    SetWindowTextW(status_text, inquire ? L"Searching for nearby Bluetooth devices…" : L"Reading Bluetooth devices…");
+    if (inquire) next_inquiry = now + discovery_interval_ms;
+    if (!shown) {
+        EnableWindow(action_button, FALSE);
+        w_tool_status(status_text,L"Reading Bluetooth devices…");
+    }
 }
 
 HANDLE w_bluetooth_pending(void) { return scan_thread; }
@@ -156,20 +175,31 @@ static bool w_paired(const BLUETOOTH_DEVICE_INFO *d) { return d->fAuthenticated 
 void w_bluetooth_selected(void) {
     BLUETOOTH_DEVICE_INFO *device = w_selected_device();
     bool paired = device && w_paired(device);
-    SetWindowTextW(action_button, paired ? L"Forget device…" : L"Pair device");
-    EnableWindow(action_button, !scan_thread && device && (paired ? api.forget != NULL : api.pair != NULL));
+    w_icon_button(action_button,paired ? L"\uE74D" : L"\uE702",paired ? L"Forget selected device…" : L"Pair selected device");
+    EnableWindow(action_button, device && (paired ? api.forget != NULL : api.pair != NULL));
 }
 
-void w_bluetooth_finish(void) {
+bool w_bluetooth_finish(void) {
     BLUETOOTH_DEVICE_INFO *old = w_selected_device();
     ULONGLONG address = old ? old->Address.ullLong : 0;
     CloseHandle(scan_thread);
     scan_thread = NULL;
+    bool changed = device_changed || refresh_after_action;
+    device_changed = false;
+    if (refresh_after_action || (!pending->complete && shown)) {
+        if (!refresh_after_action) w_tool_status(status_text,pending->message);
+        refresh_after_action = false;
+        w_release_result(pending);
+        pending = NULL;
+        if (changed) w_bluetooth_poll(true);
+        return false;
+    }
+    bool radio_arrived = pending->has_radio && (!shown || !shown->has_radio);
+    bool was_empty = !shown || !shown->count;
     w_release_result(shown);
     shown = pending;
     pending = NULL;
-    SendMessageW(devices_list, WM_SETREDRAW, FALSE, 0);
-    SendMessageW(devices_list, LB_RESETCONTENT, 0, 0);
+    w_tool_rows items=w_rows_begin(devices_list);
     LRESULT selected = -1;
     for (int i = 0; i < shown->count; ++i) {
         BLUETOOTH_DEVICE_INFO *d = &shown->devices[i];
@@ -177,23 +207,22 @@ void w_bluetooth_finish(void) {
         swprintf(label, count_of(label), L"%.220ls   ·   %ls   ·   %012llX",
                  *d->szName ? d->szName : L"Bluetooth device", d->fConnected ? L"Connected" :
                  w_paired(d) ? L"Paired" : L"Available", (unsigned long long)d->Address.ullLong);
-        LRESULT row = SendMessageW(devices_list, LB_ADDSTRING, 0, (LPARAM)label);
-        if (row >= 0) {
-            SendMessageW(devices_list, LB_SETITEMDATA, row, i);
-            if (d->Address.ullLong == address || (!address && selected < 0)) selected = row;
-        }
+        int row=w_rows_put(&items,label,i);
+        if (row>=0 && (d->Address.ullLong==address || (!address && selected<0))) selected=row;
     }
-    SendMessageW(devices_list, LB_SETCURSEL, selected, 0);
-    SendMessageW(devices_list, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(devices_list, NULL, TRUE);
-    SetWindowTextW(status_text, shown->message);
-    EnableWindow(scan_button, TRUE);
+    w_rows_end(&items,(int)selected,items.top);
+    w_tool_status(status_text, shown->message);
     w_bluetooth_selected();
+    if (radio_arrived) {
+        next_inquiry = 0;
+        w_bluetooth_poll(false);
+    } else if (changed) w_bluetooth_poll(true);
+    return was_empty != (shown->count == 0);
 }
 
 void w_bluetooth_apply(void) {
     BLUETOOTH_DEVICE_INFO *selected = w_selected_device();
-    if (scan_thread || !selected) return;
+    if (!selected) return;
     BLUETOOTH_DEVICE_INFO device = *selected;
     DWORD error;
     if (w_paired(&device)) {
@@ -201,14 +230,17 @@ void w_bluetooth_apply(void) {
         wchar_t question[384];
         swprintf(question, count_of(question), L"Forget %.200ls (%012llX)? You will need to pair it again.",
                  *device.szName ? device.szName : L"this device", (unsigned long long)device.Address.ullLong);
-        if (MessageBoxW(panel, question, L"Forget Bluetooth device", MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION) != IDYES)
+        if (w_dialog(panel, question, L"Forget Bluetooth device", MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION) != IDYES)
             return;
         error = api.forget(&device.Address);
     } else {
         if (!api.pair) return;
         error = api.pair(panel, NULL, &device, NULL, MITMProtectionNotDefined);
     }
-    if (error == ERROR_SUCCESS || error == ERROR_NO_MORE_ITEMS) w_bluetooth_scan(false);
+    if (error == ERROR_SUCCESS || error == ERROR_NO_MORE_ITEMS) {
+        if (scan_thread) refresh_after_action = true;
+        else w_bluetooth_poll(true);
+    }
     else if (error != ERROR_CANCELLED) {
         wchar_t text[128];
         swprintf(text, count_of(text), L"Windows could not complete the device request (error %lu).", error);
@@ -220,4 +252,8 @@ void w_bluetooth_close(void) {
     if (scan_thread) CloseHandle(scan_thread);
     w_release_result(pending);
     w_release_result(shown);
+    scan_thread = NULL;
+    pending = shown = NULL;
+    next_inquiry = 0;
+    refresh_after_action = device_changed = false;
 }

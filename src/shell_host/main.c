@@ -1,9 +1,13 @@
+#include "theme/dialog.h"
+#include "theme/caption.h"
+#include "theme/icon_button.h"
 #include "theme/theme.h"
 #include "shell_host/entry.h"
 #include "native_notifications/toast.h"
 #include "os_win32/environment.h"
 #include "win_platform/win_platform.h"
 #include <shellapi.h>
+#include <shellscalingapi.h>
 #include <wchar.h>
 #include <stdio.h>
 
@@ -19,11 +23,15 @@ static wchar_t session_exe[os_path_cap], restart_exe[os_path_cap];
 
 static bool ending, rescue_requested, quit_requested, preview, logging_off;
 static bool owns_desktop, waiting_for_shell;
-enum { first_recovery_id = 101, exit_windows_id = 109, recovery_row = 36 };
+enum { first_recovery_id = 101, exit_windows_id = 109 };
 
 static const wchar_t *const labels[] = {
     L"&Restart winwm",        L"Open &terminal", L"&Edit configuration",   L"Use built-in &defaults",
-    L"Use &previous release", L"&Sign out",      L"Remove winwm from &startup"};
+    L"Use &previous release", L"&Sign out",      L"Re&move winwm from startup", L"E&xit to Windows"};
+static const wchar_t *const glyphs[] = {L"\uE72C", L"\uE756", L"\uE70F", L"\uE777",
+                                       L"\uE72B", L"\uE8AC", L"\uE74D", L"\uE8A9"};
+static HFONT recovery_font;
+static UINT recovery_dpi;
 static bool w_restart(const wchar_t *exe) {
     if (GetFileAttributesW(exe) == INVALID_FILE_ATTRIBUTES) return false;
     wcscpy(restart_exe,exe);
@@ -71,22 +79,79 @@ static bool w_start_managed_previous(void) {
 ////////////////
 //~ Session recovery
 
-static void w_create_recovery_controls(void) {
-    HINSTANCE instance = GetModuleHandleW(NULL);
-    for (int i = 0; i < (int)count_of(labels); ++i) {
-        int id = first_recovery_id + i;
-        if (!GetDlgItem(panel, id))
-            CreateWindowW(L"BUTTON", labels[i], WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 14,
-                          12 + recovery_row * i, 290, 30, panel, (HMENU)(INT_PTR)id, instance, NULL);
+static int w_recovery_id(int index) {
+    return index == count_of(labels)-1 ? exit_windows_id : first_recovery_id + index;
+}
+
+static void w_fit_recovery(HWND w, const RECT *anchor, HMONITOR monitor) {
+    MONITORINFO mi = {.cbSize = sizeof(mi)};
+    if (!GetMonitorInfoW(monitor, &mi)) return;
+    RECT work = mi.rcWork, frame = {0};
+    UINT dpi = 96, dpi_y;
+    if (FAILED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpi, &dpi_y))) dpi = GetDpiForWindow(w);
+    int side = w_theme_button_size(dpi), gap = w_theme_spacing(dpi), pad = gap * 2;
+    w_theme_adjust_rect(&frame, (DWORD)GetWindowLongPtrW(w, GWL_STYLE),
+                        (DWORD)GetWindowLongPtrW(w, GWL_EXSTYLE), dpi);
+    int available = work.bottom - work.top - (frame.bottom - frame.top) - 2 * pad;
+    int rows = w_clamp_int((available + gap) / (side + gap), 1, (int)count_of(labels));
+    int columns = ((int)count_of(labels) + rows - 1) / rows;
+    rows = ((int)count_of(labels) + columns - 1) / columns;
+    HFONT old = NULL;
+    if (!recovery_font || dpi != recovery_dpi) {
+        HFONT next = w_theme_message_font(dpi);
+        if (next) {
+            old = recovery_font;
+            recovery_font = next;
+            recovery_dpi = dpi;
+        }
     }
-    if (!GetDlgItem(panel, exit_windows_id))
-        CreateWindowW(L"BUTTON", L"E&xit to Windows", WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW, 14,
-                      12 + recovery_row * count_of(labels), 290, 30, panel, (HMENU)exit_windows_id, instance,
-                      NULL);
+    HFONT font = recovery_font ? recovery_font : (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    int column_width[count_of(labels)]={0}, actions_width=0;
+    for (int i=0;i<(int)count_of(labels);++i) {
+        int preferred=w_labeled_button_width(font,labels[i],dpi);
+        column_width[i/rows]=max(column_width[i/rows],preferred);
+    }
+    for (int i=0;i<columns;++i) actions_width+=column_width[i];
+    int title_width=w_theme_caption_width(w);
+    int width=max(title_width,actions_width+(columns-1)*gap+2*pad)+frame.right-frame.left;
+    int height = rows * side + (rows-1)*gap + 2*pad + frame.bottom-frame.top;
+    width = min(width, work.right-work.left);
+    height = min(height, work.bottom-work.top);
+    if (!anchor) anchor = &work;
+    int x = w_clamp_int((anchor->left+anchor->right-width)/2, work.left, work.right-width);
+    int y = w_clamp_int((anchor->top+anchor->bottom-height)/2, work.top, work.bottom-height);
+    SetWindowPos(w,NULL,x,y,width,height,SWP_NOACTIVATE | SWP_NOZORDER);
+    RECT client;
+    w_theme_content_rect(w,&client);
+    int content_top = w_theme_caption_height(w);
+    int room=max(1,client.right-2*pad-(columns-1)*gap);
+    int sum=0,left=0;
+    for (int col=0;col<columns;++col) {
+        sum+=column_width[col];
+        int right=MulDiv(room,sum,actions_width);
+        for (int row=0;row<rows && col*rows+row<(int)count_of(labels);++row) {
+            HWND button=GetDlgItem(w,w_recovery_id(col*rows+row));
+            if (!button) continue;
+            SendMessageW(button,WM_SETFONT,(WPARAM)font,FALSE);
+            SetWindowPos(button,NULL,pad+left+col*gap,content_top+pad+row*(side+gap),max(1,right-left),side,
+                         SWP_NOACTIVATE|SWP_NOZORDER);
+        }
+        left=right;
+    }
+    if (old) DeleteObject(old);
 }
 
 static void w_rescue(void) {
-    w_create_recovery_controls();
+    w_theme_load_profile();
+    w_theme_material(panel);
+    for (int i = 0; i < (int)count_of(labels); ++i) {
+        int id = w_recovery_id(i);
+        if (GetDlgItem(panel,id)) continue;
+        HWND button = CreateWindowW(L"BUTTON", labels[i], WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW,
+                               0,0,0,0,panel,(HMENU)(INT_PTR)id,GetModuleHandleW(NULL),NULL);
+        w_labeled_button(button,glyphs[i],labels[i]);
+    }
+    w_fit_recovery(panel,NULL,MonitorFromWindow(GetForegroundWindow(),MONITOR_DEFAULTTOPRIMARY));
     ShowWindow(panel, SW_SHOW);
     SetForegroundWindow(panel);
     SetFocus(GetDlgItem(panel, 101));
@@ -116,7 +181,7 @@ restore:
 static void w_handle_action(int id) {
     if (id == 101) {
         if (!w_restart(session_exe))
-            MessageBoxW(panel, L"The selected winwm executable could not start.", L"Recovery", MB_OK);
+            w_dialog(panel, L"The selected winwm executable could not start.", L"Recovery", MB_OK);
     } else if (id == 102)
         w_os_launch_terminal("%SystemRoot%\\System32\\cmd.exe", false);
     else if (id == 103) {
@@ -126,7 +191,7 @@ static void w_handle_action(int id) {
             w_os_launch_provider("%SystemRoot%\\System32\\notepad.exe", arg, false);
     } else if (id == 104) {
         if (!w_reset_profile()) {
-            MessageBoxW(panel, L"Could not back up and reset the profile.", L"Recovery", MB_OK);
+            w_dialog(panel, L"Could not back up and reset the profile.", L"Recovery", MB_OK);
             return;
         }
         w_os_cache_discard();
@@ -143,7 +208,7 @@ static void w_handle_action(int id) {
         if (setup)
             CloseHandle(setup);
         else if (id != 105 || !w_start_managed_previous())
-            MessageBoxW(panel,
+            w_dialog(panel,
                         id == 105 ? L"No previous winwm release is available."
                                   : L"Run winwm_install.exe /uninstall from the release folder.",
                         L"winwm recovery", MB_OK);
@@ -161,6 +226,23 @@ static LRESULT CALLBACK w_host_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     if (w_theme_message(w, msg, wp, lp, &color_result))
         return color_result;
     switch (msg) {
+    case WM_FONTCHANGE:
+        recovery_dpi=0;
+        /* fall through */
+    case WM_SETTINGCHANGE:
+        if (msg==WM_SETTINGCHANGE && wp!=SPI_SETNONCLIENTMETRICS && wp!=SPI_SETWORKAREA) break;
+        if (wp==SPI_SETNONCLIENTMETRICS) recovery_dpi=0;
+        /* fall through */
+    case winwm_theme_updated:
+    case WM_DISPLAYCHANGE:
+    case WM_DPICHANGED: {
+        if (!GetDlgItem(w, first_recovery_id)) break;
+        RECT r;
+        if (msg == WM_DPICHANGED) r = *(RECT *)lp;
+        else GetWindowRect(w, &r);
+        w_fit_recovery(w, &r, MonitorFromRect(&r, MONITOR_DEFAULTTONEAREST));
+        return 0;
+    }
     case recovery_take_desktop: {
         if (preview || !session || quit_requested || rescue_requested || logging_off ||
             (owns_desktop && !waiting_for_shell) || (DWORD)wp != GetProcessId(session) ||
@@ -180,7 +262,9 @@ static LRESULT CALLBACK w_host_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         }
         return 0;
     case WM_COMMAND:
-        if (!session)
+        if (!session && LOWORD(wp) == IDCANCEL)
+            PostMessageW(w, WM_CLOSE, 0, 0);
+        else if (!session)
             w_handle_action(LOWORD(wp));
         return 0;
     case WM_HOTKEY:
@@ -217,9 +301,8 @@ static LRESULT CALLBACK w_host_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             PostQuitMessage(0);
         }
         return 0;
-    default:
-        return DefWindowProcW(w, msg, wp, lp);
     }
+    return DefWindowProcW(w, msg, wp, lp);
 }
 
 static int w_host_run(HINSTANCE inst, DWORD pid, uint64_t birth, HANDLE ready) {
@@ -246,12 +329,12 @@ static int w_host_run(HINSTANCE inst, DWORD pid, uint64_t birth, HANDLE ready) {
                     .hbrBackground = NULL};
     RegisterClassW(&wc);
     panel = CreateWindowExW(WS_EX_TOPMOST | WS_EX_CONTROLPARENT, wc.lpszClassName, L"winwm recovery",
-                            WS_CAPTION | WS_SYSMENU, 100, 100, 338,
-                            74 + recovery_row * ((int)count_of(labels) + 1), NULL, NULL, inst, NULL);
+                            WS_CAPTION | WS_SYSMENU | WS_CLIPCHILDREN, 0, 0, 1, 1, NULL, NULL, inst, NULL);
     if (!panel || !SetPropW(panel,L"winwm.session_pid",(HANDLE)(uintptr_t)pid)) { error = GetLastError(); goto done; }
     if (!RegisterHotKey(panel, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F12))
         SetPropW(panel, L"winwm.recovery_hotkey_error", (HANDLE)(uintptr_t)GetLastError());
     if (!SetEvent(ready)) { error = GetLastError(); goto done; }
+    w_theme_follow(panel);
     w_environment_start(NULL,0);
     while (!ending) {
         DWORD n = session ? 1 : 0;
@@ -296,6 +379,7 @@ static int w_host_run(HINSTANCE inst, DWORD pid, uint64_t birth, HANDLE ready) {
 done:
     if (session) CloseHandle(session);
     if (panel) DestroyWindow(panel);
+    if (recovery_font) DeleteObject(recovery_font);
     w_os_instance_release(&lock);
     if (*restart_exe && !logging_off) {
         HANDLE next = w_os_launch(restart_exe,preview ? L"--preview" : NULL);
@@ -347,7 +431,6 @@ int w_recovery_run(HINSTANCE inst, const wchar_t *operation) {
     HANDLE ready = OpenEventW(EVENT_MODIFY_STATE, FALSE, name);
     if (!ready) return (int)GetLastError();
     preview = mode != 0;
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     int result = w_host_run(inst, pid, birth, ready);
     CloseHandle(ready);
     return result;

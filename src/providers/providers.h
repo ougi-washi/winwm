@@ -16,6 +16,7 @@ typedef struct w_provider_value {
 void w_providers_configure(HWND owner, UINT message, const w_desktop_config *config);
 bool w_providers_tick(void);
 bool w_providers_value(const char *name, w_provider_value *out, char *action, size_t cap);
+bool w_providers_need_manual_refresh(void);
 void w_providers_refresh(void);
 void w_providers_stop(void);
 enum { provider_timer = 27 };

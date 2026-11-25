@@ -1,14 +1,16 @@
 #include "theme/theme.h"
 #include "theme/icon_button.h"
+#include "theme/hover.h"
+#include "theme/control_hover.h"
+#include "theme/native_controls.h"
 #include "palette/palette.h"
 #include "win_platform/layer.h"
+#include "win_platform/appearance.h"
 #include <commctrl.h>
-#include <dwmapi.h>
 #include <imm.h>
 #include <windowsx.h>
 #include <usp10.h>
 #include <shellscalingapi.h>
-#include <uxtheme.h>
 #include <wctype.h>
 #include <stdlib.h>
 #include <stdio.h>
@@ -44,16 +46,21 @@ static int row_count, result_count, in_group[palette_group_count];
 static enum w_palette_group group;
 static HWND panel, heading, back, close_button, edit, list, empty_text, footer, return_to, pending_restore;
 static HFONT text_font, title_font, small_font, glyph_font;
-static HIMAGELIST app_icons, row_height_icons;
-static struct {
-    int index;
-    HICON handle;
-} icon_cache[64];
-static UINT palette_dpi;
+static HIMAGELIST app_icons;
+static UINT palette_dpi, font_dpi;
+static int row_height, glyph_size;
+static int title_line, body_line, footer_line;
+static struct { int label, hint, context; } group_width[palette_group_count];
+static const wchar_t *const admin_keys[]={L"Shift+Enter  Admin",L"Shift+↵"};
+static int admin_width[count_of(admin_keys)];
+static const wchar_t *const nav_hint[]={L"↑ ↓  Navigate       Enter  Open       Esc  Close",L"↑ ↓  Navigate       Enter  Open       Esc  Back"};
+static int nav_width[count_of(nav_hint)];
+static RECT search_box;
 static w_palette_site placement;
 static w_layer_fade fade;
-static bool closing;
-static int pressed_result = no_result;
+static bool closing, motion_enabled;
+static int pressed_index = -1;
+static bool pressed_inside;
 static bool grouped, manual_selection, filtering, composing;
 static palette_callback select_entry;
 static palette_line_callback run_line;
@@ -66,70 +73,134 @@ static const wchar_t *launch_status;
 
 static int px(int units) { return MulDiv(units, palette_dpi, 96); }
 
+static w_transition w_palette_timing(bool entering) {
+    if (placement.follow_theme_motion) return w_theme_layer_timing(entering);
+    return entering ? placement.enter : placement.leave;
+}
+
+// Choose the viewport once on opening. Filtering, inventory updates and section
+// navigation keep the window stationary underneath the pointer.
+static int opening_rows;
+static int w_viewport_chrome(UINT dpi,int *row) {
+    int button=w_theme_button_size(dpi),gap=w_theme_spacing(dpi);
+    int body=font_dpi==dpi ? body_line : w_theme_role_line_height(dpi,text_body);
+    int title=font_dpi==dpi ? title_line : w_theme_role_line_height(dpi,text_title);
+    int footer_height=font_dpi==dpi ? footer_line : w_theme_role_line_height(dpi,text_secondary);
+    *row=max(button,body+1);
+    return max(button,title)+max(button,body+2)+footer_height+5*gap;
+}
+
+static int w_initial_height(UINT dpi,int available) {
+    int row,chrome=w_viewport_chrome(dpi,&row);
+    int budget=min(available,MulDiv(grouped ? 512 : 404,dpi,96));
+    int limit=max(1,(budget-chrome)/row);
+    return min(available,chrome+w_clamp_int(opening_rows,1,limit)*row);
+}
+
 static RECT w_button_bounds(const w_popup_anchor *anchor, UINT dpi) {
-    return w_popup_bounds(anchor, w_popup_area(anchor->bar), MulDiv(432,dpi,96),
-                          MulDiv(grouped ? 512 : 404,dpi,96), MulDiv(6,dpi,96));
+    RECT area=w_popup_area(anchor->bar);
+    int gap=w_theme_spacing(dpi),width=MulDiv(432,dpi,96);
+    RECT space=w_popup_bounds(anchor,area,width,area.bottom-area.top,gap);
+    return w_popup_bounds(anchor,area,width,w_initial_height(dpi,space.bottom-space.top),gap);
 }
 
 static void w_navigation_hint(void) {
     RECT area;
     GetClientRect(panel,&area);
     const wchar_t *hint = launch_status;
-    if (!hint && area.right < px(360))
+    if (!hint) hint=nav_hint[!!group];
+    if (!launch_status && nav_width[!!group]>area.right-4*w_theme_spacing(palette_dpi))
         hint = group ? L"↑ ↓  Move    ↵  Open    Esc  Back" : L"↑ ↓  Move    ↵  Open    Esc  Close";
-    if (!hint) hint = group ? L"↑ ↓  Navigate       Enter  Open       Esc  Back" :
-                             L"↑ ↓  Navigate       Enter  Open       Esc  Close";
-    SetWindowTextW(footer,hint);
+    wchar_t current[256];
+    GetWindowTextW(footer,current,count_of(current));
+    if (wcscmp(current,hint)) SetWindowTextW(footer,hint);
 }
 
-static void w_font(HFONT *current, int size, int weight, const wchar_t *family) {
-    HFONT next = CreateFontW(-px(size),0,0,0,weight,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
-                             0,0,CLEARTYPE_QUALITY,0,family);
+static void w_font(HFONT *current, HFONT next, const HWND *controls, size_t count) {
     if (next) {
+        for (size_t i=0;i<count;++i) SendMessageW(controls[i],WM_SETFONT,(WPARAM)next,FALSE);
         if (*current) DeleteObject(*current);
         *current = next;
     }
+}
+
+static void w_palette_fonts(UINT dpi) {
+    if (font_dpi==dpi || !footer) return;
+    HFONT text=w_theme_role_font(dpi,text_body), title=w_theme_role_font(dpi,text_title);
+    HFONT small=w_theme_role_font(dpi,text_secondary);
+    if (!text || !title || !small) {
+        DeleteObject(text); DeleteObject(title); DeleteObject(small);
+        return;
+    }
+    HWND controls[]={edit,list,empty_text,back,close_button};
+    w_font(&text_font,text,controls,count_of(controls));
+    w_font(&title_font,title,&heading,1);
+    w_font(&small_font,small,&footer,1);
+    title_line=w_theme_line_height(title);
+    body_line=w_theme_line_height(text);
+    footer_line=w_theme_line_height(small);
+    for (int i=1;i<palette_group_count;++i) {
+        group_width[i].label=w_theme_text_width(text,groups[i].label,DT_NOPREFIX);
+        group_width[i].context=w_theme_text_width(small,groups[i].label,DT_NOPREFIX);
+        group_width[i].hint=w_theme_text_width(small,groups[i].hint,DT_NOPREFIX);
+    }
+    for (size_t i=0;i<count_of(admin_keys);++i) admin_width[i]=w_theme_text_width(small,admin_keys[i],DT_NOPREFIX);
+    for (size_t i=0;i<count_of(nav_hint);++i) nav_width[i]=w_theme_text_width(small,nav_hint[i],DT_NOPREFIX);
+    font_dpi=dpi;
+    palette_dpi=0;
 }
 
 static void w_palette_size(void) {
     if (!list || !footer) return;
     UINT dpi = GetDpiForWindow(panel);
     if (!dpi) dpi = 96;
-    if (dpi != palette_dpi) {
-        palette_dpi = dpi;
-        w_font(&text_font, 15, FW_NORMAL, L"Segoe UI");
-        w_font(&title_font, 21, FW_SEMIBOLD, L"Segoe UI");
-        w_font(&small_font, 13, FW_NORMAL, L"Segoe UI");
-        w_font(&glyph_font, 17, FW_NORMAL, L"Segoe MDL2 Assets");
-        SendMessageW(heading, WM_SETFONT, (WPARAM)title_font, TRUE);
-        SendMessageW(edit, WM_SETFONT, (WPARAM)text_font, TRUE);
-        SendMessageW(list, WM_SETFONT, (WPARAM)text_font, TRUE);
-        SendMessageW(empty_text, WM_SETFONT, (WPARAM)text_font, TRUE);
-        SendMessageW(footer, WM_SETFONT, (WPARAM)small_font, TRUE);
-        HIMAGELIST size = ImageList_Create(1, max(1,px(38)), ILC_COLOR32, 1, 1);
-        if (size) {
-            ListView_SetImageList(list, size, LVSIL_SMALL);
-            if (row_height_icons) ImageList_Destroy(row_height_icons);
-            row_height_icons = size;
+    int button = w_theme_button_size(dpi), gap = w_theme_spacing(dpi);
+    RECT r;
+    GetClientRect(panel,&r);
+    static RECT previous;
+    static int last_gap;
+    static bool had_back;
+    bool show_back = group != palette_flat;
+    w_palette_fonts(dpi);
+    int row=max(button,body_line+1);
+    int icon_size=w_theme_icon_size(dpi);
+    if (palette_dpi==dpi && glyph_font && row_height == row && glyph_size == icon_size &&
+        last_gap == gap && had_back == show_back && EqualRect(&r,&previous)) return;
+    palette_dpi = dpi;
+    previous = r;
+    last_gap = gap;
+    had_back = show_back;
+    if (glyph_size != icon_size) {
+        HFONT glyph=w_theme_font(L"Segoe MDL2 Assets",icon_size,FW_NORMAL);
+        if (glyph) {
+            w_font(&glyph_font,glyph,NULL,0);
+            glyph_size=icon_size;
         }
     }
-    RECT r;
-    GetClientRect(panel, &r);
-    int pad = px(16), field_top = px(50), results_top = px(98);
-    int width = max(1, r.right - 2*pad), footer_top = max(results_top, r.bottom - px(32));
-    int left = group ? pad + px(36) : pad;
-    MoveWindow(back, pad, px(9), px(30), px(31), FALSE);
-    MoveWindow(heading, left, px(8), max(1,r.right-left-pad-px(38)), px(34), TRUE);
-    MoveWindow(close_button, r.right-pad-px(30), px(9), px(30), px(31), TRUE);
-    MoveWindow(edit, pad+px(38), field_top+px(9), max(1,width-px(50)), px(21), TRUE);
-    MoveWindow(list, pad, results_top, width, max(1,footer_top-results_top-px(4)), TRUE);
+    if (row_height!=row && w_native_list_row_height(list,row)) row_height=row;
+    int pad = 2 * gap, width = max(1, r.right - 2*pad);
+    int left = group ? pad + button + gap : pad;
+    int header=max(button,title_line),field=max(button,body_line+2);
+    int action_top=gap+(header-button)/2;
+    search_box = (RECT){pad,header+2*gap,r.right-pad,header+2*gap+field};
+    int results_top = search_box.bottom + gap, footer_top = max(results_top,r.bottom-footer_line-gap);
+    UINT place = SWP_NOZORDER | SWP_NOACTIVATE;
+    SetWindowPos(back, NULL, pad, action_top, button, button, place);
+    SetWindowPos(heading, NULL, left, gap, max(1,r.right-left-pad-button-gap), header, place);
+    SetWindowPos(close_button, NULL, r.right-pad-button, action_top, button, button, place);
+    int edit_height=body_line;
+    SetWindowPos(edit, NULL, pad+button, search_box.top+(field-edit_height)/2,
+                 max(1,width-button-gap), edit_height, place);
+    w_native_edit_frame(edit,&search_box);
+    SetWindowPos(list, NULL, pad, results_top, width, max(1,footer_top-results_top-gap), place);
     RECT viewport;
     GetClientRect(list, &viewport);
-    ListView_SetColumnWidth(list, 0, max(1, (int)viewport.right));
-    MoveWindow(empty_text, pad, results_top, width, px(62), TRUE);
-    MoveWindow(footer, pad, footer_top, width, px(27), TRUE);
+    if (ListView_GetColumnWidth(list,0) != max(1,(int)viewport.right))
+        ListView_SetColumnWidth(list,0,max(1,(int)viewport.right));
+    SetWindowPos(empty_text, NULL, pad, results_top, width, button, place);
+    SetWindowPos(footer, NULL, pad, footer_top, width, footer_line, place);
     w_navigation_hint();
-    InvalidateRect(panel, NULL, TRUE);
+    RedrawWindow(panel,NULL,NULL,RDW_INVALIDATE|RDW_ALLCHILDREN);
 }
 
 static void w_search_text(wchar_t *out, const wchar_t *text) {
@@ -258,6 +329,44 @@ static int w_source(int index) {
     return index >= 0 && index < result_count ? results[index].row : no_result;
 }
 
+// Source indices can change when the catalog inserts or reorders applications.
+typedef struct {
+    int source;
+    enum w_palette_group group;
+    uint64_t identity;
+    wchar_t label[palette_text_capacity], alias[palette_text_capacity];
+} w_result_key;
+
+static w_result_key w_result_at(int index) {
+    w_result_key key={.source=w_source(index)};
+    if (key.source>=0) {
+        const w_cached_row *row=&rows[key.source];
+        key.group=row->entry.group;
+        key.identity=row->entry.identity;
+        if (!key.identity) {
+            wcscpy(key.label,row->entry.label);
+            wcscpy(key.alias,row->alias);
+        }
+    }
+    return key;
+}
+
+static int w_locate_result(const w_result_key *key) {
+    if (key->source==no_result) return -1;
+    for (int i=0;i<result_count;++i) {
+        int source=results[i].row;
+        if (source<0 || key->source<0) {
+            if (source==key->source) return i;
+        } else {
+            const w_cached_row *row=&rows[source];
+            if (row->entry.group==key->group &&
+                (key->identity ? row->entry.identity==key->identity :
+                 !wcscmp(row->entry.label,key->label) && !wcscmp(row->alias,key->alias))) return i;
+        }
+    }
+    return -1;
+}
+
 static void w_select(int index) {
     if (index < 0 || index >= result_count) return;
     ListView_SetItemState(list, index, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
@@ -317,11 +426,20 @@ static void w_search_results(void) {
         qsort(results, (size_t)result_count, sizeof(*results), w_compare_result);
 }
 
-static void w_filter(void) {
+static void w_cancel_press(void) {
+    if (pressed_index<0) return;
+    int previous=pressed_index;
+    pressed_index=-1;
+    pressed_inside=false;
+    ListView_RedrawItems(list,previous,previous);
+    if (GetCapture()==list) ReleaseCapture();
+}
+
+static void w_filter(bool reset_view) {
     if (filtering || !list) return;
     filtering = true;
     manual_selection = false;
-    pressed_result = no_result;
+    w_cancel_press();
     result_count = 0;
     command_line = NULL;
     int length = GetWindowTextLengthW(edit);
@@ -339,14 +457,14 @@ static void w_filter(void) {
             results[result_count++] = (w_result){command_submit,0,0};
         }
     } else if (length < palette_text_capacity) w_search_results();
-    int previous = w_selected_index();
-    if (previous >= 0) ListView_SetItemState(list,previous,0,LVIS_SELECTED|LVIS_FOCUSED);
     if (ListView_GetItemCount(list) != result_count)
         ListView_SetItemCountEx(list, result_count, LVSICF_NOSCROLL | LVSICF_NOINVALIDATEALL);
-    w_select(0);
-    SetWindowTextW(empty_text, message);
-    ShowWindow(list,result_count ? SW_SHOWNA : SW_HIDE);
-    ShowWindow(empty_text, result_count ? SW_HIDE : SW_SHOWNA);
+    if (reset_view) w_select(0);
+    if (!result_count) SetWindowTextW(empty_text, message);
+    if (!!(GetWindowLongPtrW(list,GWL_STYLE) & WS_VISIBLE) != !!result_count)
+        ShowWindow(list,result_count ? SW_SHOWNA : SW_HIDE);
+    if (!!(GetWindowLongPtrW(empty_text,GWL_STYLE) & WS_VISIBLE) == !!result_count)
+        ShowWindow(empty_text,result_count ? SW_HIDE : SW_SHOWNA);
     RECT viewport;
     GetClientRect(list,&viewport);
     int width = max(1,(int)viewport.right);
@@ -366,9 +484,9 @@ static void w_route(enum w_palette_group next) {
     SetWindowTextW(edit, L"");
     search_hint = group ? L"Search this category" : run_line ? L"Search apps and actions, or type > for a command" :
                   grouped ? L"Search apps and actions" : L"Filter entries";
-    InvalidateRect(edit,NULL,TRUE);
+    InvalidateRect(edit,NULL,FALSE);
     filtering = false;
-    w_filter();
+    w_filter(true);
     if (previous && !next) {
         for (int i = 0; i < result_count; ++i)
             if (results[i].row == -(int)previous) { w_select(i); break; }
@@ -377,30 +495,20 @@ static void w_route(enum w_palette_group next) {
 }
 
 static void w_glyph(HDC dc, wchar_t glyph, RECT r, COLORREF color) {
-    SelectObject(dc, glyph_font);
+    HGDIOBJ old=SelectObject(dc,glyph_font);
+    if (!old) return;
     SetTextColor(dc, color);
     DrawTextW(dc, &glyph, 1, &r, DT_SINGLELINE|DT_CENTER|DT_VCENTER|DT_NOPREFIX);
-}
-
-static void w_round_rect(HDC dc, RECT r, COLORREF fill, COLORREF border, int radius) {
-    SelectObject(dc, GetStockObject(DC_PEN));
-    SelectObject(dc, GetStockObject(DC_BRUSH));
-    SetDCPenColor(dc, border);
-    SetDCBrushColor(dc, fill);
-    RoundRect(dc, r.left, r.top, r.right, r.bottom, radius, radius);
+    SelectObject(dc,old);
 }
 
 static bool w_app_icon(HDC dc, int index, RECT box) {
     if (!app_icons || index <= 0) return false;
-    size_t slot = (size_t)index % count_of(icon_cache);
-    if (icon_cache[slot].index != index) {
-        if (icon_cache[slot].handle) DestroyIcon(icon_cache[slot].handle);
-        icon_cache[slot].handle = ImageList_GetIcon(app_icons,index-1,ILD_NORMAL);
-        icon_cache[slot].index = index;
-    }
-    int size = px(18);
-    return icon_cache[slot].handle && DrawIconEx(dc, (box.left+box.right-size)/2, (box.top+box.bottom-size)/2,
-                                                 icon_cache[slot].handle, size,size,0,NULL,DI_NORMAL);
+    int size = glyph_size;
+    IMAGELISTDRAWPARAMS image = {.cbSize=sizeof(image), .himl=app_icons, .i=index-1, .hdcDst=dc,
+        .x=(box.left+box.right-size)/2, .y=(box.top+box.bottom-size)/2, .cx=size, .cy=size,
+        .rgbBk=CLR_NONE, .rgbFg=CLR_NONE, .fStyle=ILD_TRANSPARENT|ILD_SCALE};
+    return ImageList_DrawIndirect(&image) != FALSE;
 }
 
 static bool w_can_run_admin(int source) {
@@ -423,62 +531,68 @@ static void w_draw_result(NMLVCUSTOMDRAW *draw) {
     r.right = viewport.right;
     HDC dc = cd->hdc;
     int saved = SaveDC(dc);
-    bool selected = (ListView_GetItemState(list,index,LVIS_SELECTED) & LVIS_SELECTED) != 0;
-    COLORREF ink = selected ? w_theme_selection(true) : w_theme_foreground();
-    FillRect(dc, &r, w_theme_brush());
+    UINT state=ListView_GetItemState(list,index,LVIS_SELECTED|LVIS_FOCUSED);
+    bool selected=(state&LVIS_SELECTED)!=0;
+    int hover=w_hover_amount(list,index);
+    bool highlighted=selected || (hover && w_theme_high_contrast());
+    COLORREF ink=w_hover_row(dc,&r,selected,hover,index==pressed_index && pressed_inside);
     if (selected) {
-        RECT box = r;
-        InflateRect(&box, -px(1), -px(2));
-        w_round_rect(dc, box, w_theme_selection(false), w_theme_selection(false), px(10));
+        RECT mark=r;
+        mark.right=mark.left+max(1,px(2));
+        SetDCBrushColor(dc,w_theme_high_contrast() ? ink : w_theme_accent());
+        FillRect(dc,&mark,GetStockObject(DC_BRUSH));
     }
     SetBkMode(dc, TRANSPARENT);
     RECT label = r;
-    label.left += px(12);
-    label.right -= px(12);
+    int gap = w_theme_spacing(palette_dpi);
+    label.left += 2*gap;
+    label.right -= 2*gap;
     RECT icon = r;
-    icon.left += px(8);
-    icon.right = icon.left + px(29);
-    if (glyph) label.left = icon.right + px(8);
+    icon.left += gap;
+    icon.right = icon.left + w_theme_button_size(palette_dpi);
+    if (glyph) label.left = icon.right + gap;
     if (category) {
         RECT arrow = label;
-        arrow.left = arrow.right-px(21);
-        w_glyph(dc, 0xe76c, arrow, selected ? ink : w_theme_accent());
-        label.right = arrow.left-px(6);
-        if (viewport.right >= px(435)) {
+        arrow.left = arrow.right-glyph_size;
+        w_glyph(dc, 0xe76c, arrow, highlighted ? ink : w_theme_accent());
+        label.right = arrow.left-gap;
+        if (label.right-label.left>=group_width[kind].label+2*gap+group_width[kind].hint) {
             RECT hint=label;
-            hint.left+=px(183);
+            hint.left=hint.right-group_width[kind].hint;
             SelectObject(dc,small_font);
-            SetTextColor(dc,selected ? ink : w_theme_hint());
-            DrawTextW(dc,groups[kind].hint,-1,&hint,DT_RIGHT|DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
-            label.right=hint.left-px(6);
+            SetTextColor(dc,highlighted ? ink : w_theme_hint());
+            w_theme_draw_text(dc,groups[kind].hint,-1,&hint,DT_RIGHT|DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
+            label.right=hint.left-gap;
         }
     } else if (selected && w_can_run_admin(source)) {
-        const wchar_t *hint = viewport.right >= px(365) ? L"Shift+Enter  Admin" : L"Shift+↵";
-        SelectObject(dc, small_font);
-        SIZE size;
-        GetTextExtentPoint32W(dc, hint, (int)wcslen(hint), &size);
-        RECT key = label;
-        key.left = key.right - size.cx;
-        RECT shield = {key.left-px(22), key.top, key.left-px(3), key.bottom};
-        SetTextColor(dc, ink);
-        DrawTextW(dc, hint, -1, &key, DT_RIGHT|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
-        w_glyph(dc, 0xea18, shield, ink);
-        label.right = shield.left-px(6);
-    } else if (kind && !group && viewport.right >= px(350)) {
-        SelectObject(dc, small_font);
-        SIZE size;
-        GetTextExtentPoint32W(dc, groups[kind].label, (int)wcslen(groups[kind].label), &size);
-        RECT context = label;
-        context.left = context.right - size.cx;
-        SetTextColor(dc, selected ? ink : w_theme_accent());
-        DrawTextW(dc, groups[kind].label, -1, &context, DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
-        label.right = context.left - px(16);
+        int available=(label.right-label.left)/2-glyph_size-2*gap;
+        int variant=admin_width[0]<=available ? 0 : 1;
+        if (admin_width[variant]<=available) {
+            SelectObject(dc,small_font);
+            RECT key=label; key.left=key.right-admin_width[variant];
+            RECT shield={key.left-gap-glyph_size,key.top,key.left-gap,key.bottom};
+            SetTextColor(dc,ink);
+            w_theme_draw_text(dc,admin_keys[variant],-1,&key,DT_RIGHT|DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
+            w_glyph(dc,0xea18,shield,ink);
+            label.right=shield.left-gap;
+        }
+    } else if (kind && !group && group_width[kind].context+gap<=(label.right-label.left)/2) {
+        SelectObject(dc,small_font);
+        RECT context=label;
+        context.left=context.right-group_width[kind].context;
+        SetTextColor(dc,highlighted ? ink : w_theme_accent());
+        w_theme_draw_text(dc,groups[kind].label,-1,&context,DT_SINGLELINE|DT_VCENTER|DT_NOPREFIX);
+        label.right=context.left-gap;
     }
     SelectObject(dc, text_font);
     SetTextColor(dc, ink);
-    DrawTextW(dc, w_label(source), -1, &label, DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
+    w_theme_draw_text(dc, w_label(source), -1, &label, DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
     if (glyph && (!entry || !w_app_icon(dc,entry->system_icon,icon)))
-        w_glyph(dc, glyph, icon, selected ? ink : w_theme_accent());
+        w_glyph(dc, glyph, icon, highlighted ? ink : w_theme_accent());
+    if ((state&LVIS_FOCUSED) && GetFocus()==list && !(SendMessageW(list,WM_QUERYUISTATE,0,0)&UISF_HIDEFOCUS)) {
+        InflateRect(&r,-px(2),-px(2));
+        DrawFocusRect(dc,&r);
+    }
     RestoreDC(dc, saved);
 }
 
@@ -499,20 +613,28 @@ void w_palette_focus(void) {
     }
 }
 
+static void w_restore_window(HWND previous);
+
 static void w_dismiss(bool restore_focus) {
     if (closing) return;
+    w_cancel_press();
     pending_ticket = 0;
     pending_restore = restore_focus && GetForegroundWindow() == panel ? return_to : NULL;
     return_to = NULL;
     HWND capture = GetCapture();
     if (capture == panel || IsChild(panel, capture))
         ReleaseCapture();
-    if (placement.anchor.bar && placement.leave.ms && GetForegroundWindow() != panel && IsWindowVisible(panel)) {
-        closing = true;
+    closing = true;
+    if (IsWindowVisible(panel)) {
         SetWindowLongPtrW(panel, GWL_EXSTYLE, GetWindowLongPtrW(panel,GWL_EXSTYLE) | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
-        if (w_layer_fade_to(panel, &fade, 0, placement.leave, true)) return;
+        if (pending_restore) w_restore_window(pending_restore);
+        if (GetForegroundWindow()!=panel) {
+            pending_restore=NULL;
+            if (w_layer_fade_to(panel,&fade,0,w_palette_timing(false),motion_enabled)) return;
+        }
     }
     KillTimer(panel, layer_fade_timer);
+    fade.start = 0;
     ShowWindow(panel, SW_HIDE);
     if (pending_restore)
         PostMessageW(panel, restore_foreground, 0, 0);
@@ -523,7 +645,8 @@ static bool w_palette_contains(HWND hit) {
     HWND root = GetAncestor(hit, GA_ROOT);
     if (root == panel || GetAncestor(hit, GA_ROOTOWNER) == panel) return true;
     // Some input methods show a separate, non-activating candidate window.
-    return composing && (root == ImmGetDefaultIMEWnd(edit) || (GetClassLongPtrW(root,GCL_STYLE) & CS_IME));
+    return (root == ImmGetDefaultIMEWnd(edit) || (GetClassLongPtrW(root,GCL_STYLE) & CS_IME)) &&
+           (composing || w_native_edit_ime_active(edit));
 }
 
 void w_palette_outside(HWND hit) {
@@ -546,7 +669,7 @@ static void w_restore_window(HWND previous) {
     if (w_palette_shown() || previous == GetDesktopWindow() || !IsWindowVisible(previous) || IsIconic(previous))
         return;
     HWND foreground = GetForegroundWindow();
-    if (foreground && foreground != GetDesktopWindow() && IsWindowVisible(foreground) &&
+    if (foreground && foreground!=panel && foreground != GetDesktopWindow() && IsWindowVisible(foreground) &&
         !(GetWindowLongPtrW(foreground, GWL_EXSTYLE) & WS_EX_NOACTIVATE))
         return;
     HWND popup = GetLastActivePopup(previous);
@@ -606,25 +729,31 @@ void w_palette_line_result(UINT request, DWORD error) {
 static LRESULT CALLBACK w_results_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR subclass, DWORD_PTR data) {
     (void)subclass;
     (void)data;
-    if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP) {
+    if (msg==WM_LBUTTONDOWN || msg==WM_LBUTTONUP || (msg==WM_MOUSEMOVE && pressed_index>=0)) {
         LVHITTESTINFO hit = {.pt={GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}};
         int index = ListView_HitTest(w, &hit);
-        int source = w_source(index);
         if (msg == WM_LBUTTONDOWN) {
-            pressed_result = source;
-            if (source != no_result) { w_select(index); manual_selection = true; SetCapture(w); }
+            w_cancel_press();
+            if (w_source(index)!=no_result) {
+                w_select(index); manual_selection=true;
+                SetCapture(w);
+                if (GetCapture()!=w) return 0;
+                pressed_index=index; pressed_inside=true;
+                ListView_RedrawItems(w,index,index);
+            }
             return 0;
-        }
-        else {
-            bool pick = source != no_result && pressed_result == source;
-            pressed_result = no_result;
-            if (GetCapture() == w) ReleaseCapture();
+        } else if (msg==WM_LBUTTONUP) {
+            bool pick=index>=0 && index==pressed_index;
+            w_cancel_press();
             if (pick && w_palette_shown()) { w_select(index); w_accept(false); }
             return 0;
+        } else if (pressed_inside!=(index==pressed_index)) {
+            pressed_inside=index==pressed_index;
+            ListView_RedrawItems(w,pressed_index,pressed_index);
         }
-    } else if (msg == WM_CANCELMODE || msg == WM_CAPTURECHANGED || msg == WM_LBUTTONDBLCLK)
-        pressed_result = no_result;
-    else if (msg == WM_CHAR && wp >= L' ' && GetKeyState(VK_CONTROL) >= 0) {
+    } else if (msg == WM_CANCELMODE || msg == WM_CAPTURECHANGED || msg == WM_LBUTTONDBLCLK) {
+        w_cancel_press();
+    } else if (msg == WM_CHAR && wp >= L' ' && GetKeyState(VK_CONTROL) >= 0) {
         SetFocus(edit);
         return SendMessageW(edit, msg, wp, lp);
     }
@@ -650,7 +779,7 @@ static LRESULT CALLBACK w_edit_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UINT
             SetBkMode(dc,TRANSPARENT);
             SelectObject(dc,text_font);
             SetTextColor(dc,w_theme_hint());
-            DrawTextW(dc,search_hint,-1,&box,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
+            w_theme_draw_text(dc,search_hint,-1,&box,DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
             RestoreDC(dc,saved);
             if (msg == WM_PAINT) ReleaseDC(w,dc);
         }
@@ -660,6 +789,22 @@ static LRESULT CALLBACK w_edit_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UINT
 }
 
 static LRESULT CALLBACK w_palette_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg==WM_FONTCHANGE || (msg==WM_SETTINGCHANGE && wp==SPI_SETNONCLIENTMETRICS)) {
+        font_dpi=0;
+        w_palette_size();
+        if (placement.anchor.bar && w_palette_shown()) w_palette_reanchor(&placement.anchor);
+    }
+    if (msg==winwm_motion_updated || msg==WM_SYSCOLORCHANGE ||
+        (msg==WM_SETTINGCHANGE && (wp==SPI_SETCLIENTAREAANIMATION || w_appearance_setting(wp,lp)))) {
+        motion_enabled=!placement.follow_theme_motion || w_theme_motion_enabled();
+        if (fade.start && !w_layer_fade_to(w,&fade,fade.target,w_palette_timing(!closing),motion_enabled) && closing)
+            ShowWindow(w,SW_HIDE);
+    }
+    // Keep WS_THICKFRAME/WS_SYSMENU for native mouse and keyboard resizing.
+    // Both palette modes paint their own border into the full window rectangle.
+    if (msg == WM_NCCALCSIZE || msg == WM_NCPAINT) return 0;
+    if (msg == WM_NCACTIVATE) return TRUE;
+    if (msg == WM_ERASEBKGND) return 1;
     if (msg == WM_NOTIFY && ((NMHDR *)lp)->hwndFrom == list) {
         NMHDR *note = (NMHDR *)lp;
         if (note->code == LVN_GETDISPINFOW) {
@@ -682,24 +827,22 @@ static LRESULT CALLBACK w_palette_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     }
     LRESULT color_result;
     if (w_theme_message(w, msg, wp, lp, &color_result)) return color_result;
+    if (msg==winwm_theme_updated && list) {
+        ListView_SetBkColor(list,w_theme_background());
+        ListView_SetTextBkColor(list,w_theme_background());
+        return 0;
+    }
     if (msg == WM_PAINT || msg == WM_PRINTCLIENT) {
-        COLORREF background=w_theme_background();
-        if (list && ListView_GetBkColor(list)!=background) {
-            ListView_SetBkColor(list,background);
-            ListView_SetTextBkColor(list,background);
-        }
         PAINTSTRUCT ps;
         HDC dc = msg == WM_PAINT ? BeginPaint(w, &ps) : (HDC)wp;
         RECT area;
         GetClientRect(w, &area);
-        if (placement.anchor.bar) {
-            HBRUSH stroke = CreateSolidBrush(w_theme_separator());
-            if (stroke) { FrameRect(dc, &area, stroke); DeleteObject(stroke); }
-        }
-        RECT field = {px(16),px(50),area.right-px(16),px(89)};
+        FillRect(dc,&area,w_theme_brush());
+        w_theme_frame(dc,&area,palette_dpi);
         int saved = SaveDC(dc);
-        w_round_rect(dc, field, w_theme_background(), w_theme_separator(), px(10));
-        RECT icon = {field.left+px(6),field.top,field.left+px(34),field.bottom};
+        w_theme_input_frame(dc,&search_box,w_hover_amount(edit,0),GetFocus()==edit,IsWindowEnabled(edit));
+        RECT icon = search_box;
+        icon.right = icon.left + w_theme_button_size(palette_dpi);
         SetBkMode(dc, TRANSPARENT);
         w_glyph(dc, 0xe721, icon, w_theme_accent());
         RestoreDC(dc,saved);
@@ -707,21 +850,23 @@ static LRESULT CALLBACK w_palette_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == WM_NCHITTEST) {
-        LRESULT hit = DefWindowProcW(w,msg,wp,lp);
+        if (placement.anchor.bar) return HTCLIENT;
         POINT p = {GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
         ScreenToClient(w,&p);
-        if (!placement.anchor.bar && hit == HTCLIENT && p.y < px(48)) {
-            HWND child = ChildWindowFromPointEx(w,p,CWP_SKIPINVISIBLE|CWP_SKIPDISABLED);
-            if (child != back && child != close_button) return HTCAPTION;
-        }
-        return hit;
+        HWND child = ChildWindowFromPointEx(w,p,CWP_SKIPINVISIBLE);
+        if (child && child!=w && child!=heading && child!=footer) return HTCLIENT;
+        LRESULT hit=w_popup_resize_hit(w,p);
+        return hit==HTCLIENT && p.y<search_box.top ? HTCAPTION : hit;
     }
     if (msg == WM_GETMINMAXINFO) {
         UINT dpi = GetDpiForWindow(w);
-        ((MINMAXINFO *)lp)->ptMinTrackSize = (POINT){MulDiv(240,dpi,96), MulDiv(195,dpi,96)};
+        int button=w_theme_button_size(dpi), gap=w_theme_spacing(dpi);
+        int row,chrome=w_viewport_chrome(dpi,&row);
+        int minimum=chrome+row;
+        ((MINMAXINFO *)lp)->ptMinTrackSize = (POINT){max(MulDiv(240,dpi,96),2*button+7*gap),minimum};
         return 0;
     }
-    if (msg == WM_LBUTTONDOWN && GET_Y_LPARAM(lp) >= px(50) && GET_Y_LPARAM(lp) <= px(90)) {
+    if (msg == WM_LBUTTONDOWN && PtInRect(&search_box,(POINT){GET_X_LPARAM(lp),GET_Y_LPARAM(lp)})) {
         SetFocus(edit);
         return 0;
     }
@@ -731,7 +876,7 @@ static LRESULT CALLBACK w_palette_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             pending_ticket = 0;
             launch_status = NULL;
             w_navigation_hint();
-            w_filter();
+            w_filter(true);
         }
         if ((HWND)lp == back && HIWORD(wp) == BN_CLICKED) { w_route(palette_flat); SetFocus(edit); }
         if ((HWND)lp == close_button && HIWORD(wp) == BN_CLICKED) w_dismiss(true);
@@ -752,12 +897,7 @@ static LRESULT CALLBACK w_palette_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     }
     if (msg == WM_CLOSE) { w_dismiss(true); return 0; }
     if (msg == WM_TIMER && wp == layer_fade_timer) {
-        if (!w_layer_fade_tick(w, &fade, true) && closing) ShowWindow(w, SW_HIDE);
-        return 0;
-    }
-    if ((msg == WM_DISPLAYCHANGE || (msg == WM_SETTINGCHANGE && wp == SPI_SETWORKAREA)) &&
-        placement.anchor.bar && w_palette_shown()) {
-        w_dismiss(false);
+        if (fade.start && !w_layer_fade_tick(w,&fade,motion_enabled) && closing) ShowWindow(w,SW_HIDE);
         return 0;
     }
     if (msg == WM_ACTIVATE && LOWORD(wp) == WA_INACTIVE) PostMessageW(w,check_deactivation,0,0);
@@ -783,12 +923,12 @@ static bool w_create_palette(void) {
     heading = CreateWindowW(L"STATIC",L"",visible|SS_CENTERIMAGE|SS_NOPREFIX|SS_ENDELLIPSIS,0,0,0,0,panel,NULL,inst,NULL);
     close_button = CreateWindowW(L"BUTTON",L"Close",visible|WS_TABSTOP|BS_OWNERDRAW,0,0,0,0,panel,NULL,inst,NULL);
     if (back) w_icon_button(back,L"\xe72b",L"Back to categories");
-    if (close_button) w_icon_button(close_button,L"\xe8bb",L"Close");
+    if (close_button) w_icon_button(close_button,L"\xe711",L"Close");
     // The static label precedes the edit in the child order for its accessible name.
     HWND search_name = CreateWindowW(L"STATIC",L"Search",visible,0,0,0,0,panel,NULL,inst,NULL);
     edit = CreateWindowExW(0,L"EDIT",L"",visible|WS_TABSTOP|ES_AUTOHSCROLL,0,0,0,0,panel,NULL,inst,NULL);
     list = CreateWindowExW(0,WC_LISTVIEWW,L"Results",visible|WS_TABSTOP|LVS_REPORT|LVS_NOCOLUMNHEADER|
-                           LVS_OWNERDATA|LVS_SINGLESEL|LVS_SHOWSELALWAYS|LVS_SHAREIMAGELISTS,
+                           LVS_OWNERDATA|LVS_SINGLESEL|LVS_SHOWSELALWAYS,
                            0,0,0,0,panel,NULL,inst,NULL);
     empty_text = CreateWindowW(L"STATIC",L"No matches",WS_CHILD|SS_CENTER|SS_CENTERIMAGE,
                                0,0,0,0,panel,NULL,inst,NULL);
@@ -802,7 +942,7 @@ static bool w_create_palette(void) {
     LVCOLUMNW column = {.mask=LVCF_TEXT|LVCF_WIDTH,.cx=1,.pszText=L"Result"};
     ListView_InsertColumn(list,0,&column);
     ListView_SetExtendedListViewStyle(list,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER);
-    SetWindowTheme(list,L"DarkMode_Explorer",NULL);
+    w_theme_native_controls(panel);
     w_palette_size();
     return true;
 }
@@ -812,6 +952,7 @@ static bool w_cache(const w_palette_entry *entries, int count, const w_palette_a
     int app_count = apps ? apps->count : 0;
     if (count < 0 || app_count < 0 || (!entries && count) ||
         (int64_t)count+app_count > INT_MAX-palette_group_count-1) return false;
+    w_cancel_press();
     int total = count+app_count;
     if (!results || total != row_count) {
         w_result *slots = realloc(results, ((size_t)total+palette_group_count+1)*sizeof(*slots));
@@ -858,16 +999,12 @@ void w_palette_open(const w_palette_site *site, const wchar_t *title, const w_pa
     pending_restore = NULL;
     bool preserve = w_palette_visible(title);
     if (!panel && !w_create_palette()) return;
-    int selected = preserve && manual_selection ? w_source(w_selected_index()) : no_result;
-    enum w_palette_group old_group = palette_flat;
-    uint64_t old_identity = 0;
-    wchar_t old_label[palette_text_capacity] = {0}, old_alias[palette_text_capacity] = {0};
-    if (selected >= 0) {
-        old_group = rows[selected].entry.group;
-        old_identity = rows[selected].entry.identity;
-        wcscpy(old_label,rows[selected].entry.label);
-        wcscpy(old_alias,rows[selected].alias);
-    }
+    int old_index = preserve && manual_selection ? w_selected_index() : -1;
+    int top = preserve ? ListView_GetTopIndex(list) : 0;
+    bool selection_visible = old_index >= top && old_index < top + ListView_GetCountPerPage(list);
+    RECT old_bounds;
+    w_result_key selected=w_result_at(old_index);
+    w_result_key first=w_result_at(top>0 && ListView_GetItemRect(list,top,&old_bounds,LVIR_BOUNDS) ? top : -1);
     if (!w_cache(entries,count,apps) && (!apps || !apps->count || !w_cache(entries,count,NULL))) {
         select_entry = NULL;
         run_line = NULL;
@@ -882,42 +1019,49 @@ void w_palette_open(const w_palette_site *site, const wchar_t *title, const w_pa
     }
     // Leave room beyond the dispatch limit so an oversized paste stays invalid.
     SendMessageW(edit,EM_SETLIMITTEXT,run_line ? UINT16_MAX : palette_text_capacity-1,0);
-    for (size_t i=0; i < count_of(icon_cache); ++i) {
-        if (icon_cache[i].handle) DestroyIcon(icon_cache[i].handle);
-    }
-    memset(icon_cache,0,sizeof(icon_cache));
     app_icons = (HIMAGELIST)app_images;
     lstrcpynW(root_title,title,count_of(root_title));
-    ListView_SetBkColor(list,w_theme_background());
-    ListView_SetTextBkColor(list,w_theme_background());
-    SetWindowTextW(panel,title);
-    if (preserve && (site->monitor != placement.monitor || site->anchor.bar != placement.anchor.bar ||
+    if (ListView_GetBkColor(list) != w_theme_background()) {
+        ListView_SetBkColor(list,w_theme_background());
+        ListView_SetTextBkColor(list,w_theme_background());
+    }
+    if (!preserve) SetWindowTextW(panel,title);
+    if (preserve && (site->monitor != placement.monitor || !w_popup_same_source(&site->anchor,&placement.anchor) ||
         !EqualRect(&site->anchor.button, &placement.anchor.button) || strcmp(site->anchor.edge, placement.anchor.edge))) {
         w_palette_position(site);
         w_palette_focus();
     }
     if (preserve && (!group || in_group[group])) {
-        w_filter();
-        if (selected != no_result) {
-            for (int i=0; i < result_count; ++i) {
-                int src = results[i].row;
-                if (src < 0 ? src == selected : selected >= 0 && rows[src].entry.group == old_group &&
-                    (old_identity ? rows[src].entry.identity == old_identity :
-                     !wcscmp(rows[src].entry.label,old_label) && !wcscmp(rows[src].alias,old_alias))) {
-                    w_select(i);
-                    manual_selection = true;
-                    break;
-                }
-            }
-        }
+        w_filter(false);
+        int restored=w_locate_result(&selected), target=max(0,restored);
+        if (result_count && target != w_selected_index())
+            ListView_SetItemState(list,target,LVIS_SELECTED|LVIS_FOCUSED,LVIS_SELECTED|LVIS_FOCUSED);
+        int first_index=w_locate_result(&first);
+        RECT bounds;
+        if (first_index>=0 && ListView_GetItemRect(list,first_index,&bounds,LVIR_BOUNDS) && bounds.top!=old_bounds.top)
+            ListView_Scroll(list,0,bounds.top-old_bounds.top);
+        if (restored>=0 && selection_visible && (target!=old_index || (first_index>=0 && first_index!=top)))
+            ListView_EnsureVisible(list,target,FALSE);
+        manual_selection = restored>=0;
         return;
     }
     group = palette_flat;
     w_route(palette_flat);
     if (preserve) return;
+    opening_rows=result_count;
     if (!w_palette_shown()) return_to = GetForegroundWindow();
     w_palette_position(site);
     w_palette_focus();
+}
+
+void w_palette_reanchor(const w_popup_anchor *anchor) {
+    if (!w_palette_shown() || !placement.anchor.bar) return;
+    if (!anchor) { w_dismiss(false); return; }
+    placement.anchor=*anchor;
+    placement.monitor=MonitorFromWindow(anchor->bar,MONITOR_DEFAULTTONEAREST);
+    RECT old, next=w_button_bounds(anchor,GetDpiForWindow(anchor->bar));
+    if (!GetWindowRect(panel,&old) || !EqualRect(&old,&next))
+        SetWindowPos(panel,NULL,next.left,next.top,next.right-next.left,next.bottom-next.top,SWP_NOACTIVATE|SWP_NOZORDER);
 }
 
 void w_palette_position(const w_palette_site *site) {
@@ -934,7 +1078,7 @@ void w_palette_position(const w_palette_site *site) {
     if (attached) {
         bounds = w_button_bounds(&site->anchor, dpi);
     } else {
-        int width = MulDiv(520,dpi,96), height = MulDiv(grouped ? 512 : 404,dpi,96);
+        int width = MulDiv(520,dpi,96), height = w_initial_height(dpi,mi.rcWork.bottom-mi.rcWork.top);
         UINT old_dpi = GetDpiForWindow(panel);
         RECT current;
         if (!placement.anchor.bar && w_palette_shown() && old_dpi && GetWindowRect(panel,&current)) {
@@ -948,7 +1092,8 @@ void w_palette_position(const w_palette_site *site) {
         bounds.right = bounds.left + width;
         bounds.bottom = bounds.top + height;
     }
-    bool opening = !w_palette_shown();
+    bool hidden = !IsWindowVisible(panel);
+    bool opening = hidden || closing;
     bool was_attached=placement.anchor.bar!=NULL;
     closing = false;
     placement = *site;
@@ -959,15 +1104,13 @@ void w_palette_position(const w_palette_site *site) {
     if (next_style!=style) SetWindowLongPtrW(panel,GWL_STYLE,next_style);
     if (next_ex!=ex) SetWindowLongPtrW(panel,GWL_EXSTYLE,next_ex);
     if (attached!=was_attached) w_theme_material(panel);
-    KillTimer(panel, layer_fade_timer);
-    if (attached) {
-        DWORD corner = DWMWCP_ROUND;
-        DwmSetWindowAttribute(panel, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
+    if (opening || attached != was_attached) {
+        if (hidden) fade.value=0;
+        motion_enabled=!placement.follow_theme_motion || w_theme_motion_enabled();
+        w_layer_fade_to(panel,&fade,255,w_palette_timing(true),opening && motion_enabled);
     }
-    fade.value=attached && opening ? 0 : 255;
-    w_layer_fade_to(panel,&fade,255,site->enter,attached && opening && site->enter.ms>0);
     SetWindowPos(panel,HWND_TOPMOST,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,
-                 SWP_SHOWWINDOW|SWP_NOACTIVATE|SWP_FRAMECHANGED);
+                 SWP_SHOWWINDOW|SWP_NOACTIVATE|(next_style != style || next_ex != ex ? SWP_FRAMECHANGED : 0));
 }
 
 bool w_palette_visible(const wchar_t *title) {
@@ -1016,8 +1159,11 @@ static void w_delete_word(bool backwards) {
 
 bool w_palette_message(MSG *msg) {
     if (!w_palette_shown() || !(msg->hwnd==panel || IsChild(panel,msg->hwnd)) ||
-        (msg->message != WM_KEYDOWN && msg->message != WM_SYSKEYDOWN) || composing) return false;
+        (msg->message != WM_KEYDOWN && msg->message != WM_SYSKEYDOWN) || composing ||
+        (msg->hwnd==edit && w_native_ime_key(msg))) return false;
     bool ctrl = GetKeyState(VK_CONTROL) < 0, shift = GetKeyState(VK_SHIFT) < 0;
+    if ((msg->lParam & (1L<<30)) && (msg->wParam==VK_RETURN || msg->wParam==VK_ESCAPE) &&
+        !ctrl && msg->message==WM_KEYDOWN) return true;
     if (GetKeyState(VK_MENU) < 0) {
         if (group && msg->wParam == VK_LEFT) { w_route(palette_flat); SetFocus(edit); return true; }
         return false;

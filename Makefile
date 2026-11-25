@@ -31,16 +31,16 @@ build/obj/%.o: src/%.c compile.rsp Makefile | $$(@D)
 build/obj/lua/%.o: third_party/lua/%.c compile.rsp Makefile | $$(@D)
 	"$(CC)" @compile.rsp -MMD -MP -c $< -o $@
 
-build/install_res.o: src/install/install.rc src/install/app.manifest Makefile | build
+build/install_res.o: src/install/install.rc src/install/app.manifest third_party/lua/LICENSE Makefile | build
 	"$(WINDRES)" -I src/install -i $< -O coff -o $@
 
-build/config_res.o: assets/config.rc assets/winwm.lua third_party/lua/LICENSE Makefile | build
+build/config_res.o: assets/config.rc assets/app.manifest assets/winwm.lua third_party/lua/LICENSE Makefile | build
 	"$(WINDRES)" -I assets -i $< -O coff -o $@
 
 $(staged): compile.rsp Makefile | build
 build/winwm.exe: build.rsp lua.rsp $(filter %.o,$(main_inputs))
 	"$(CC)" @compile.rsp $(main_inputs) -o $@
-build/winwm_install.exe: install.rsp $(filter %.o,$(install_inputs))
+build/winwm_install.exe: install.rsp lua.rsp $(filter %.o,$(install_inputs))
 	"$(CC)" @compile.rsp $(install_inputs) -o $@
 
 # Publish in order after all links succeed. A running manager can lock the first file.

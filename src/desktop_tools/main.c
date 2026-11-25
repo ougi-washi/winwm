@@ -1,6 +1,7 @@
 #include "desktop_tools/entry.h"
 #include "desktop_tools/tools.h"
 #include "desktop_tools/adapter.h"
+#include "theme/dialog.h"
 #include "theme/theme.h"
 #include "os_win32/environment.h"
 #include <powrprof.h>
@@ -27,7 +28,6 @@ UINT w_tool_work_area(MONITORINFO *info) {
 
 static int w_run_tool(const wchar_t *mode) {
     if (!wcsncmp(mode,L"dns-",4)) return (int)w_adapter_apply_dns(mode+4);
-    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     if (!wcscmp(mode,L"bar_settings")) return w_toolbar_run();
     if (!wcscmp(mode,L"capture_window") || !wcsncmp(mode,L"capture_window-",15))
         return w_capture_run(mode);
@@ -38,7 +38,6 @@ static int w_run_tool(const wchar_t *mode) {
         if (!w_os_cache_read(cfg) && !w_os_config_load(cfg,diagnostic,sizeof(diagnostic)))
             w_config_defaults(cfg);
         w_theme_configure(cfg);
-        w_tool_popup_preferences(cfg);
         if (!wcscmp(mode, L"project")) {
             w_environment_start(NULL,0);
             int result = w_project_run(cfg);
@@ -66,7 +65,7 @@ static int w_run_tool(const wchar_t *mode) {
     if (!wcscmp(mode, L"capture_region") || !wcscmp(mode, L"record"))
         result = w_capture_run(mode);
     else if (!wcscmp(mode, L"sleep") || !wcscmp(mode, L"restart")) {
-        if (MessageBoxW(NULL, !wcscmp(mode, L"sleep") ? L"Put this PC to sleep?" : L"Restart this PC?",
+        if (w_dialog(NULL, !wcscmp(mode, L"sleep") ? L"Put this PC to sleep?" : L"Restart this PC?",
                         L"Power", MB_OKCANCEL | MB_DEFBUTTON2) == IDOK) {
             if (!wcscmp(mode, L"sleep"))
                 result = !SetSuspendState(FALSE, FALSE, FALSE);

@@ -24,14 +24,14 @@ enum { bar_tray_slots = 8 };
 typedef struct w_bar_window {
     HWND hwnd;
     struct w_bar_access *access;
-    int output, dpi;
+    int output, dpi, font_dpi;
     HFONT font, heading_font;
     w_icon_atlas icons;
     bar_icon network_icon;
     HDC buffer_dc;
     HBITMAP buffer, previous_bitmap;
     SIZE buffer_size;
-    int hover, wheel_hit, wheel_remainder, audio_percent;
+    int hover, wheel_source, wheel_remainder, audio_percent;
     bool calendar_date, audio_muted;
     bool motion_allowed, modules_ticking, pointer_inside, high_contrast;
     POINT pointer;
@@ -43,7 +43,7 @@ typedef struct w_bar_window {
         HKL keyboard_layout;
         wchar_t keyboard_name[208];
         RECT parts[3];
-        POINT anchor;
+        w_layer_fade fade;
         ULONGLONG deadline;
         bool pending, showing;
     } tip;
@@ -55,10 +55,13 @@ typedef struct w_bar_window {
     const char *docked_edge;
     bool pressed, dragging;
     void (*dock)(int output);
+    void (*anchors_changed)(struct w_bar_window *bar);
+    bool anchors_pending;
     const w_desktop_config *config;
     w_bar_view view;
     struct w_bar_hit {
         RECT box;
+        RECT tray_slot;
         char action[128], module[56], instance[56];
         wchar_t tooltip[256], text[256];
         const w_module_style *style;
@@ -73,6 +76,8 @@ typedef struct w_bar_window {
     } *hits;
     struct w_bar_cell *cells;
     int hit_count, cell_capacity;
+    int group_count[3], group_length[3];
+    bool measure_dirty, has_tray;
     bar_action invoke;
     bar_custom custom;
     bool (*detail)(const char *module, wchar_t *text, int cap);
@@ -81,7 +86,7 @@ typedef struct w_bar_window {
     void (*tray_activate)(uint64_t key, UINT event, POINT screen_point);
     struct {
         int source, suppressed, first, page, total;
-        bool open;
+        bool open, dirty;
         double position, from;
         ULONGLONG start;
         uint64_t context_key;
@@ -94,12 +99,14 @@ typedef struct w_bar_window {
 //~ Bar Interface
 
 bool w_bar_create(w_bar_window *b, int output, const w_desktop_config *config, bar_action invoke);
+HFONT w_bar_create_label_font(UINT dpi);
 w_rect w_bar_position(w_bar_window *b, w_rect screen, w_rect available, int dpi, bool hidden);
 void w_bar_invalidate(w_bar_window *b, const char *module);
 void w_bar_set_audio(w_bar_window *b, int percent, bool muted);
 void w_bar_update(w_bar_window *b, const w_bar_view *v);
 bool w_bar_activate_hit(w_bar_window *bar, int hit);
 bool w_bar_anchor(const w_bar_window *bar, int hit, w_popup_anchor *anchor);
+bool w_bar_resolve_anchor(const w_bar_window *bar,const w_popup_anchor *source,w_popup_anchor *result);
 bool w_bar_tray_bounds(const w_bar_window *bar, uint64_t key, RECT *screen);
 void w_bar_invoke(w_bar_window *bar, int hit, const char *action);
 

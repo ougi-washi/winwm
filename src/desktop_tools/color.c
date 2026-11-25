@@ -1,6 +1,7 @@
 #include "desktop_tools/tools.h"
 #include "theme/theme.h"
 #include <shellscalingapi.h>
+#include <uxtheme.h>
 #include <stdio.h>
 
 typedef struct {
@@ -12,6 +13,7 @@ typedef struct {
     COLORREF sample;
     HFONT font;
     UINT dpi;
+    int gap, step, line, label_width;
     bool busy;
 } w_picker;
 
@@ -25,22 +27,33 @@ static DWORD w_pixel(const w_picker *p, int x, int y) {
 static void w_sample(HWND w, w_picker *p, POINT point) {
     MONITORINFO mi = {.cbSize = sizeof(mi)};
     HMONITOR monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONEAREST);
-    GetMonitorInfoW(monitor, &mi);
-    if (p->monitor != monitor) {
+    if (!GetMonitorInfoW(monitor, &mi)) return;
+    bool monitor_changed=p->monitor!=monitor;
+    if (monitor_changed) {
         p->monitor = monitor;
         UINT dpi, vertical;
         if (SUCCEEDED(GetDpiForMonitor(monitor,MDT_EFFECTIVE_DPI,&dpi,&vertical))) p->dpi = dpi;
-        HFONT next = CreateFontW(-w_px(p,13),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,0,0,
-                                 CLEARTYPE_QUALITY,0,L"Segoe UI");
-        if (next) { if (p->font) DeleteObject(p->font); p->font = next; }
+        HFONT next = w_theme_message_font(p->dpi);
+        if (next) { DeleteObject(p->font); p->font = next; }
+        p->step = max(1,w_px(p,7));
+        static const wchar_t *const labels[]={L"#DDDDDD",L"Enter to copy",L"Clipboard busy",L"Esc to cancel"};
+        p->line = w_theme_line_height(p->font);
+        p->label_width = w_tool_widest_option(p->font,labels,count_of(labels));
     }
     point.x = max(mi.rcMonitor.left, min(point.x, mi.rcMonitor.right-1));
     point.y = max(mi.rcMonitor.top, min(point.y, mi.rcMonitor.bottom-1));
+    bool moved=IsRectEmpty(&p->lens) || point.x!=p->point.x || point.y!=p->point.y;
+    int gap=w_theme_spacing(p->dpi);
+    if (!moved && !monitor_changed && p->gap==gap) return;
+    p->gap=gap;
+    if (moved) p->busy=false;
     p->point = point;
     DWORD pixel = w_pixel(p,point.x-p->desktop.left,point.y-p->desktop.top);
     p->sample = RGB(pixel >> 16, pixel >> 8, pixel);
     InvalidateRect(w, &p->lens, FALSE);
-    int pad = w_px(p, 18), width = w_px(p, 188), height = w_px(p, 88);
+    int pad = 2*p->gap;
+    int width = min(mi.rcMonitor.right-mi.rcMonitor.left, 4*p->gap+9*p->step+p->label_width);
+    int height = min(mi.rcMonitor.bottom-mi.rcMonitor.top, 2*p->gap+max(9*p->step,3*p->line+p->gap));
     int x = point.x + pad, y = point.y + pad;
     if (x + width > mi.rcMonitor.right) x = point.x - width - pad;
     if (y + height > mi.rcMonitor.bottom) y = point.y - height - pad;
@@ -71,15 +84,24 @@ static bool w_copy_sample(HWND w, COLORREF color) {
     return false;
 }
 
-static void w_paint_picker(HWND w, const w_picker *p) {
-    PAINTSTRUCT paint;
-    HDC dc = BeginPaint(w, &paint);
-    RECT r = paint.rcPaint, lens = p->lens;
-    BitBlt(dc, r.left,r.top,r.right-r.left,r.bottom-r.top,p->image,r.left,r.top,SRCCOPY);
-    FillRect(dc,&lens,w_theme_brush());
-    SetDCBrushColor(dc,w_theme_accent());
-    FrameRect(dc,&lens,GetStockObject(DC_BRUSH));
-    int step = max(1,w_px(p,7)), left = lens.left+w_px(p,10), top = lens.top+w_px(p,12);
+static void w_paint_picker(HDC target,RECT r,const w_picker *p) {
+    RECT lens = p->lens;
+    int saved = SaveDC(target);
+    ExcludeClipRect(target,lens.left,lens.top,lens.right,lens.bottom);
+    BitBlt(target,r.left,r.top,r.right-r.left,r.bottom-r.top,p->image,r.left,r.top,SRCCOPY);
+    RestoreDC(target,saved);
+    HDC dc = target;
+    HPAINTBUFFER buffer = BeginBufferedPaint(target,&lens,BPBF_COMPATIBLEBITMAP,NULL,&dc);
+    if (!buffer) dc = target;
+    int state = SaveDC(dc);
+    BitBlt(dc,lens.left,lens.top,lens.right-lens.left,lens.bottom-lens.top,p->image,lens.left,lens.top,SRCCOPY);
+    SelectObject(dc,w_theme_brush());
+    SelectObject(dc,GetStockObject(DC_PEN));
+    SetDCPenColor(dc,w_theme_separator());
+    int curve = min(lens.bottom-lens.top,2*w_theme_radius(p->dpi));
+    if (curve) RoundRect(dc,lens.left,lens.top,lens.right,lens.bottom,curve,curve);
+    else Rectangle(dc,lens.left,lens.top,lens.right,lens.bottom);
+    int step = p->step, left = lens.left+p->gap, top = (lens.top+lens.bottom-9*step)/2;
     int sx = p->point.x-p->desktop.left, sy = p->point.y-p->desktop.top;
     // Clamp each source pixel at the edge of the desktop so the center of
     // the loupe stays on the chosen pixel even in the four corners.
@@ -97,15 +119,16 @@ static void w_paint_picker(HWND w, const w_picker *p) {
     w_hex(p->sample,hex);
     SetBkMode(dc,TRANSPARENT);
     SetTextColor(dc,w_theme_foreground());
-    HGDIOBJ old = SelectObject(dc,p->font);
-    RECT label = {left+9*step+w_px(p,9),top,lens.right-w_px(p,5),lens.bottom};
-    DrawTextW(dc,hex,-1,&label,DT_SINGLELINE|DT_NOPREFIX);
-    label.top += w_px(p,24);
-    DrawTextW(dc,p->busy ? L"Clipboard busy" : L"Enter to copy",-1,&label,DT_SINGLELINE);
-    label.top += w_px(p,18);
-    DrawTextW(dc,L"Esc to cancel",-1,&label,DT_SINGLELINE);
-    SelectObject(dc,old);
-    EndPaint(w,&paint);
+    SelectObject(dc,p->font ? p->font : GetStockObject(DEFAULT_GUI_FONT));
+    int label_y=(lens.top+lens.bottom-3*p->line-p->gap)/2;
+    RECT label = {left+9*step+2*p->gap,label_y,lens.right-p->gap,lens.bottom};
+    w_theme_draw_text(dc,hex,-1,&label,DT_SINGLELINE|DT_NOPREFIX);
+    label.top += p->line+p->gap;
+    w_theme_draw_text(dc,p->busy ? L"Clipboard busy" : L"Enter to copy",-1,&label,DT_SINGLELINE);
+    label.top += p->line;
+    w_theme_draw_text(dc,L"Esc to cancel",-1,&label,DT_SINGLELINE);
+    RestoreDC(dc,state);
+    if (buffer) EndBufferedPaint(buffer,TRUE);
 }
 
 static LRESULT CALLBACK w_picker_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
@@ -113,6 +136,15 @@ static LRESULT CALLBACK w_picker_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         SetWindowLongPtrW(w,GWLP_USERDATA,(LONG_PTR)((CREATESTRUCTW *)lp)->lpCreateParams);
     w_picker *p = (w_picker *)GetWindowLongPtrW(w,GWLP_USERDATA);
     if (!p) return DefWindowProcW(w,msg,wp,lp);
+    bool metrics_changed = msg==WM_SETTINGCHANGE && wp==SPI_SETNONCLIENTMETRICS;
+    if (msg==winwm_theme_updated || msg==WM_DPICHANGED || metrics_changed) {
+        if (!IsRectEmpty(&p->lens)) {
+            if (msg==WM_DPICHANGED || metrics_changed) p->monitor=NULL;
+            w_sample(w,p,p->point);
+            InvalidateRect(w,&p->lens,FALSE);
+        }
+        return 0;
+    }
     if (msg == WM_MOUSEMOVE || msg == WM_LBUTTONUP) {
         POINT point;
         if (GetCursorPos(&point)) w_sample(w,p,point);
@@ -135,7 +167,13 @@ static LRESULT CALLBACK w_picker_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_DISPLAYCHANGE || msg == WM_KILLFOCUS || msg == WM_RBUTTONUP ||
         (msg == WM_KEYDOWN && wp == VK_ESCAPE)) { DestroyWindow(w); return 0; }
     if (msg == WM_ERASEBKGND) return 1;
-    if (msg == WM_PAINT) { w_paint_picker(w,p); return 0; }
+    if (msg == WM_PAINT) {
+        PAINTSTRUCT paint;
+        HDC dc = BeginPaint(w,&paint);
+        w_paint_picker(dc,paint.rcPaint,p);
+        EndPaint(w,&paint);
+        return 0;
+    }
     if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
     return DefWindowProcW(w,msg,wp,lp);
 }
@@ -158,6 +196,7 @@ int w_color_run(void) {
     ReleaseDC(NULL,screen);
     HWND window = NULL;
     if (captured) {
+        HRESULT buffered = BufferedPaintInit();
         HINSTANCE inst = GetModuleHandleW(NULL);
         WNDCLASSW wc = {.lpfnWndProc=w_picker_proc,.hInstance=inst,.lpszClassName=L"WinwmColorPicker",
                         .hCursor=LoadCursorW(NULL,IDC_CROSS)};
@@ -165,6 +204,7 @@ int w_color_run(void) {
         window = CreateWindowExW(WS_EX_TOPMOST|WS_EX_TOOLWINDOW,wc.lpszClassName,L"Pick screen color",
                                  WS_POPUP,x,y,width,height,NULL,NULL,inst,&p);
         if (window) {
+            w_theme_follow_overlay(window);
             POINT point = {x,y};
             GetCursorPos(&point);
             w_sample(window,&p,point);
@@ -174,6 +214,7 @@ int w_color_run(void) {
             MSG m;
             while (GetMessageW(&m,NULL,0,0)>0) { TranslateMessage(&m); DispatchMessageW(&m); }
         }
+        if (SUCCEEDED(buffered)) BufferedPaintUnInit();
     }
     if (previous) SelectObject(p.image,previous);
     if (bmp) DeleteObject(bmp);

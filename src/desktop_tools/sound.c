@@ -1,5 +1,6 @@
 #define COBJMACROS
 #include "desktop_tools/sound.h"
+#include "desktop_tools/rows.h"
 #include <initguid.h>
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
@@ -12,10 +13,15 @@ typedef struct {
     IAudioEndpointVolume *endpoint;
     ISimpleAudioVolume *session;
     bool is_default, calls_default;
+    wchar_t label[512];
 } w_sound_row;
 
 static w_sound_row *rows;
-static int used, capacity;
+static int used;
+typedef struct {
+    w_sound_row *rows;
+    int used, capacity;
+} w_sound_inventory;
 static IMMDeviceEnumerator *devices;
 static bool watching;
 static LONG changed;
@@ -78,7 +84,7 @@ static void w_sound_clear(void) {
         w_sound_release(rows[i]);
     free(rows);
     rows = NULL;
-    used = capacity = 0;
+    used = 0;
 }
 
 void w_sound_stop(void) {
@@ -91,27 +97,19 @@ void w_sound_stop(void) {
     last_view = -1;
 }
 
-static void w_add_sound(HWND list, const wchar_t *label, w_sound_row row) {
-    if (used == capacity) {
-        int size = capacity ? capacity * 2 : 16;
-        w_sound_row *next = realloc(rows, (size_t)size * sizeof(*rows));
-        if (!next) {
-            w_sound_release(row);
-            return;
-        }
-        rows = next;
-        capacity = size;
+static void w_add_sound(w_sound_inventory *inventory, const wchar_t *label, w_sound_row row) {
+    if (inventory->used == inventory->capacity) {
+        int size = inventory->capacity ? inventory->capacity * 2 : 16;
+        w_sound_row *next = realloc(inventory->rows, (size_t)size * sizeof(*next));
+        if (!next) { w_sound_release(row); return; }
+        inventory->rows = next;
+        inventory->capacity = size;
     }
-    LRESULT index = SendMessageW(list, LB_ADDSTRING, 0, (LPARAM)label);
-    if (index < 0) {
-        w_sound_release(row);
-        return;
-    }
-    SendMessageW(list, LB_SETITEMDATA, index, used);
-    rows[used++] = row;
+    lstrcpynW(row.label,label,count_of(row.label));
+    inventory->rows[inventory->used++] = row;
 }
 
-static void w_sessions(HWND list, IMMDevice *device, const wchar_t *endpoint) {
+static void w_sessions(w_sound_inventory *inventory, IMMDevice *device, const wchar_t *endpoint) {
     IAudioSessionManager2 *manager = NULL;
     if (FAILED(IMMDevice_Activate(device, &IID_IAudioSessionManager2, CLSCTX_ALL, NULL, (void **)&manager)))
         return;
@@ -144,7 +142,7 @@ static void w_sessions(HWND list, IMMDevice *device, const wchar_t *endpoint) {
                     *path ? (base ? base + 1 : path) :
                     IAudioSessionControl2_IsSystemSoundsSession(info) == S_OK ? L"System sounds" : L"Audio session";
                 swprintf(label, count_of(label), L"%.225ls   ·   %.225ls", name, endpoint);
-                w_add_sound(list, label, row);
+                w_add_sound(inventory, label, row);
                 CoTaskMemFree(display);
             } else w_sound_release(row);
             if (info) IAudioSessionControl2_Release(info);
@@ -178,9 +176,7 @@ void w_sound_refresh(HWND list, enum w_sound_view view) {
     }
     last_view = view;
     const wchar_t *id = selection[view];
-    SendMessageW(list, WM_SETREDRAW, FALSE, 0);
-    SendMessageW(list, LB_RESETCONTENT, 0, 0);
-    w_sound_clear();
+    w_sound_inventory next = {0};
     EDataFlow flow = view == sound_inputs ? eCapture : eRender;
     IMMDeviceCollection *collection = NULL;
     if (devices && SUCCEEDED(IMMDeviceEnumerator_EnumAudioEndpoints(devices,flow,DEVICE_STATE_ACTIVE,&collection))) {
@@ -200,7 +196,7 @@ void w_sound_refresh(HWND list, enum w_sound_view view) {
                 IPropertyStore_Release(properties);
             }
             const wchar_t *name = value.vt == VT_LPWSTR && value.pwszVal ? value.pwszVal : L"Audio device";
-            if (view == sound_apps) w_sessions(list, device, name);
+            if (view == sound_apps) w_sessions(&next, device, name);
             else {
                 w_sound_row row = {0};
                 if (SUCCEEDED(IMMDevice_GetId(device, &row.id)) &&
@@ -210,7 +206,7 @@ void w_sound_refresh(HWND list, enum w_sound_view view) {
                     wchar_t label[512];
                     swprintf(label, count_of(label), L"%.410ls%ls%ls", name,
                              row.is_default ? L"   ·   Default" : L"", row.calls_default ? L"   ·   Calls" : L"");
-                    w_add_sound(list, label, row);
+                    w_add_sound(&next, label, row);
                 } else w_sound_release(row);
             }
             PropVariantClear(&value);
@@ -221,15 +217,16 @@ void w_sound_refresh(HWND list, enum w_sound_view view) {
         CoTaskMemFree(calls_id);
         IMMDeviceCollection_Release(collection);
     }
+    w_sound_clear();
+    rows = next.rows;
+    used = next.used;
+    w_tool_rows items=w_rows_begin(list);
     selected = id ? -1 : 0;
-    for (int i = 0; i < used; ++i) {
-        if (id && !wcscmp(id, rows[i].id)) { selected = i; break; }
-        if (!id && rows[i].is_default) { selected = i; break; }
+    for (int i=0; i<used; ++i) {
+        int index=w_rows_put(&items,rows[i].label,i);
+        if ((id && !wcscmp(id,rows[i].id)) || (!id && rows[i].is_default)) selected=index;
     }
-    SendMessageW(list, LB_SETCURSEL, selected, 0);
-    if (scroll[view] > 0 && scroll[view] < used) SendMessageW(list, LB_SETTOPINDEX, scroll[view], 0);
-    SendMessageW(list, WM_SETREDRAW, TRUE, 0);
-    InvalidateRect(list, NULL, TRUE);
+    w_rows_end(&items,selected,id ? scroll[view] : w_rows_show_selection);
 }
 
 bool w_sound_state(int index, int *percent, BOOL *muted) {

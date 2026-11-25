@@ -34,6 +34,7 @@ typedef struct w_palette_site {
     HMONITOR monitor;
     w_popup_anchor anchor;
     w_transition enter, leave;
+    bool follow_theme_motion; // Read the current theme on entry, exit, and preference changes.
 } w_palette_site;
 
 ////////////////
@@ -46,6 +47,7 @@ void w_palette_line_result(UINT request, DWORD error);
 void w_palette_focus(void);
 void w_palette_position(const w_palette_site *site);
 const w_popup_anchor *w_palette_anchor(void);
+void w_palette_reanchor(const w_popup_anchor *anchor);
 void w_palette_outside(HWND hit);
 bool w_palette_shown(void);
 bool w_palette_close(void);

@@ -1,65 +1,127 @@
 #define COBJMACROS
+#include "theme/dialog.h"
 #include "desktop_tools/tools.h"
+#include "theme/theme.h"
 #include <dwmapi.h>
+#include <limits.h>
 #include <mfapi.h>
 #include <mfidl.h>
 #include <mfreadwrite.h>
 #include <shlobj.h>
 #include <stdio.h>
+#include <windowsx.h>
 
 ////////////////
 //~ Capture
 
 static POINT anchor, cursor;
-static bool dragging, selected;
+static bool dragging, selected, finishing;
 static RECT selection;
+static const COLORREF clear_pixel = RGB(1,0,1);
 
 ////////////////
 //~ Capture Functions
 
 static RECT w_region(void) {
-    RECT r = {min(anchor.x, cursor.x), min(anchor.y, cursor.y), max(anchor.x, cursor.x),
-              max(anchor.y, cursor.y)};
-    return r;
+    if (anchor.x==cursor.x && anchor.y==cursor.y) return (RECT){0};
+    // Mouse coordinates identify pixels; capture and paint both use an exclusive far edge.
+    return (RECT){min(anchor.x,cursor.x),min(anchor.y,cursor.y),max(anchor.x,cursor.x)+1,max(anchor.y,cursor.y)+1};
+}
+
+static POINT w_event_pixel(HWND w, LPARAM lp) {
+    RECT bounds;
+    GetClientRect(w,&bounds);
+    POINT p={GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
+    // A message contains signed 16-bit coordinates. Large virtual desktops can exceed that range.
+    if (bounds.right>SHRT_MAX || bounds.bottom>SHRT_MAX) {
+        POINT current;
+        if (GetCursorPos(&current) && ScreenToClient(w,&current)) p=current;
+    }
+    p.x=max(0,min(bounds.right-1,p.x));
+    p.y=max(0,min(bounds.bottom-1,p.y));
+    return p;
+}
+
+static void w_invalidate_around(HWND w,RECT r,RECT keep) {
+    if (IsRectEmpty(&r)) return;
+    if (IsRectEmpty(&keep)) { InvalidateRect(w,&r,FALSE); return; }
+    RECT strips[]={{r.left,r.top,r.right,keep.top},{r.left,keep.bottom,r.right,r.bottom},
+                   {r.left,keep.top,keep.left,keep.bottom},{keep.right,keep.top,r.right,keep.bottom}};
+    for (size_t i=0; i<count_of(strips); ++i)
+        if (!IsRectEmpty(&strips[i])) InvalidateRect(w,&strips[i],FALSE);
 }
 
 static LRESULT CALLBACK w_region_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
-    if (msg == WM_LBUTTONDOWN) {
-        GetCursorPos(&anchor);
+    if (msg==winwm_theme_updated) {
+        RECT r=w_region(),inside=r;
+        InflateRect(&inside,-1,-1);
+        if (dragging) w_invalidate_around(w,r,inside);
+        return 0;
+    }
+    if (msg == WM_LBUTTONDOWN && !finishing) {
+        anchor=w_event_pixel(w,lp);
         cursor = anchor;
         dragging = true;
         SetCapture(w);
         return 0;
     }
     if (msg == WM_MOUSEMOVE && dragging) {
-        GetCursorPos(&cursor);
-        InvalidateRect(w, NULL, TRUE);
+        RECT before = w_region();
+        cursor=w_event_pixel(w,lp);
+        RECT after = w_region();
+        if (!EqualRect(&before,&after)) {
+            RECT keep;
+            if (IntersectRect(&keep,&before,&after)) InflateRect(&keep,-1,-1);
+            w_invalidate_around(w,before,keep);
+            w_invalidate_around(w,after,keep);
+        }
         return 0;
     }
     if (msg == WM_LBUTTONUP && dragging) {
-        GetCursorPos(&cursor);
+        cursor=w_event_pixel(w,lp);
         selection = w_region();
         selected = !IsRectEmpty(&selection);
+        if (selected) MapWindowPoints(w,NULL,(POINT *)&selection,2);
+        dragging = false;
+        finishing = true;
         ReleaseCapture();
         DestroyWindow(w);
         return 0;
     }
-    if (msg == WM_RBUTTONUP || (msg == WM_KEYDOWN && wp == VK_ESCAPE)) {
-        DestroyWindow(w);
+    if (msg==WM_CANCELMODE || msg==WM_KILLFOCUS || msg==WM_DISPLAYCHANGE ||
+        (msg==WM_CAPTURECHANGED && dragging && (HWND)lp!=w) ||
+        msg==WM_RBUTTONUP || (msg==WM_KEYDOWN && wp==VK_ESCAPE)) {
+        if (!finishing) {
+            finishing=true;
+            dragging=false;
+            selected=false;
+            // Complete focus and capture transfers before tearing down the active window.
+            if (!PostMessageW(w,WM_CLOSE,0,0)) DestroyWindow(w);
+        }
         return 0;
     }
+    if (msg == WM_ERASEBKGND) return TRUE;
     if (msg == WM_PAINT) {
         PAINTSTRUCT ps;
         HDC dc = BeginPaint(w, &ps);
         if (dragging) {
             RECT r = w_region();
-            MapWindowPoints(NULL, w, (POINT *)&r, 2);
-            FrameRect(dc, &r, (HBRUSH)GetStockObject(WHITE_BRUSH));
+            SetDCBrushColor(dc,clear_pixel);
+            FillRect(dc,&r,GetStockObject(DC_BRUSH));
+            COLORREF accent = w_theme_accent();
+            unsigned luminance = 299*GetRValue(accent) + 587*GetGValue(accent) + 114*GetBValue(accent);
+            // The mask is always black, even when Windows supplies black high-contrast ink.
+            SetDCBrushColor(dc,luminance < 90000 ? RGB(255,255,255) : accent);
+            FrameRect(dc,&r,GetStockObject(DC_BRUSH));
+            ExcludeClipRect(dc,r.left,r.top,r.right,r.bottom);
         }
+        FillRect(dc,&ps.rcPaint,GetStockObject(BLACK_BRUSH));
         EndPaint(w, &ps);
         return 0;
     }
     if (msg == WM_DESTROY) {
+        finishing=true;
+        dragging=false;
         PostQuitMessage(0);
         return 0;
     }
@@ -67,6 +129,9 @@ static LRESULT CALLBACK w_region_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 }
 
 static bool w_choose_region(void) {
+    selected=false;
+    dragging=false;
+    finishing=false;
     HINSTANCE inst = GetModuleHandleW(NULL);
     WNDCLASSW wc = {.hInstance = inst,
                     .lpfnWndProc = w_region_proc,
@@ -80,7 +145,11 @@ static bool w_choose_region(void) {
                              GetSystemMetrics(SM_CYVIRTUALSCREEN), NULL, NULL, inst, NULL);
     if (!w)
         return false;
-    SetLayeredWindowAttributes(w, 0, 90, LWA_ALPHA);
+    w_theme_follow_overlay(w);
+    if (!SetLayeredWindowAttributes(w,clear_pixel,90,LWA_ALPHA|LWA_COLORKEY)) {
+        DestroyWindow(w);
+        return false;
+    }
     ShowWindow(w, SW_SHOW);
     SetForegroundWindow(w);
     SetFocus(w);
@@ -164,15 +233,12 @@ static bool w_load_encoder(void) {
     HMODULE writer = LoadLibraryExW(L"mfreadwrite.dll", NULL, LOAD_LIBRARY_SEARCH_SYSTEM32);
     if (!platform || !writer)
         return false;
-    media.startup = (HRESULT(WINAPI *)(ULONG, DWORD))GetProcAddress(platform, "MFStartup");
-    media.shutdown = (HRESULT(WINAPI *)(void))GetProcAddress(platform, "MFShutdown");
-    media.create_type = (HRESULT(WINAPI *)(IMFMediaType **))GetProcAddress(platform, "MFCreateMediaType");
-    media.create_buffer =
-        (HRESULT(WINAPI *)(DWORD, IMFMediaBuffer **))GetProcAddress(platform, "MFCreateMemoryBuffer");
-    media.create_sample = (HRESULT(WINAPI *)(IMFSample **))GetProcAddress(platform, "MFCreateSample");
-    media.create_writer =
-        (HRESULT(WINAPI *)(LPCWSTR, IMFByteStream *, IMFAttributes *, IMFSinkWriter **))GetProcAddress(
-            writer, "MFCreateSinkWriterFromURL");
+    media.startup = (__typeof__(media.startup))(void *)GetProcAddress(platform, "MFStartup");
+    media.shutdown = (__typeof__(media.shutdown))(void *)GetProcAddress(platform, "MFShutdown");
+    media.create_type = (__typeof__(media.create_type))(void *)GetProcAddress(platform, "MFCreateMediaType");
+    media.create_buffer = (__typeof__(media.create_buffer))(void *)GetProcAddress(platform, "MFCreateMemoryBuffer");
+    media.create_sample = (__typeof__(media.create_sample))(void *)GetProcAddress(platform, "MFCreateSample");
+    media.create_writer = (__typeof__(media.create_writer))(void *)GetProcAddress(writer, "MFCreateSinkWriterFromURL");
     return media.startup && media.shutdown && media.create_type && media.create_buffer &&
            media.create_sample && media.create_writer;
 }
@@ -208,7 +274,7 @@ static int w_record(void) {
     }
     if (!w_load_encoder()) {
         CloseHandle(stop);
-        MessageBoxW(NULL, L"Install the Windows Media Feature Pack to record video.", L"Recording", MB_OK);
+        w_dialog(NULL, L"Install the Windows Media Feature Pack to record video.", L"Recording", MB_OK);
         return 1;
     }
     POINT p;
@@ -334,7 +400,7 @@ static int w_record(void) {
     if (FAILED(hr)) {
         wchar_t why[160];
         swprintf(why, count_of(why), L"Screen recording failed (0x%08lx).", hr);
-        MessageBoxW(NULL, why, L"Recording", MB_OK);
+        w_dialog(NULL, why, L"Recording", MB_OK);
     }
     return FAILED(hr);
 }

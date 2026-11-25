@@ -33,9 +33,11 @@ void w_effects_opacity(int slot, bool focused, bool entering) {
     w_window_state *s = &desk.windows[slot];
     if (s->direct_surface)
         return;
-    BYTE target = focused ? 255 : desk.config.inactive_alpha;
-    if (s->decorated && !entering && target == s->opacity.target && s->alpha == desk.config.inactive_alpha)
+    BYTE inactive = desk.high_contrast ? 255 : desk.config.inactive_alpha;
+    BYTE target = focused ? 255 : inactive;
+    if (s->decorated && !entering && target == s->opacity.target && s->alpha == inactive)
         return;
+    s->alpha = inactive;
     w_transition timing = desk.config.motion[entering ? motion_fade_in : motion_fade_switch];
     BYTE from = entering ? min(70,target) : s->opacity.value;
     s->opacity.target = target;
@@ -47,7 +49,7 @@ void w_effects_opacity(int slot, bool focused, bool entering) {
         s->opacity.start = GetTickCount64();
     } else {
         s->opacity.value = target;
-        w_os_window_opacity(s->hwnd,target,desk.config.inactive_alpha != 255);
+        w_os_window_opacity(s->hwnd,target,inactive != 255);
     }
 }
 
@@ -317,7 +319,7 @@ void w_effects_tick(void) {
             if (done)
                 alpha = s->opacity.target;
             if ((done || alpha != s->opacity.value) &&
-                !w_os_window_opacity(s->hwnd,alpha,!done || desk.config.inactive_alpha != 255))
+                !w_os_window_opacity(s->hwnd,alpha,!done || s->alpha != 255))
                 done = true;
             s->opacity.value = alpha;
             if (done)

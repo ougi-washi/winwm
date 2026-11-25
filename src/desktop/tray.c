@@ -1,4 +1,5 @@
 #include "desktop/tray.h"
+#include "theme/menu.h"
 #include "desktop/desktop.h"
 #include "tray/host.h"
 #include <objbase.h>
@@ -422,12 +423,8 @@ static void w_activate(uint64_t key, UINT event, POINT screen) {
     }
     if (event == WM_RBUTTONUP) {
         if (!w_restorable(key,false)) return;
-        HMENU menu = CreatePopupMenu();
-        if (!menu) return;
-        AppendMenuW(menu,MF_STRING,1,L"Restore window");
-        UINT selected = TrackPopupMenuEx(menu,TPM_RIGHTBUTTON|TPM_RETURNCMD|TPM_NONOTIFY,
-                                        screen.x,screen.y,desk.root,NULL);
-        DestroyMenu(menu);
+        const w_theme_menu_item restore={1,L"Restore window",L"\xe923",false};
+        UINT selected = w_theme_track_menu(desk.root,screen,TPM_RIGHTBUTTON,NULL,&restore,1);
         if (selected == 1) w_restore(key,false);
     } else if (event == WM_LBUTTONUP || event == WM_LBUTTONDBLCLK || event == NIN_KEYSELECT) w_restore(key,false);
 }

@@ -13,5 +13,5 @@
 -mwindows
 -Wl,--subsystem,windows
 -Wl,--gc-sections
--static-libgcc
+-static
 -s

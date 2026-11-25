@@ -1,3 +1,4 @@
+#include "theme/dialog.h"
 #include "desktop/desktop.h"
 #include "providers/audio.h"
 #include <stdio.h>
@@ -540,7 +541,7 @@ bool w_desktop_run_anchored(const w_command *c, int output, bool admin, const w_
         ok = w_queue_launch("ms-settings:", NULL, launch_command, NULL, false);
         break;
     case cmd_confirm_sign_out:
-        if (MessageBoxW(NULL, L"Sign out and close your applications?", L"Sign out",
+        if (w_dialog(NULL, L"Sign out and close your applications?", L"Sign out",
                         MB_OKCANCEL | MB_DEFBUTTON2 | MB_ICONQUESTION) == IDOK)
             ok = ExitWindowsEx(EWX_LOGOFF, 0) != 0;
         break;
@@ -590,12 +591,10 @@ bool w_desktop_run_anchored(const w_command *c, int output, bool admin, const w_
         w_desktop_timer();
         break;
     case cmd_animations_toggle:
-        desk.config.animations = desk.motion_allowed ? motion_off : motion_on;
-        w_effects_preferences();
-        break;
     case cmd_animations_system:
-        desk.config.animations = motion_system;
-        w_effects_preferences();
+        desk.config.animations = c->kind==cmd_animations_system ? motion_system :
+                                 desk.motion_allowed ? motion_off : motion_on;
+        w_desktop_update_appearance();
         break;
     case cmd_borders_toggle:
         desk.borders_hidden = !desk.borders_hidden;

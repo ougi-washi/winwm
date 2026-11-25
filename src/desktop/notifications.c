@@ -1,4 +1,5 @@
 #include "desktop/desktop.h"
+#include "theme/menu.h"
 #include "native_notifications/listener.h"
 #include "native_notifications/banners.h"
 #include "native_notifications/publish.h"
@@ -171,17 +172,16 @@ static void w_capture_options(HWND button) {
     RECT bounds;
     HWND window = GetAncestor(button,GA_ROOT);
     if (!window || !GetWindowRect(button,&bounds)) return;
-    HMENU menu = CreatePopupMenu();
-    if (!menu) return;
-    AppendMenuW(menu,MF_STRING,1,L"Read Windows notifications…");
-    AppendMenuW(menu,MF_STRING | (source == notice_capture_visible ? MF_CHECKED : 0),2,L"Watch visible Windows banners");
-    AppendMenuW(menu,MF_STRING | (source == notice_capture_off ? MF_CHECKED : 0),3,L"Turn capture off");
-    AppendMenuW(menu,MF_SEPARATOR,0,NULL);
-    AppendMenuW(menu,MF_STRING,4,L"Windows notification privacy settings");
+    const w_theme_menu_item items[] = {
+        {1,L"Read Windows notifications…",L"\xe7f4",source==notice_capture_windows},
+        {2,L"Watch visible Windows banners",L"\xe890",source==notice_capture_visible},
+        {3,L"Turn capture off",L"\xe711",source==notice_capture_off},
+        {0},
+        {4,L"Windows notification privacy settings",L"\xe72e",false}
+    };
     TPMPARAMS anchor = {.cbSize=sizeof(anchor),.rcExclude=bounds};
-    unsigned choice = TrackPopupMenuEx(menu,TPM_RETURNCMD | TPM_NONOTIFY | TPM_VERTICAL,
-                                       bounds.left,bounds.bottom,window,&anchor);
-    DestroyMenu(menu);
+    unsigned choice = w_theme_track_menu(window,(POINT){bounds.left,bounds.bottom},TPM_VERTICAL,&anchor,
+                                         items,count_of(items));
     if (choice == 2) w_set_source(notice_capture_visible);
     else if (choice == 3) w_set_source(notice_capture_off);
     else if (choice == 4) w_privacy_settings();

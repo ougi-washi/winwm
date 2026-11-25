@@ -4,4 +4,5 @@
 #include <iphlpapi.h>
 
 bool w_adapter_show(HWND owner, const IP_ADAPTER_ADDRESSES *adapter);
+DWORD w_adapter_read_all(IP_ADAPTER_ADDRESSES **out);
 DWORD w_adapter_apply_dns(const wchar_t *request);

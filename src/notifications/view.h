@@ -27,3 +27,5 @@ void w_notice_outside(HWND hit);
 void w_notice_reposition(void);
 int w_notice_count(void);
 void w_notice_shutdown(void);
+const w_popup_anchor *w_notice_anchor(void);
+void w_notice_reanchor(const w_popup_anchor *anchor);
