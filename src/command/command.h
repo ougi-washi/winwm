@@ -13,7 +13,7 @@
     x(power_settings) x(date_time) x(network_settings) x(animations_toggle) x(borders_toggle) \
     x(animations_system) x(media_previous) x(media_next) x(media_stop) x(activity) x(open_place) \
     x(project) x(pick_color) x(bar_settings) x(microphone) x(input_methods) x(packages) x(updates) \
-    x(google_japanese_input) x(windows_update)
+    x(google_japanese_input) x(windows_update) x(chocolatey)
 #define command_enum(name) cmd_##name,
 enum command_kind { cmd_invalid, command_list(command_enum) cmd_count };
 

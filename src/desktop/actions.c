@@ -232,6 +232,7 @@ static bool w_panel_command(enum command_kind kind) {
     switch (kind) {
     case cmd_activity:
     case cmd_packages:
+    case cmd_chocolatey:
     case cmd_updates:
     case cmd_google_japanese_input:
     case cmd_input_methods:

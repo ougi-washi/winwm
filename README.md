@@ -14,7 +14,7 @@ Tiling window manager and shell for Windows x64.
 - Per-monitor workspaces, tiling, floating, mouse move and resize.
 - Hover to focus and center the pointer. Desktop gaps clear focus.
 - Configurable borders, animations, keybindings, and toolbar.
-- Win+D Menu for apps, commands, WinGet installs and updates.
+- Win+D Menu for apps, commands, WinGet installs and updates, and elevated Chocolatey installs.
 - Ctrl+Enter in Menu runs the selected app, tool, or command as administrator.
 - Win+Shift+Q closes the active panel or app.
 - Audio, network, displays, power, languages, keyboards, and IMEs.

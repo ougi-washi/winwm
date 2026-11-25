@@ -63,7 +63,7 @@ static const wchar_t command_glyphs[cmd_count] = {
     [cmd_media_previous]=0xe892, [cmd_media_play]=0xe768, [cmd_media_next]=0xe893, [cmd_media_stop]=0xe71a,
     [cmd_wifi]=0xe701, [cmd_bluetooth]=0xe702, [cmd_network_settings]=0xe839, [cmd_display]=0xe7f4,
     [cmd_date_time]=0xe823, [cmd_languages]=0xe774, [cmd_input_methods]=0xe765, [cmd_keyboard_settings]=0xe765,
-    [cmd_packages]=0xe896, [cmd_google_japanese_input]=0xe896, [cmd_updates]=0xe895, [cmd_windows_update]=0xe895,
+    [cmd_packages]=0xe896, [cmd_chocolatey]=0xe896, [cmd_google_japanese_input]=0xe896, [cmd_updates]=0xe895, [cmd_windows_update]=0xe895,
     [cmd_reload]=0xe72c, [cmd_provider_refresh]=0xe72c, [cmd_lock]=0xe72e, [cmd_restart]=0xe777,
     [cmd_sleep]=0xe708, [cmd_confirm_sign_out]=0xf3b1, [cmd_power_settings]=0xe7e8,
 };
@@ -190,6 +190,7 @@ static const w_menu_item menu_items[] = {
     {palette_input, "Choose input method and test typing", "input_methods"},
     {palette_input, "Get Google Japanese Input", "google_japanese_input"},
     {palette_software, "Find and install software with WinGet", "packages"},
+    {palette_software, "Find and install software with Chocolatey", "chocolatey"},
     {palette_software, "Review and apply software updates", "updates"},
     {palette_software, "Windows Update settings", "windows_update"},
     {palette_settings, "Power plans and timeouts", "power_settings"},
@@ -226,6 +227,7 @@ static const wchar_t *w_menu_keywords(enum command_kind kind) {
     case cmd_input_methods: return L"ime microsoft japanese input method romaji hiragana katakana kanji typing 日本語";
     case cmd_google_japanese_input: return L"google japanese input ime gboard mozc 日本語入力";
     case cmd_packages: return L"winget search install package packages software apps applications";
+    case cmd_chocolatey: return L"choco chocolatey search install package packages software apps applications admin";
     case cmd_updates: return L"winget upgrade update packages apps applications";
     case cmd_windows_update: return L"windows system updates check security";
     case cmd_project: return L"developer recent project folder terminal editor";

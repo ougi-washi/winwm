@@ -2,6 +2,8 @@
 #include "theme/theme.h"
 #include "theme/icon_button.h"
 #include <commctrl.h>
+#include <shellapi.h>
+#include <shlobj.h>
 #include <wchar.h>
 #include <wctype.h>
 
@@ -11,10 +13,11 @@ static HWND window, pages, query, search, results, status, output, apply;
 static HFONT font, output_font;
 static HANDLE process, stream;
 static w_package_action action;
-static bool updates, closing, truncated, reviewed, source_terms, accept_once;
+static bool updates, chocolatey, closing, truncated, reviewed, source_terms, accept_once;
 static char bytes[256 * 1024];
 static size_t used;
 static wchar_t selected[256];
+static wchar_t selected_version[128];
 static wchar_t last_value[512];
 static wchar_t *transcript;
 static ULONGLONG next_progress;
@@ -34,8 +37,33 @@ static bool w_package_id(const wchar_t *id) {
     return parts >= 2 && length > 0;
 }
 
+static bool w_choco_token(const wchar_t *s, bool version) {
+    const wchar_t *alnum = L"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    if (!*s || !wcschr(alnum,*s) || wcslen(s) >= (version ? count_of(selected_version) : count_of(selected)))
+        return false;
+    for (const wchar_t *p = s+1; *p; ++p)
+        if (!wcschr(alnum,*p) && !wcschr(version ? L".-+" : L".-_",*p)) return false;
+    // Chocolatey interprets a .config argument as a local package manifest.
+    const wchar_t *ext = wcsrchr(s,L'.');
+    return version || !ext || (_wcsicmp(ext,L".config") && _wcsicmp(ext,L".nupkg"));
+}
+
+static bool w_choco_args(w_package_action op, const wchar_t *value, wchar_t *line, size_t cap) {
+    const wchar_t *source = L"--source=https://community.chocolatey.org/api/v2/";
+    if (op == pkg_search) {
+        if (!*value || *value == L'-' || *value == L'/' || iswspace(*value) || wcspbrk(value,L"\"\\\r\n\t")) return false;
+        return swprintf(line,cap,L"choco.exe search \"%ls\" --limit-output --page=0 --page-size=75 %ls",value,source) > 0;
+    }
+    if (!w_choco_token(value,false) || !w_choco_token(selected_version,true)) return false;
+    if (op != pkg_show && op != pkg_install) return false;
+    return swprintf(line,cap,L"choco.exe %ls %ls --version=%ls %ls %ls",
+                    op == pkg_show ? L"info" : L"install",value,selected_version,source,
+                    op == pkg_install ? L"--yes --no-progress" : L"--no-color") > 0;
+}
+
 /* Quote one argument using CommandLineToArgvW rules. The executable never goes through a shell. */
 static bool w_args(w_package_action op, const wchar_t *value, wchar_t *line, size_t cap) {
+    if (chocolatey) return w_choco_args(op,value,line,cap);
     const wchar_t *verb = op == pkg_search ? L"search --count 75 --query=" :
                           op == pkg_updates ? L"list --upgrade-available " :
                           op == pkg_show ? L"show --exact --id=" :
@@ -72,7 +100,7 @@ static void w_controls(void) {
     EnableWindow(search,!process && (updates || GetWindowTextLengthW(query) > 0));
     EnableWindow(apply,!process && (selected[0] || source_terms));
     w_icon_button(search,updates ? L"\uE72C" : L"\uE721",
-                  updates ? L"Refresh available updates" : L"Search WinGet");
+                  updates ? L"Refresh available updates" : chocolatey ? L"Search Chocolatey" : L"Search WinGet");
     SetWindowTextW(apply,source_terms ? L"Accept terms…" : reviewed ? (updates ? L"Update…" : L"Install…") : L"Review");
 }
 
@@ -84,6 +112,7 @@ static void w_clear_rows(void) {
     }
     SendMessageW(results,LB_RESETCONTENT,0,0);
     selected[0] = 0;
+    selected_version[0] = 0;
     reviewed = false;
 }
 
@@ -91,16 +120,54 @@ static void w_selection(void) {
     LRESULT row = SendMessageW(results,LB_GETCURSEL,0,0);
     LRESULT ptr = row == LB_ERR ? 0 : SendMessageW(results,LB_GETITEMDATA,row,0);
     selected[0] = 0;
+    selected_version[0] = 0;
     reviewed = false;
     source_terms = false;
-    if (ptr && ptr != LB_ERR) wcscpy(selected,(wchar_t *)ptr);
+    if (ptr && ptr != LB_ERR) {
+        const wchar_t *id = (wchar_t *)ptr;
+        wcscpy(selected,id);
+        if (chocolatey) wcscpy(selected_version,id+wcslen(id)+1);
+    }
     if (selected[0]) {
-        wchar_t label[320];
-        swprintf(label,count_of(label),L"%ls   ·   winget",selected);
+        wchar_t label[420];
+        if (chocolatey) swprintf(label,count_of(label),L"%ls %ls   ·   Chocolatey",selected,selected_version);
+        else swprintf(label,count_of(label),L"%ls   ·   WinGet",selected);
         SetWindowTextW(status,label);
         SetWindowTextW(output,L"Review the publisher, version, and license before installing or updating.");
     }
     w_controls();
+}
+
+static int w_choco_rows(wchar_t *text) {
+    int count = 0;
+    wchar_t *ctx = NULL;
+    for (wchar_t *id = wcstok_s(text,L"\r\n",&ctx); id; id = wcstok_s(NULL,L"\r\n",&ctx)) {
+        wchar_t *version = wcschr(id,L'|');
+        if (!version) continue;
+        *version++ = 0;
+        if (!w_choco_token(id,false) || !w_choco_token(version,true)) continue;
+        size_t chars = wcslen(id)+1+wcslen(version)+1;
+        wchar_t *entry = malloc(chars*sizeof(*entry));
+        if (!entry) break;
+        memcpy(entry,id,chars*sizeof(*entry));
+        wchar_t label[420];
+        swprintf(label,count_of(label),L"%ls   ·   %ls",id,version);
+        LRESULT row = SendMessageW(results,LB_ADDSTRING,0,(LPARAM)label);
+        if (row < 0) { free(entry); break; }
+        SendMessageW(results,LB_SETITEMDATA,row,(LPARAM)entry);
+        ++count;
+    }
+    return count;
+}
+
+static bool w_choco_details(const wchar_t *text) {
+    wchar_t header[400];
+    int n = swprintf(header,count_of(header),L"%ls %ls",selected,selected_version);
+    for (const wchar_t *p = text; *p; p += wcsspn(p,L"\r\n")) {
+        if (!_wcsnicmp(p,header,n) && (!p[n] || iswspace(p[n]))) return true;
+        p += wcscspn(p,L"\r\n");
+    }
+    return false;
 }
 
 /* WinGet pads columns by terminal cell width. Only accept complete manifest IDs at column boundaries. */
@@ -189,18 +256,34 @@ static void w_start(w_package_action op, const wchar_t *value);
 
 static void w_finish(DWORD code) {
     KillTimer(window,1);
-    CloseHandle(stream); stream = NULL;
+    if (stream) CloseHandle(stream);
+    stream = NULL;
     CloseHandle(process); process = NULL;
     if (closing) { DestroyWindow(window); return; }
+    if (chocolatey && action == pkg_install) {
+        wchar_t message[512];
+        if (!code || code == ERROR_SUCCESS_REBOOT_REQUIRED || code == ERROR_SUCCESS_REBOOT_INITIATED) {
+            swprintf(message,count_of(message),L"Install finished  ·  %ls %ls%ls",selected,selected_version,
+                     code == ERROR_SUCCESS_REBOOT_REQUIRED ? L"  ·  Restart required" :
+                     code == ERROR_SUCCESS_REBOOT_INITIATED ? L"  ·  Restart initiated" : L"");
+            w_clear_rows();
+        } else swprintf(message,count_of(message),L"Chocolatey install failed (exit code %ld).",(long)code);
+        SetWindowTextW(status,message);
+        SetWindowTextW(output,L"Installation details are in the Chocolatey log (logs\\chocolatey.log under the Chocolatey installation folder).");
+        w_controls();
+        return;
+    }
     free(transcript); transcript = w_decode();
-    SetWindowTextW(output,transcript ? transcript : L"Could not read WinGet output.");
+    SetWindowTextW(output,transcript ? transcript : L"Could not read package manager output.");
     int count = 0;
     if (!code && transcript && (action == pkg_search || action == pkg_updates)) {
         wchar_t *copy = _wcsdup(transcript);
-        if (copy) { count = w_rows(copy); free(copy); }
+        if (copy) { count = chocolatey ? w_choco_rows(copy) : w_rows(copy); free(copy); }
     }
     wchar_t message[380];
-    if (code == 0x8a150046u && transcript && transcript[0] && !truncated) {
+    if (chocolatey && code == 2) wcscpy(message,L"No matching package version.");
+    else if (chocolatey && code) swprintf(message,count_of(message),L"Chocolatey returned %ld. See the output below.",(long)code);
+    else if (code == 0x8a150046u && transcript && transcript[0] && !truncated) {
         source_terms = true;
         wcscpy(message,L"Review the WinGet source terms below.");
     }
@@ -210,12 +293,13 @@ static void w_finish(DWORD code) {
     else if (code == 0x8a15002bu) wcscpy(message,L"No applicable update is available.");
     else if (code) swprintf(message,count_of(message),L"WinGet returned 0x%08lX. See the output below.",code);
     else if (action == pkg_show) {
-        reviewed = transcript && transcript[0] && !truncated;
+        reviewed = transcript && transcript[0] && !truncated && (!chocolatey || w_choco_details(transcript));
         swprintf(message,count_of(message),reviewed ? L"Review package details  ·  %ls" : L"Incomplete package details  ·  %ls",selected);
     } else if (w_mutating()) {
         swprintf(message,count_of(message),L"%ls finished. %ls",action == pkg_upgrade ? L"Update" : L"Install",selected);
         w_clear_rows();
     } else if (count) swprintf(message,count_of(message),L"%d package%ls. Select one to review.",count,count == 1 ? L"" : L"s");
+    else if (chocolatey) wcscpy(message,L"No matching packages. Try another search.");
     else {
         wchar_t value[512];
         GetWindowTextW(query,value,count_of(value));
@@ -235,7 +319,7 @@ static void w_finish(DWORD code) {
 static void w_poll(void) {
     DWORD available = 0, read = 0;
     char block[8192];
-    for (int batch = 0; batch < 16; ++batch) {
+    for (int batch = 0; stream && batch < 16; ++batch) {
         if (!PeekNamedPipe(stream,NULL,0,NULL,&available,NULL) || !available) break;
         if (!ReadFile(stream,block,min(available,(DWORD)sizeof(block)),&read,NULL) || !read) break;
         size_t keep = min(sizeof(bytes)-used,(size_t)read);
@@ -243,7 +327,7 @@ static void w_poll(void) {
         if (keep < read) truncated = true;
     }
     if (WaitForSingleObject(process,0) == WAIT_OBJECT_0 &&
-        (!PeekNamedPipe(stream,NULL,0,NULL,&available,NULL) || !available)) {
+        (!stream || !PeekNamedPipe(stream,NULL,0,NULL,&available,NULL) || !available)) {
         DWORD code = ERROR_GEN_FAILURE;
         GetExitCodeProcess(process,&code);
         w_finish(code);
@@ -259,17 +343,66 @@ static void w_poll(void) {
     }
 }
 
+static bool w_choco_path(wchar_t *path, DWORD cap) {
+    DWORD bytes = cap*sizeof(*path);
+    LSTATUS rc = RegGetValueW(HKEY_LOCAL_MACHINE,L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment",
+                              L"ChocolateyInstall",RRF_RT_REG_SZ,NULL,path,&bytes);
+    if (rc == ERROR_FILE_NOT_FOUND) {
+        if (cap < MAX_PATH || FAILED(SHGetFolderPathW(NULL,CSIDL_COMMON_APPDATA,NULL,SHGFP_TYPE_CURRENT,path))) return false;
+        if (wcslen(path)+count_of(L"\\chocolatey") > cap) return false;
+        wcscat(path,L"\\chocolatey");
+    } else if (rc != ERROR_SUCCESS) return false;
+    if (wcslen(path) < 3 || path[1] != L':' || path[2] != L'\\' || wcslen(path)+count_of(L"\\bin\\choco.exe") > cap)
+        return false;
+    wcscat(path,L"\\bin\\choco.exe");
+    DWORD flags = GetFileAttributesW(path);
+    return flags != INVALID_FILE_ATTRIBUTES && !(flags & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static const wchar_t choco_missing[] = L"Chocolatey CLI was not found. Install Chocolatey CLI for this machine, then retry.";
+
 static void w_start(w_package_action op, const wchar_t *value) {
     if (process) return;
     wchar_t path[os_path_cap], line[1500];
-    if (!w_args(op,value,line,count_of(line))) return;
+    if (!w_args(op,value,line,count_of(line))) {
+        SetWindowTextW(status,L"Enter an app name or package ID without command-line options.");
+        return;
+    }
     if (accept_once) wcscat(line,L" --accept-source-agreements");
     accept_once = false;
     source_terms = false;
     if (value != last_value) wcscpy(last_value,value);
-    DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA",path,count_of(path));
-    if (!n || n + 34 >= count_of(path)) { SetWindowTextW(status,L"Could not locate App Installer."); return; }
-    wcscat(path,L"\\Microsoft\\WindowsApps\\winget.exe");
+    if (chocolatey) {
+        if (!w_choco_path(path,count_of(path))) {
+            SetWindowTextW(status,L"Chocolatey CLI unavailable.");
+            SetWindowTextW(output,choco_missing);
+            return;
+        }
+        if (op == pkg_install) {
+            SHELLEXECUTEINFOW run = {.cbSize=sizeof(run), .hwnd=window, .lpVerb=L"runas", .lpFile=path,
+                .lpParameters=wcschr(line,L' ')+1, .nShow=SW_SHOWNORMAL,
+                .fMask=SEE_MASK_NOCLOSEPROCESS|SEE_MASK_NOASYNC|SEE_MASK_FLAG_NO_UI};
+            if (!ShellExecuteExW(&run) || !run.hProcess) {
+                DWORD err = GetLastError();
+                wchar_t message[180];
+                if (err == ERROR_CANCELLED) wcscpy(message,L"Administrator approval canceled. You can retry the install.");
+                else swprintf(message,count_of(message),L"Could not start Chocolatey as administrator (Windows error %lu).",err);
+                SetWindowTextW(status,message);
+                return;
+            }
+            action = op;
+            process = run.hProcess;
+            SetWindowTextW(status,L"Installing as administrator…");
+            SetWindowTextW(output,L"Chocolatey is running in its own window.");
+            w_controls();
+            SetTimer(window,1,100,NULL);
+            return;
+        }
+    } else {
+        DWORD n = GetEnvironmentVariableW(L"LOCALAPPDATA",path,count_of(path));
+        if (!n || n + 34 >= count_of(path)) { SetWindowTextW(status,L"Could not locate App Installer."); return; }
+        wcscat(path,L"\\Microsoft\\WindowsApps\\winget.exe");
+    }
     SECURITY_ATTRIBUTES sec = {.nLength = sizeof(sec), .bInheritHandle = TRUE};
     HANDLE reader = NULL, writer = NULL;
     HANDLE input = CreateFileW(L"NUL",GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,&sec,OPEN_EXISTING,0,NULL);
@@ -287,7 +420,8 @@ static void w_start(w_package_action op, const wchar_t *value) {
     if (error) {
         if (reader) CloseHandle(reader);
         wchar_t detail[512];
-        swprintf(detail,count_of(detail),L"Could not start WinGet (Windows error %lu). Check App Installer and its WinGet execution alias.",error);
+        swprintf(detail,count_of(detail),chocolatey ? L"Could not start Chocolatey (Windows error %lu)." :
+                 L"Could not start WinGet (Windows error %lu). Check App Installer and its WinGet execution alias.",error);
         SetWindowTextW(status,detail);
         SetWindowTextW(output,detail);
         w_controls();
@@ -297,7 +431,7 @@ static void w_start(w_package_action op, const wchar_t *value) {
     action = op; process = pi.hProcess; stream = reader; used = 0; truncated = false; next_progress = 0;
     if (op == pkg_search || op == pkg_updates) w_clear_rows();
     SetWindowTextW(output,L"");
-    SetWindowTextW(status,op == pkg_search ? L"Searching the WinGet catalog…" : op == pkg_updates ? L"Checking installed packages…" :
+    SetWindowTextW(status,op == pkg_search ? (chocolatey ? L"Searching Chocolatey Community Repository…" : L"Searching the WinGet catalog…") : op == pkg_updates ? L"Checking installed packages…" :
                    op == pkg_show ? L"Loading publisher and license details…" :
                    op == pkg_install ? L"Installing package…" : L"Updating package…");
     w_controls();
@@ -307,6 +441,12 @@ static void w_start(w_package_action op, const wchar_t *value) {
 static void w_search(void) {
     wchar_t value[512];
     GetWindowTextW(query,value,count_of(value));
+    if (chocolatey) {
+        size_t start = wcsspn(value,L" \t"), end = wcslen(value);
+        while (end > start && iswspace(value[end-1])) --end;
+        value[end] = 0;
+        if (start) memmove(value,value+start,(end-start+1)*sizeof(*value));
+    }
     if (!updates && !value[0]) {
         SetWindowTextW(status,L"Enter an app name or package ID."); return;
     }
@@ -322,10 +462,12 @@ static void w_review(void) {
         }
         return;
     }
-    if (process || !w_package_id(selected)) return;
+    if (process || (chocolatey ? !w_choco_token(selected,false) : !w_package_id(selected))) return;
     if (!reviewed) { w_start(pkg_show,selected); return; }
-    wchar_t prompt[460];
-    swprintf(prompt,count_of(prompt),L"%ls %ls from the WinGet catalog and accept its package license terms?",
+    wchar_t prompt[560];
+    if (chocolatey) swprintf(prompt,count_of(prompt),
+        L"Install %ls %ls from the Chocolatey Community Repository as administrator and accept the package license terms?",selected,selected_version);
+    else swprintf(prompt,count_of(prompt),L"%ls %ls from the WinGet catalog and accept its package license terms?",
              updates ? L"Update" : L"Install",selected);
     if (MessageBoxW(window,prompt,updates ? L"Review update" : L"Review install",MB_OKCANCEL|MB_DEFBUTTON2) == IDOK)
         w_start(updates ? pkg_upgrade : pkg_install,selected);
@@ -365,10 +507,12 @@ static void w_layout(bool fonts) {
     MoveWindow(output,pad,top+h+gap,width,space-list_height,TRUE);
 }
 
-static void w_page(bool update) {
-    updates = update;
+enum { page_winget, page_updates, page_choco };
+static void w_page(int page) {
+    updates = page == page_updates;
+    chocolatey = page == page_choco;
     source_terms = false;
-    SendMessageW(pages,CB_SETCURSEL,updates ? 1 : 0,0);
+    SendMessageW(pages,CB_SETCURSEL,page,0);
     ShowWindow(query,updates ? SW_HIDE : SW_SHOWNA);
     w_layout(false);
     w_clear_rows(); SetWindowTextW(output,L"");
@@ -392,7 +536,7 @@ static LRESULT CALLBACK w_pkg_proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     case WM_COMMAND:
         if (!process) {
             HWND c = (HWND)lp;
-            if (c == pages && HIWORD(wp) == CBN_SELCHANGE) w_page(SendMessageW(pages,CB_GETCURSEL,0,0) == 1);
+            if (c == pages && HIWORD(wp) == CBN_SELCHANGE) w_page((int)SendMessageW(pages,CB_GETCURSEL,0,0));
             else if (c == search && HIWORD(wp) == BN_CLICKED) w_search();
             else if (c == results && HIWORD(wp) == LBN_SELCHANGE) w_selection();
             else if ((c == apply && HIWORD(wp) == BN_CLICKED) || (c == results && HIWORD(wp) == LBN_DBLCLK)) w_review();
@@ -438,11 +582,13 @@ int w_packages_run(const wchar_t *mode) {
     if (!pages || !query || !search || !results || !status || !apply || !output) { DestroyWindow(window); return 1; }
     SendMessageW(query,EM_SETLIMITTEXT,510,0);
     SendMessageW(query,EM_SETCUEBANNER,TRUE,(LPARAM)L"App name or package ID");
-    SendMessageW(pages,CB_ADDSTRING,0,(LPARAM)L"Find software");
-    SendMessageW(pages,CB_ADDSTRING,0,(LPARAM)L"Updates");
+    SendMessageW(pages,CB_ADDSTRING,0,(LPARAM)L"WinGet");
+    SendMessageW(pages,CB_ADDSTRING,0,(LPARAM)L"WinGet updates");
+    SendMessageW(pages,CB_ADDSTRING,0,(LPARAM)L"Chocolatey");
+    HRESULT apartment = CoInitializeEx(NULL,COINIT_APARTMENTTHREADED|COINIT_DISABLE_OLE1DDE);
     w_layout(true);
     ShowWindow(window,SW_SHOW);
-    w_page(!_wcsicmp(mode,L"updates"));
+    w_page(!wcscmp(mode,L"chocolatey") ? page_choco : !wcscmp(mode,L"updates") ? page_updates : page_winget);
     if (!_wcsicmp(mode,L"google_japanese_input")) { SetWindowTextW(query,L"Google.JapaneseIME"); w_search(); }
     MSG m;
     while (GetMessageW(&m,NULL,0,0) > 0) {
@@ -458,5 +604,6 @@ int w_packages_run(const wchar_t *mode) {
     DeleteObject(font); font = NULL;
     DeleteObject(output_font); output_font = NULL;
     free(transcript); transcript = NULL;
+    if (SUCCEEDED(apartment)) CoUninitialize();
     return 0;
 }

@@ -47,7 +47,7 @@ int w_tools_run(const wchar_t *mode) {
         return w_clock_run();
     if (!wcscmp(mode, L"pick_color"))
         return w_color_run();
-    if (!wcscmp(mode,L"packages") || !wcscmp(mode,L"updates") || !wcscmp(mode,L"google_japanese_input"))
+    if (!wcscmp(mode,L"packages") || !wcscmp(mode,L"updates") || !wcscmp(mode,L"chocolatey") || !wcscmp(mode,L"google_japanese_input"))
         return w_packages_run(mode);
     if (!wcscmp(mode, L"activity"))
         return w_activity_run();
