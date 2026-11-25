@@ -1,4 +1,5 @@
 #include "desktop_tools/power.h"
+#include "theme/icon_button.h"
 #include <powrprof.h>
 #include <errno.h>
 #include <stdio.h>
@@ -146,8 +147,8 @@ void w_power_create(HWND panel, HWND list, HWND status, HWND apply) {
     HINSTANCE inst = GetModuleHandleW(NULL);
     DWORD style = WS_CHILD | WS_VISIBLE | WS_TABSTOP;
     MoveWindow(timers, 12, 52, 520, 196, FALSE);
-    MoveWindow(save, 210, 300, 140, 30, FALSE);
-    SetWindowTextW(save, L"Save timer");
+    MoveWindow(save, 210, 300, 30, 30, FALSE);
+    w_icon_button(save,L"\uE74E",L"Save selected power timer");
     plans_box = CreateWindowW(L"COMBOBOX", L"Power plan", style | CBS_DROPDOWNLIST | WS_VSCROLL,
                               12, 12, 360, 240, panel, NULL, inst, NULL);
     activate = CreateWindowW(L"BUTTON", L"Use plan", style | BS_OWNERDRAW,

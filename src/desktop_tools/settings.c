@@ -1,4 +1,5 @@
 #define COBJMACROS
+#include "theme/icon_button.h"
 #include "theme/theme.h"
 #include "desktop_tools/tools.h"
 #include "desktop_tools/adapter.h"
@@ -75,20 +76,26 @@ static int w_current_item(void) {
     return row == LB_ERR ? -1 : (int)SendMessageW(list, LB_GETITEMDATA, row, 0);
 }
 
+static void w_size_controls(bool update_font);
+
 static void w_audio_selection(void) {
     int id = w_current_item(), percent = 0;
     BOOL muted = FALSE;
     bool ready = w_sound_state(id, &percent, &muted);
     EnableWindow(sound_slider, ready);
     EnableWindow(apply, ready);
-    EnableWindow(default_device, ready && w_sound_can_default(id,false));
-    EnableWindow(calls_device, ready && w_sound_can_default(id,true));
+    EnableWindow(default_device, w_sound_can_default(id,false));
+    EnableWindow(calls_device, w_sound_can_default(id,true));
     if (SendMessageW(sound_slider, TBM_GETPOS, 0, 0) != percent)
         SendMessageW(sound_slider, TBM_SETPOS, TRUE, percent);
+    if (sound_view == sound_inputs)
+        w_icon_button(apply, muted ? L"\uEC54" : L"\uE720", muted ? L"Unmute microphone" : L"Mute microphone");
+    else {
+        const wchar_t *label = sound_view == sound_apps ? (muted ? L"Unmute application" : L"Mute application") :
+                                                         (muted ? L"Unmute output" : L"Mute output");
+        w_icon_button(apply, muted ? L"\uE74F" : L"\uE767", label);
+    }
     wchar_t old[96];
-    const wchar_t *mute = muted ? L"Unmute" : L"Mute";
-    GetWindowTextW(apply,old,count_of(old));
-    if (wcscmp(mute,old)) SetWindowTextW(apply,mute);
     wchar_t level[64];
     swprintf(level, count_of(level), L"%ls   %d%%%ls", sound_view == sound_inputs ? L"Input" : L"Volume",
              percent, muted ? L"   ·   Muted" : L"");
@@ -110,8 +117,13 @@ static void w_audio_open_view(enum w_sound_view next) {
     sound_error_until = 0;
     ShowWindow(default_device, next == sound_apps ? SW_HIDE : SW_SHOWNA);
     ShowWindow(calls_device, next == sound_apps ? SW_HIDE : SW_SHOWNA);
+    if (next != sound_apps) {
+        w_icon_button(default_device,L"\uE734",next == sound_inputs ? L"Set as default input device" : L"Set as default output device");
+        w_icon_button(calls_device,L"\uE717",next == sound_inputs ? L"Use this microphone for calls" : L"Use this output for calls");
+    }
     SetWindowTextW(list, next == sound_apps ? L"Applications" : next == sound_inputs ? L"Input devices" : L"Output devices");
     SetWindowTextW(sound_slider, next == sound_inputs ? L"Microphone level" : L"Volume");
+    w_size_controls(false);
     sound_watching = w_sound_watch();
     w_sound_refresh(list,next);
     sound_refresh_due = GetTickCount64()+5000;
@@ -489,7 +501,8 @@ static void w_selected(void) {
         struct w_wifi_profile *p = id >= 0 && id < profile_count ? &profiles[id] : NULL;
         bool connected = p && (p->network.dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED);
         SetWindowTextW(apply, connected ? L"Disconnect" : L"Connect");
-        SetWindowTextW(saved_action, p && *p->profile ? L"Forget network…" : L"Save network");
+        bool saved = p && *p->profile;
+        w_icon_button(saved_action, saved ? L"\uE74D" : L"\uE74E", saved ? L"Forget saved network…" : L"Save network");
         EnableWindow(saved_action, p && (*p->profile ? wifi.forget != NULL : connected && wifi.save && wifi.query));
         bool needs_key = p && !*p->profile && p->network.bSecurityEnabled && w_personal_auth(&p->network);
         if (!needs_key || !w_same_network(&key_target, p))
@@ -502,13 +515,13 @@ static void w_selected(void) {
         w_message(network_problems[-2-id].detail);
 }
 
-static void w_size_controls(bool update_font);
-
 static void w_open_network_page(enum page next) {
     page = next;
     bool wireless = page == page_wifi;
     SetWindowTextW(window, wireless ? L"Wi-Fi networks" : L"Network adapters");
-    SetWindowTextW(network_switch, wireless ? L"Network adapters" : L"Wi-Fi networks");
+    w_icon_button(network_switch, wireless ? L"\uE839" : L"\uE701",
+                  wireless ? L"Show network adapters" : L"Show Wi-Fi networks");
+    w_icon_button(lower, L"\uE72C", wireless ? L"Scan for Wi-Fi networks" : L"Refresh network adapters");
     ShowWindow(saved_action, wireless ? SW_SHOWNA : SW_HIDE);
     SetWindowTextW(password, L"");
     ShowWindow(password, SW_HIDE);
@@ -589,24 +602,23 @@ static void w_size_controls(bool update_font) {
     GetClientRect(window, &area);
     int width = MulDiv(area.right, 96, dpi);
     int dx = width - 544, dy = MulDiv(area.bottom, 96, dpi) - 344;
-    bool wrap = width < 456 && (page == page_display || page == page_bluetooth || page == page_wifi);
+    bool wrap = width < 456 && page == page_display;
     int extra_row = wrap ? 38 : 0;
     for (size_t i = 0; i < position_count; ++i) {
         HWND c = positions[i].control;
         RECT r = positions[i].logical;
         if (c == list) r.bottom += dy - extra_row;
         else if (r.top >= 248) OffsetRect(&r, 0, dy - extra_row);
-        if (wrap && positions[i].logical.top >= 300 && positions[i].logical.left >= (page == page_display ? 160 : 270)) {
-            int first_x = page == page_display ? 162 : positions[i].logical.left;
-            OffsetRect(&r, 12 - first_x, extra_row);
-        }
-        if (c == list || (c == status && page != page_audio) || c == password || c == sound_slider ||
+        if (wrap && positions[i].logical.top >= 300 && positions[i].logical.left >= 160)
+            OffsetRect(&r, 12 - 162, extra_row);
+        if (c == list || c == status || c == password || c == sound_slider ||
             (page == page_display && w_display_stretches(c))) r.right += dx;
-        if (c == refresh_sound) OffsetRect(&r,dx,0);
+        if (c == refresh_sound || c == default_device || c == calls_device) OffsetRect(&r,dx,0);
+        if (c == sound_slider && sound_view == sound_apps) r.right = width - 12;
         if (c == sound_tab) r.right += dx;
         if (c == sound_tab && update_font)
             TabCtrl_SetItemSize(c,MulDiv(79,dpi,96),MulDiv(30,dpi,96));
-        if (wrap && (c == password || (page == page_display && positions[i].logical.left >= 320)))
+        if (wrap && positions[i].logical.left >= 320)
             r.right = width - 12;
         if (page == page_power && positions[i].logical.top < 48) {
             if (r.left > 12) OffsetRect(&r, dx, 0);
@@ -770,10 +782,10 @@ int w_settings_run(const wchar_t *name) {
                           BS_OWNERDRAW | WS_CHILD | WS_TABSTOP | (page == page_network ? 0 : WS_VISIBLE),
                           12, 300, 140, 30, window, (HMENU)101, inst, NULL);
     if (page == page_audio) {
-        MoveWindow(list,12,52,520,196,FALSE);
+        MoveWindow(list,12,52,520,208,FALSE);
         sound_tab = CreateWindowW(WC_TABCONTROLW,L"Sound controls",WS_CHILD|WS_VISIBLE|WS_TABSTOP|
                                   TCS_FIXEDWIDTH|TCS_FOCUSONBUTTONDOWN,
-                                  12,10,432,32,window,NULL,inst,NULL);
+                                  12,10,478,32,window,NULL,inst,NULL);
         SetWindowSubclass(sound_tab,w_sound_tab_proc,1,0);
         for (size_t i=0; i<count_of(sound_tabs); ++i) {
             TCITEMW item = {.mask=TCIF_TEXT,.pszText=(wchar_t *)sound_tabs[i]};
@@ -781,33 +793,42 @@ int w_settings_run(const wchar_t *name) {
         }
         TabCtrl_SetCurSel(sound_tab,sound_view);
         refresh_sound = CreateWindowW(L"BUTTON",L"Refresh",BS_OWNERDRAW|WS_CHILD|WS_TABSTOP|WS_VISIBLE,
-                                      450,10,82,30,window,(HMENU)106,inst,NULL);
+                                      496,10,36,32,window,(HMENU)106,inst,NULL);
+        w_icon_button(refresh_sound,L"\uE72C",L"Refresh sound devices and applications");
         sound_slider = CreateWindowW(TRACKBAR_CLASSW, L"Volume", WS_CHILD | WS_VISIBLE | WS_TABSTOP | TBS_NOTICKS,
-                                     164, 252, 368, 36, window, NULL, inst, NULL);
-        MoveWindow(status, 12, 258, 148, 34, FALSE);
+                                     58, 298, 382, 34, window, NULL, inst, NULL);
+        MoveWindow(status, 12, 268, 520, 25, FALSE);
         w_percent_slider_init(sound_slider);
-        MoveWindow(apply,12,300,77,30,FALSE);
+        MoveWindow(apply,12,298,36,34,FALSE);
         default_device = CreateWindowW(L"BUTTON",L"Set as default",BS_OWNERDRAW|WS_CHILD|WS_TABSTOP,
-                                       95,300,121,30,window,(HMENU)107,inst,NULL);
+                                       450,298,36,34,window,(HMENU)107,inst,NULL);
         calls_device = CreateWindowW(L"BUTTON",L"Use for calls",BS_OWNERDRAW|WS_CHILD|WS_TABSTOP,
-                                     222,300,114,30,window,(HMENU)110,inst,NULL);
+                                     496,298,36,34,window,(HMENU)110,inst,NULL);
+        // Match keyboard traversal to the visible rows.
+        UINT position_flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE;
+        SetWindowPos(sound_tab,HWND_TOP,0,0,0,0,position_flags);
+        SetWindowPos(refresh_sound,sound_tab,0,0,0,0,position_flags);
+        SetWindowPos(sound_slider,apply,0,0,0,0,position_flags);
     }
     if (page == page_network || page == page_wifi || page == page_bluetooth) {
         lower = CreateWindowW(L"BUTTON", page == page_bluetooth ? L"Scan nearby" : L"Refresh",
                               BS_OWNERDRAW | WS_CHILD | WS_VISIBLE | WS_TABSTOP, 160,
-                              300, 110, 30, window, (HMENU)104, inst, NULL);
+                              300, 36, 30, window, (HMENU)104, inst, NULL);
+        w_icon_button(lower,L"\uE72C",page == page_bluetooth ? L"Scan for nearby Bluetooth devices" : L"Refresh networks");
     }
-    if (page == page_bluetooth)
+    if (page == page_bluetooth) {
         raise_button = CreateWindowW(L"BUTTON", L"More devices…", BS_OWNERDRAW | WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                     280, 300, 150, 30, window, (HMENU)105, inst, NULL);
+                                     204, 300, 36, 30, window, (HMENU)105, inst, NULL);
+        w_icon_button(raise_button,L"\uE836",L"Open Windows device pairing");
+    }
     if (page == page_wifi || page == page_network) {
         MoveWindow(list, 12, 49, 520, 199, FALSE);
         network_switch = CreateWindowW(L"BUTTON", L"", BS_OWNERDRAW | WS_CHILD | WS_VISIBLE | WS_TABSTOP,
-                                       12, 10, 165, 30, window, (HMENU)108, inst, NULL);
+                                       12, 10, 36, 30, window, (HMENU)108, inst, NULL);
         saved_action = CreateWindowW(L"BUTTON", L"Save network", BS_OWNERDRAW | WS_CHILD | WS_TABSTOP,
-                                     188, 10, 155, 30, window, (HMENU)109, inst, NULL);
+                                     56, 10, 36, 30, window, (HMENU)109, inst, NULL);
         password = CreateWindowW(L"EDIT", L"", WS_CHILD | WS_TABSTOP | WS_BORDER | ES_PASSWORD | ES_AUTOHSCROLL,
-                                 284, 300, 246, 30, window, NULL, inst, NULL);
+                                 204, 300, 328, 30, window, NULL, inst, NULL);
         SendMessageW(password, EM_SETCUEBANNER, TRUE, (LPARAM)L"Wi-Fi password");
         SendMessageW(password, EM_SETLIMITTEXT, 64, 0);
     }

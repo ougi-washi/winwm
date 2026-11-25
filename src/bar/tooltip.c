@@ -2,17 +2,14 @@
 #include "bar/menu.h"
 #include <stdio.h>
 
-static const struct {
-    const char *module;
-    const wchar_t *heading, *click, *right, *wheel;
-} descriptions[] = {
+static const w_bar_description descriptions[] = {
     {"menu", L"Menu", L"Open menu", L"Desktop settings", NULL},
     {"workspaces", L"Workspace", L"Switch workspace", NULL, L"Cycle workspaces"},
     {"title", L"Focused window", L"Switch window", NULL, NULL},
     {"mode", L"Desktop mode", NULL, NULL, NULL},
     {"clock", L"Clock", L"Calendar and time zone", L"Toggle date", NULL},
     {"keyboard", L"Keyboard", L"Choose layout", L"Input settings", L"Cycle layouts"},
-    {"audio", L"Sound", L"Volume and devices", L"Mute", L"Adjust volume"},
+    {"audio", L"Sound", L"Volume and devices", NULL, L"Adjust volume"},
     {"bluetooth", L"Bluetooth", L"Manage devices", NULL, NULL},
     {"network", L"Network", L"Wi-Fi networks", L"Network adapters", NULL},
     {"throughput", L"Network traffic", L"Wi-Fi networks", L"Network adapters", NULL},
@@ -25,6 +22,12 @@ static const struct {
     {"clipboard", L"Clipboard history", L"Browse clipboard history", NULL, NULL},
     {"notifications", L"Desktop notifications", L"View notifications", NULL, NULL},
 };
+
+const w_bar_description *w_bar_describe(const char *module) {
+    for (size_t i=0; i<count_of(descriptions); ++i)
+        if (!strcmp(module,descriptions[i].module)) return &descriptions[i];
+    return NULL;
+}
 
 static void w_hint(wchar_t *out, size_t cap, const wchar_t *gesture, const wchar_t *label, const char *command) {
     wchar_t name[128];
@@ -40,13 +43,12 @@ static void w_tip_text(w_bar_window *b, wchar_t *heading, wchar_t *body, wchar_t
     const struct w_bar_hit *hit = &b->hits[b->tip.index];
     const w_module_style *s = hit->style;
     const wchar_t *left = NULL, *right = NULL, *wheel = NULL;
-    for (size_t i=0;i<count_of(descriptions);++i) {
-        if (strcmp(hit->module,descriptions[i].module)) continue;
-        wcscpy(heading,descriptions[i].heading);
-        left = descriptions[i].click;
-        right = descriptions[i].right;
-        wheel = descriptions[i].wheel;
-        break;
+    const w_bar_description *info = w_bar_describe(hit->module);
+    if (info) {
+        wcscpy(heading,info->heading);
+        left = info->click;
+        right = info->right;
+        wheel = info->wheel;
     }
     if (!*heading) {
         const char *name = !strncmp(hit->module,"custom/",7) ? hit->module+7 : hit->module;
@@ -89,10 +91,18 @@ static void w_tip_text(w_bar_window *b, wchar_t *heading, wchar_t *body, wchar_t
     }
     if (!*body) wcscpy(body,hit->tooltip);
     if (!_wcsicmp(heading,body)) *body = 0;
+    if (!strcmp(hit->module,"mode"))
+        left = b->view.resize_mode ? L"Exit resize mode" : L"Allow automatic sleep";
+    const wchar_t *toggle_mute = NULL;
+    if (!strcmp(hit->module,"audio")) {
+        if (b->audio_percent >= 0) toggle_mute = b->audio_muted ? L"Unmute output" : L"Mute output";
+        else wheel = NULL;
+        right = toggle_mute;
+    }
     w_hint(help,320,L"Click",left,s && *s->action ? s->action : left ? NULL : hit->action);
     w_hint(help,320,L"Right-click",right,s ? s->right_click : NULL);
     w_hint(help,320,L"Middle-click",!strcmp(hit->module,"menu") ? L"Configure toolbar" :
-           !strcmp(hit->module,"audio") ? L"Mute" : NULL,
+           toggle_mute,
            s ? s->middle_click : NULL);
     if (s && (*s->scroll_up || *s->scroll_down)) {
         w_hint(help,320,L"Scroll up",wheel,s->scroll_up);

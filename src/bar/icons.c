@@ -30,6 +30,9 @@ static const w_vertex chip[] = {{6, 6},   {18, 6},  {18, 18}, {6, 18},  {6, 6}, 
                               {15, 18}, {15, 21}, {-1, 0},  {3, 9},   {6, 9},  {-1, 0},  {3, 15},
                               {6, 15},  {-1, 0},  {18, 9},  {21, 9},  {-1, 0}, {18, 15}, {21, 15}};
 static const w_vertex play[] = {{7, 4}, {20, 12}, {7, 20}, {7, 4}};
+static const w_vertex resize[] = {{4,10},{4,4},{10,4},{-1,0},{4,4},{20,20},{-1,0},{14,20},{20,20},{20,14}};
+static const w_vertex awake[] = {{4,9},{16,9},{16,15},{14,18},{7,18},{4,15},{4,9},{-1,0},
+    {16,10},{20,10},{21,12},{20,14},{16,14},{-1,0},{3,21},{19,21},{-1,0},{8,6},{8,3},{-1,0},{12,6},{12,2}};
 static const w_vertex ram[] = {{2,6},{22,6},{22,16},{2,16},{2,6},{-1,0},{6,10},{6,12},
     {-1,0},{10,10},{10,12},{-1,0},{14,10},{14,12},{-1,0},{18,10},{18,12},
     {-1,0},{5,17},{5,20},{-1,0},{10,17},{10,20},{-1,0},{15,17},{15,20},{-1,0},{20,17},{20,20}};
@@ -121,6 +124,8 @@ void w_icons_resize(w_icon_atlas *atlas, int dpi) {
                       [icon_project] = {project,count_of(project)},
                       [icon_clipboard] = {clipboard,count_of(clipboard)},
                       [icon_bell] = {bell,count_of(bell)},
+                      [icon_resize] = {resize,count_of(resize)},
+                      [icon_awake] = {awake,count_of(awake)},
                       [icon_play] = {play, count_of(play)},
                       [icon_plug] = {plug, count_of(plug)},
                       [icon_quiet] = {speaker, count_of(speaker)},

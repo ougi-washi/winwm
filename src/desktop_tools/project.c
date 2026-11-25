@@ -1,6 +1,7 @@
 #define COBJMACROS
 #include "desktop_tools/tools.h"
 #include "theme/theme.h"
+#include "theme/icon_button.h"
 #include <shobjidl.h>
 #include <shlwapi.h>
 #include <stdio.h>
@@ -217,7 +218,7 @@ static void w_layout_project(bool resize_font) {
     RECT client;
     GetClientRect(panel,&client);
     int pad = MulDiv(16,dpi,96), gap = MulDiv(8,dpi,96), line = MulDiv(32,dpi,96);
-    int width = max(1,(int)client.right-2*pad), side = min(width/3,MulDiv(100,dpi,96)), y = pad;
+    int width = max(1,(int)client.right-2*pad), side = min(width/3,line), y = pad;
     MoveWindow(label,pad,y,width,line,TRUE);
     y += line;
     MoveWindow(folder,pad,y,max(1,width-side-gap),line,TRUE);
@@ -229,9 +230,8 @@ static void w_layout_project(bool resize_font) {
     int last = client.bottom-pad-line;
     MoveWindow(recent,pad,y,width,max(1,last-line-gap-y),TRUE);
     MoveWindow(status,pad,last-line,width,line,TRUE);
-    int button = (width-gap*2)/3;
     HWND actions[] = {terminal,files,editor};
-    for (int i = 0; i < 3; i++) MoveWindow(actions[i],pad+i*(button+gap),last,button,line,TRUE);
+    for (int i = 0; i < 3; i++) MoveWindow(actions[i],pad+i*(side+gap),last,side,line,TRUE);
 }
 
 static LRESULT CALLBACK w_project_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
@@ -333,11 +333,16 @@ int w_project_run(const w_desktop_config *config) {
     terminal = w_project_control(L"BUTTON",L"Open terminal",button,107);
     files = w_project_control(L"BUTTON",L"Open files",button,108);
     editor = w_project_control(L"BUTTON",L"Edit file…",button,109);
-    if (!folder || !recent || !status || !browse || !terminal || !files || !editor) {
+    if (!label || !folder || !recent_label || !recent || !forget || !status || !browse || !terminal || !files || !editor) {
         DestroyWindow(panel);
         if (SUCCEEDED(apartment)) CoUninitialize();
         return 1;
     }
+    w_icon_button(browse,L"\uE838",L"Browse for a project folder");
+    w_icon_button(forget,L"\uE738",L"Remove folder from recent projects");
+    w_icon_button(terminal,L"\uE756",L"Open terminal in project folder");
+    w_icon_button(files,L"\uE8B7",L"Open project folder in file manager");
+    w_icon_button(editor,L"\uE70F",L"Choose a project file to edit");
     w_recent_list();
     wchar_t initial[os_path_cap] = {0};
     if (SendMessageW(recent,LB_SETCURSEL,0,0) != LB_ERR && w_selected_folder(initial)) SetWindowTextW(folder,initial);

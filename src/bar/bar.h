@@ -22,6 +22,7 @@ bool w_bar_fade(HWND hwnd, w_layer_fade *fade, BYTE target, w_transition timing,
 bool w_bar_fade_tick(HWND hwnd, w_layer_fade *fade, bool enabled);
 typedef struct w_bar_window {
     HWND hwnd;
+    struct w_bar_access *access;
     int output, dpi;
     HFONT font, heading_font;
     w_icon_atlas icons;
@@ -60,7 +61,7 @@ typedef struct w_bar_window {
         char action[128], module[56], instance[56];
         wchar_t tooltip[256], text[256];
         const w_module_style *style;
-        int workspace;
+        int workspace, source;
         bar_icon icon;
         bool active, empty, label, painted;
         uint64_t start;
@@ -81,6 +82,7 @@ w_rect w_bar_position(w_bar_window *b, w_rect screen, int dpi, bool hidden);
 void w_bar_invalidate(w_bar_window *b, const char *module);
 void w_bar_set_audio(w_bar_window *b, int percent, bool muted);
 void w_bar_update(w_bar_window *b, const w_bar_view *v);
+bool w_bar_activate_hit(w_bar_window *bar, int hit);
 
 bool w_bar_menu_active(void);
 void w_bar_menu_close(const w_bar_window *bar, bool restore);

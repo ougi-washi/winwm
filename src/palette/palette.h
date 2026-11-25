@@ -15,6 +15,7 @@ typedef struct w_palette_entry {
     wchar_t label[palette_text_capacity];
     int id;
     enum w_palette_group group;
+    wchar_t glyph;
     const char *command_name;
     const wchar_t *keywords; // Normalized search terms for built-in actions; static lifetime.
     int system_icon; // One-based index in the shell's small icon image list, or zero.

@@ -1,5 +1,6 @@
 #include "desktop_tools/tools.h"
 #include "theme/theme.h"
+#include "theme/icon_button.h"
 #include <commctrl.h>
 #include <wchar.h>
 #include <wctype.h>
@@ -70,7 +71,8 @@ static void w_controls(void) {
     EnableWindow(results,!process);
     EnableWindow(search,!process && (updates || GetWindowTextLengthW(query) > 0));
     EnableWindow(apply,!process && (selected[0] || source_terms));
-    SetWindowTextW(search,updates ? L"Refresh" : L"Search");
+    w_icon_button(search,updates ? L"\uE72C" : L"\uE721",
+                  updates ? L"Refresh available updates" : L"Search WinGet");
     SetWindowTextW(apply,source_terms ? L"Accept terms…" : reviewed ? (updates ? L"Update…" : L"Install…") : L"Review");
 }
 
@@ -329,17 +331,6 @@ static void w_review(void) {
         w_start(updates ? pkg_upgrade : pkg_install,selected);
 }
 
-static void w_page(bool update) {
-    updates = update;
-    source_terms = false;
-    SendMessageW(pages,CB_SETCURSEL,updates ? 1 : 0,0);
-    w_clear_rows(); SetWindowTextW(output,L"");
-    SetWindowTextW(status,L"Search by app name or package ID.");
-    w_controls();
-    if (updates) w_search();
-    else SetFocus(query);
-}
-
 static void w_layout(bool fonts) {
     if (!apply) return;
     RECT area;
@@ -347,7 +338,7 @@ static void w_layout(bool fonts) {
     UINT dpi = GetDpiForWindow(window);
     int pad = MulDiv(14,dpi,96), gap = MulDiv(8,dpi,96), h = MulDiv(32,dpi,96);
     int width = max(1,(int)area.right-2*pad), button = min(width/3,MulDiv(104,dpi,96));
-    int top = pad, mode = min(width/3,MulDiv(132,dpi,96));
+    int top = pad, mode = updates ? width-h-gap : min(width/3,MulDiv(132,dpi,96));
     if (fonts) {
         HFONT next = CreateFontW(-MulDiv(14,dpi,96),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
         if (next) {
@@ -362,8 +353,8 @@ static void w_layout(bool fonts) {
         SendMessageW(results,LB_SETITEMHEIGHT,0,h);
     }
     MoveWindow(pages,pad,top,mode,h*5,TRUE);
-    MoveWindow(query,pad+mode+gap,top,max(1,width-mode-button-2*gap),h,TRUE);
-    MoveWindow(search,pad+width-button,top,button,h,TRUE);
+    MoveWindow(query,pad+mode+gap,top,max(1,width-mode-h-2*gap),h,TRUE);
+    MoveWindow(search,pad+width-h,top,h,h,TRUE);
     top += h+gap;
     int space = max(2,(int)area.bottom-pad-top-h-2*gap);
     int list_height = space*3/5;
@@ -372,6 +363,19 @@ static void w_layout(bool fonts) {
     MoveWindow(status,pad,top,max(1,width-button-gap),h,TRUE);
     MoveWindow(apply,pad+width-button,top,button,h,TRUE);
     MoveWindow(output,pad,top+h+gap,width,space-list_height,TRUE);
+}
+
+static void w_page(bool update) {
+    updates = update;
+    source_terms = false;
+    SendMessageW(pages,CB_SETCURSEL,updates ? 1 : 0,0);
+    ShowWindow(query,updates ? SW_HIDE : SW_SHOWNA);
+    w_layout(false);
+    w_clear_rows(); SetWindowTextW(output,L"");
+    SetWindowTextW(status,L"Search by app name or package ID.");
+    w_controls();
+    if (updates) w_search();
+    else SetFocus(query);
 }
 
 static LRESULT CALLBACK w_pkg_proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {

@@ -26,6 +26,8 @@ typedef enum bar_icon {
     icon_project,
     icon_clipboard,
     icon_bell,
+    icon_resize,
+    icon_awake,
     icon_count
 } bar_icon;
 

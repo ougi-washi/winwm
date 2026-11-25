@@ -34,6 +34,7 @@ Sign out and back in to start winwm as your shell.
 - Software. Search WinGet, install packages, review updates.
 - Languages & input. Add or remove languages. Select keyboards and IMEs. Install basic typing. Test input.
 - Configurable toolbar. Hover for details. Middle-click Menu to edit module order.
+- Icon controls show their action on hover or keyboard focus.
 - Custom toolbar commands appear in Menu under Toolbar actions.
 - Output, microphone, and app volume controls. Input languages, Wi-Fi, Bluetooth, displays, and power.
 - Activity monitor, clipboard history, screenshots, screen recording, color picker.

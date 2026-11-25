@@ -1,5 +1,6 @@
 #include "desktop_tools/tools.h"
 #include "theme/theme.h"
+#include "theme/icon_button.h"
 #include <stdio.h>
 
 enum { layout_capacity = sizeof(((w_desktop_config *)0)->bar_left), save_done = WM_APP + 20 };
@@ -247,6 +248,7 @@ static void w_show_group(int selection) {
 }
 
 static void w_modify(HWND source) {
+    bool button_had_focus = GetFocus() == source;
     int selected=(int)SendMessageW(list,LB_GETCURSEL,0,0);
     if (source==add) {
         int choice=(int)SendMessageW(available,CB_GETCURSEL,0,0);
@@ -277,6 +279,8 @@ static void w_modify(HWND source) {
     SendMessageW(list,LB_SETCURSEL,selected,0);
     SetWindowTextW(status,L"");
     w_controls();
+    if (button_had_focus && !IsWindowEnabled(source))
+        SetFocus(selected >= 0 ? list : available);
 }
 
 static void w_arrange(bool fonts) {
@@ -285,8 +289,8 @@ static void w_arrange(bool fonts) {
     GetClientRect(window,&r);
     UINT dpi=GetDpiForWindow(window);
     int p=MulDiv(14,dpi,96), gap=MulDiv(8,dpi,96), h=MulDiv(31,dpi,96), label=MulDiv(22,dpi,96);
-    int width=max(1,(int)r.right-2*p), side=min(width/3,MulDiv(98,dpi,96));
-    int list_y=p+label+h+gap, bottom=r.bottom-p, pick_y=bottom-3*h-2*gap;
+    int width=max(1,(int)r.right-2*p), side=min(width/3,h);
+    int list_y=p+label+h+gap, bottom=r.bottom-p, pick_y=bottom-2*h-gap;
     int list_h=max(1,pick_y-label-gap-list_y);
     if (fonts) {
         HFONT next=CreateFontW(-MulDiv(14,dpi,96),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,0,0,
@@ -307,7 +311,7 @@ static void w_arrange(bool fonts) {
     MoveWindow(available_label,p,pick_y-label,width,label,TRUE);
     MoveWindow(available,p,pick_y,width-side-gap,h*8,TRUE);
     MoveWindow(add,p+width-side,pick_y,side,h,TRUE);
-    MoveWindow(status,p,pick_y+h+gap,width,h+gap,TRUE);
+    MoveWindow(status,p,bottom-h,width-side-gap,h,TRUE);
     MoveWindow(apply,p+width-side,bottom-h,side,h,TRUE);
 }
 
@@ -386,6 +390,11 @@ int w_toolbar_run(void) {
     if (!group_label || !group_box || !list || !up || !down || !remove_button || !available_label || !available || !add || !status || !apply) {
         DestroyWindow(window); free(cfg); return 1;
     }
+    w_icon_button(up,L"\uE74A",L"Move module up (Alt+Up in list)");
+    w_icon_button(down,L"\uE74B",L"Move module down (Alt+Down in list)");
+    w_icon_button(remove_button,L"\uE738",L"Remove module from section (Delete in list)");
+    w_icon_button(add,L"\uE710",L"Add selected module to this section");
+    w_icon_button(apply,L"\uE74E",L"Save toolbar layout");
     for(int i=0;i<3;i++) SendMessageW(group_box,CB_ADDSTRING,0,(LPARAM)sections[i]);
     SendMessageW(group_box,CB_SETCURSEL,group,0);
     for(int i=0;w_config_module_name(i);i++) {

@@ -1,6 +1,7 @@
 #define COBJMACROS
 #include "desktop_tools/tools.h"
 #include "theme/theme.h"
+#include "theme/icon_button.h"
 #include <commctrl.h>
 #include <imm.h>
 #include <msctf.h>
@@ -173,8 +174,10 @@ static void w_buttons(void) {
     EnableWindow(make_default, ready);
     EnableWindow(basic, ready && *c->id);
     EnableWindow(methods, !applying);
-    SetWindowTextW(add, page == input_languages ? L"Add language" : page == input_keyboards ? L"Add keyboard" :
-                         c && !c->enabled ? L"Enable and try" : L"Try input method");
+    w_icon_button(add, page == input_methods ? L"\uE92E" : L"\uE710",
+                  page == input_languages ? L"Add selected language" :
+                  page == input_keyboards ? L"Add selected keyboard layout" :
+                  c && !c->enabled ? L"Enable and test input method" : L"Test input method");
 }
 
 static void w_filter_choices(void) {
@@ -440,7 +443,7 @@ static void w_layout(void) {
     int test_y = actions_y-gap-px(34);
     int status_y = (page == input_methods ? test_y : actions_y)-gap-px(44);
     int results_y = pad+px(32)+gap;
-    int cell = (width-2*gap)/3;
+    int icon = px(34);
     w_place(category, pad, pad, category_width, px(180));
     w_place(search, pad+category_width+gap, pad, width-category_width-gap, px(30));
     w_place(results, pad, results_y, width, status_y-gap-results_y);
@@ -448,11 +451,12 @@ static void w_layout(void) {
     int label_width = px(78);
     w_place(test_label, pad, test_y, label_width, px(34));
     w_place(typing, pad+label_width+gap, test_y, width-label_width-gap, px(34));
-    w_place(add, pad, actions_y, cell, px(34));
-    w_place(remove_lang, pad+cell+gap, actions_y, cell, px(34));
-    w_place(make_default, pad+cell+gap, actions_y, cell, px(34));
-    w_place(methods, pad+2*(cell+gap), actions_y, width-2*(cell+gap), px(34));
-    w_place(basic, pad+2*(cell+gap), actions_y, width-2*(cell+gap), px(34));
+    w_place(add, pad, actions_y, icon, icon);
+    w_place(remove_lang, pad+icon+gap, actions_y, icon, icon);
+    w_place(make_default, pad+icon+gap, actions_y, icon, icon);
+    int more = min(px(172),width-2*(icon+gap));
+    w_place(methods, pad+width-more, actions_y, more, icon);
+    w_place(basic, pad+width-more, actions_y, more, icon);
 }
 
 static void w_font(void) {
@@ -561,6 +565,8 @@ int w_language_setup(w_input_page start_page) {
         DestroyWindow(panel);
         return 1;
     }
+    w_icon_button(remove_lang,L"\uE738",L"Remove selected language");
+    w_icon_button(make_default,L"\uE734",L"Set selected keyboard or input method as default");
     HRESULT com = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
     TfClientId client = 0;
     if (SUCCEEDED(com)) {

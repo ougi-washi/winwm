@@ -1,4 +1,5 @@
 #include "theme/theme.h"
+#include "theme/icon_button.h"
 #include "palette/palette.h"
 #include <commctrl.h>
 #include <windowsx.h>
@@ -392,6 +393,7 @@ static void w_draw_result(NMLVCUSTOMDRAW *draw) {
     const w_palette_entry *entry = source >= 0 ? &rows[source].entry : NULL;
     bool category = source < 0 && source > command_prompt;
     enum w_palette_group kind = entry ? entry->group : category ? (enum w_palette_group)-source : palette_tools;
+    wchar_t glyph = entry && entry->glyph ? entry->glyph : groups[kind].glyph;
     RECT r = {0};
     if (!ListView_GetItemRect(list,index,&r,LVIR_BOUNDS)) return;
     RECT viewport;
@@ -415,7 +417,7 @@ static void w_draw_result(NMLVCUSTOMDRAW *draw) {
     RECT icon = r;
     icon.left += px(8);
     icon.right = icon.left + px(29);
-    if (kind) label.left = icon.right + px(8);
+    if (glyph) label.left = icon.right + px(8);
     if (category) {
         RECT arrow = label;
         arrow.left = arrow.right-px(21);
@@ -442,8 +444,8 @@ static void w_draw_result(NMLVCUSTOMDRAW *draw) {
     SelectObject(dc, text_font);
     SetTextColor(dc, ink);
     DrawTextW(dc, w_label(source), -1, &label, DT_SINGLELINE|DT_VCENTER|DT_END_ELLIPSIS|DT_NOPREFIX);
-    if (kind && (!entry || !w_app_icon(dc,entry->system_icon,icon)))
-        w_glyph(dc, groups[kind].glyph, icon, selected ? ink : w_theme_accent());
+    if (glyph && (!entry || !w_app_icon(dc,entry->system_icon,icon)))
+        w_glyph(dc, glyph, icon, selected ? ink : w_theme_accent());
     RestoreDC(dc, saved);
 }
 
@@ -603,22 +605,6 @@ static LRESULT CALLBACK w_palette_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 manual_selection = true;
         }
     }
-    if (msg == WM_DRAWITEM && lp) {
-        DRAWITEMSTRUCT *item = (DRAWITEMSTRUCT *)lp;
-        if (item->hwndItem == back || item->hwndItem == close_button) {
-            int saved = SaveDC(item->hDC);
-            FillRect(item->hDC, &item->rcItem, w_theme_brush());
-            bool pressed = (item->itemState & ODS_SELECTED) != 0;
-            if (pressed)
-                w_round_rect(item->hDC, item->rcItem, w_theme_selection(false), w_theme_selection(false), px(8));
-            SetBkMode(item->hDC, TRANSPARENT);
-            w_glyph(item->hDC, item->hwndItem == back ? 0xe72b : 0xe8bb, item->rcItem,
-                    pressed ? w_theme_selection(true) : w_theme_foreground());
-            if (item->itemState & ODS_FOCUS) DrawFocusRect(item->hDC, &item->rcItem);
-            RestoreDC(item->hDC, saved);
-            return TRUE;
-        }
-    }
     LRESULT color_result;
     if (w_theme_message(w, msg, wp, lp, &color_result)) return color_result;
     if (msg == WM_PAINT || msg == WM_PRINTCLIENT) {
@@ -703,6 +689,8 @@ static bool w_create_palette(void) {
     back = CreateWindowW(L"BUTTON",L"Back",WS_CHILD|WS_TABSTOP|BS_OWNERDRAW,0,0,0,0,panel,NULL,inst,NULL);
     heading = CreateWindowW(L"STATIC",L"",visible|SS_CENTERIMAGE|SS_NOPREFIX|SS_ENDELLIPSIS,0,0,0,0,panel,NULL,inst,NULL);
     close_button = CreateWindowW(L"BUTTON",L"Close",visible|WS_TABSTOP|BS_OWNERDRAW,0,0,0,0,panel,NULL,inst,NULL);
+    if (back) w_icon_button(back,L"\xe72b",L"Back to categories");
+    if (close_button) w_icon_button(close_button,L"\xe8bb",L"Close");
     // The static label precedes the edit in the child order for its accessible name.
     HWND search_name = CreateWindowW(L"STATIC",L"Search",visible,0,0,0,0,panel,NULL,inst,NULL);
     edit = CreateWindowExW(0,L"EDIT",L"",visible|WS_TABSTOP|ES_AUTOHSCROLL,0,0,0,0,panel,NULL,inst,NULL);

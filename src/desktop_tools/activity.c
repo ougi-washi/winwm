@@ -1,5 +1,6 @@
 #include "desktop_tools/tools.h"
 #include "theme/theme.h"
+#include "theme/icon_button.h"
 #include <commctrl.h>
 #include <psapi.h>
 #include <shlwapi.h>
@@ -214,7 +215,8 @@ static void w_apply_sample(bool ok) {
 static void w_toggle_pause(void) {
     paused = !paused;
     discard_sample = paused && worker;
-    SetWindowTextW(pause_button, paused ? L"Resume" : L"Pause");
+    w_icon_button(pause_button, paused ? L"\uE768" : L"\uE769",
+                  paused ? L"Resume process updates" : L"Pause process updates");
     if (!paused) w_request_sample();
 }
 
@@ -388,22 +390,23 @@ static void w_layout(bool resize_font) {
     GetClientRect(panel, &client);
     int pad = MulDiv(14,dpi,96), gap = MulDiv(8,dpi,96), line = MulDiv(30,dpi,96);
     int width = max(1,(int)client.right - 2*pad);
-    int buttons = (width - 3*gap)/4, pause_width = MulDiv(86,dpi,96);
     int y = pad;
     MoveWindow(summary, pad, y, width, line, TRUE);
     y += line + gap;
     int label_width = MulDiv(93,dpi,96);
     MoveWindow(search_label, pad, y, label_width, line, TRUE);
-    MoveWindow(search, pad+label_width, y, max(1,width-pause_width-label_width-gap), line, TRUE);
-    MoveWindow(pause_button, pad+width-pause_width, y, pause_width, line, TRUE);
+    MoveWindow(search, pad+label_width, y, max(1,width-line-label_width-gap), line, TRUE);
+    MoveWindow(pause_button, pad+width-line, y, line, line, TRUE);
     y += line + gap;
     int bottom = client.bottom - pad - line;
     MoveWindow(table, pad, y, width, max(1,bottom-line-gap-y), TRUE);
     MoveWindow(empty, 2*pad, y+2*line, max(1,width-2*pad), line, TRUE);
     MoveWindow(feedback, pad, bottom-line, width, line, TRUE);
-    HWND actions[] = {copy_pid, copy_path, close_app, end_task};
-    for (int i = 0; i < (int)count_of(actions); i++)
-        MoveWindow(actions[i], pad+i*(buttons+gap), bottom, buttons, line, TRUE);
+    MoveWindow(copy_pid, pad, bottom, line, line, TRUE);
+    MoveWindow(copy_path, pad+line+gap, bottom, line, line, TRUE);
+    int action = min(MulDiv(124,dpi,96), max(1,(width-2*line-3*gap)/2));
+    MoveWindow(close_app, pad+width-2*action-gap, bottom, action, line, TRUE);
+    MoveWindow(end_task, pad+width-action, bottom, action, line, TRUE);
     RECT box;
     GetClientRect(table,&box);
     // The first asynchronous sample can introduce a vertical scrollbar after the layout.
@@ -500,6 +503,9 @@ int w_activity_run(void) {
         DestroyWindow(panel);
         return 1;
     }
+    w_icon_button(pause_button,L"\uE769",L"Pause process updates");
+    w_icon_button(copy_pid,L"\uE8C8",L"Copy process ID");
+    w_icon_button(copy_path,L"\uE71B",L"Copy executable path");
     ListView_SetExtendedListViewStyle(table,LVS_EX_FULLROWSELECT|LVS_EX_DOUBLEBUFFER);
     ListView_SetBkColor(table,w_theme_background());
     ListView_SetTextBkColor(table,w_theme_background());

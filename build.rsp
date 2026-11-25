@@ -1,7 +1,9 @@
 @compile.rsp
 src/theme/theme.c
+src/theme/icon_button.c
 src/app/main.c
 src/bar/bar.c
+src/bar/accessibility.c
 src/bar/icons.c
 src/bar/menu.c
 src/bar/tooltip.c
@@ -68,6 +70,7 @@ src/win_platform/win_platform.c
 -lcfgmgr32
 -lws2_32
 -lole32
+-loleacc
 -loleaut32
 -limm32
 -lshell32

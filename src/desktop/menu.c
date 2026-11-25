@@ -46,6 +46,22 @@ static void w_desktop_run_line(const wchar_t *line, UINT request) {
 ////////////////
 //~ Command palette
 
+static const wchar_t command_glyphs[cmd_count] = {
+    [cmd_terminal]=0xe756, [cmd_program]=0xe756, [cmd_open_folder]=0xe8b7, [cmd_open_place]=0xe8b7,
+    [cmd_edit_config]=0xe70f, [cmd_project]=0xe943, [cmd_settings]=0xe713, [cmd_shortcuts]=0xe765,
+    [cmd_close]=0xe8bb, [cmd_fullscreen]=0xe740, [cmd_workspace_back]=0xe72b,
+    [cmd_clipboard]=0xe77f, [cmd_clipboard_clear]=0xe74d, [cmd_notifications]=0xe7e7,
+    [cmd_capture]=0xe722, [cmd_capture_window]=0xe722, [cmd_capture_region]=0xe722, [cmd_record]=0xe7c8,
+    [cmd_volume_up]=0xe995, [cmd_volume_down]=0xe993, [cmd_mute]=0xe74f, [cmd_audio]=0xe767,
+    [cmd_volume_set]=0xe767, [cmd_volume_mixer]=0xe9e9, [cmd_microphone]=0xe720,
+    [cmd_media_previous]=0xe892, [cmd_media_play]=0xe768, [cmd_media_next]=0xe893, [cmd_media_stop]=0xe71a,
+    [cmd_wifi]=0xe701, [cmd_bluetooth]=0xe702, [cmd_network_settings]=0xe839, [cmd_display]=0xe7f4,
+    [cmd_date_time]=0xe823, [cmd_languages]=0xe774, [cmd_input_methods]=0xe765, [cmd_keyboard_settings]=0xe765,
+    [cmd_packages]=0xe896, [cmd_google_japanese_input]=0xe896, [cmd_updates]=0xe895, [cmd_windows_update]=0xe895,
+    [cmd_reload]=0xe72c, [cmd_provider_refresh]=0xe72c, [cmd_lock]=0xe72e, [cmd_restart]=0xe777,
+    [cmd_sleep]=0xe708, [cmd_confirm_sign_out]=0xf3b1, [cmd_power_settings]=0xe7e8,
+};
+
 static void w_add_row(const wchar_t *label, const char *action, w_window_id target) {
     if (row_count >= window_limit)
         return;
@@ -53,7 +69,7 @@ static void w_add_row(const wchar_t *label, const char *action, w_window_id targ
     if (action && !w_command_parse(action, &command)) return;
     int n = row_count++;
     row_output[n] = -1;
-    entries[n] = (w_palette_entry){.id = n, .group = group};
+    entries[n] = (w_palette_entry){.id = n, .group = group, .glyph = command_glyphs[command.kind]};
     wcsncpy(entries[n].label, label, 255);
     entries[n].label[255] = 0;
     if (IS_HIGH_SURROGATE(entries[n].label[254])) entries[n].label[254] = 0;

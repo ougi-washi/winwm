@@ -1,10 +1,12 @@
 #include "theme/theme.h"
+#include "theme/icon_button.h"
 #include <dwmapi.h>
 
 ////////////////
 //~ Theme
 
 static COLORREF surface = RGB(16, 17, 22), ink = RGB(228, 229, 234), active = RGB(145, 170, 247);
+static uint32_t configured_background = 0x101116, configured_foreground = 0xe4e5ea, configured_accent = 0x91aaf7;
 static HBRUSH brush;
 static bool high_contrast;
 
@@ -49,6 +51,9 @@ COLORREF w_theme_selection(bool foreground) {
 }
 
 void w_theme_colors(uint32_t background, uint32_t foreground, uint32_t accent) {
+    configured_background = background;
+    configured_foreground = foreground;
+    configured_accent = accent;
     HIGHCONTRASTW hc = {.cbSize = sizeof(hc)};
     SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(hc), &hc, 0);
     bool contrast = (hc.dwFlags & HCF_HIGHCONTRASTON) != 0;
@@ -68,6 +73,9 @@ bool w_theme_message(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT *result) {
     if (msg == WM_CREATE) {
         BOOL enabled = TRUE;
         DwmSetWindowAttribute(w, 20, &enabled, sizeof(enabled));
+    } else if (msg == WM_SYSCOLORCHANGE || (msg == WM_SETTINGCHANGE && (wp == SPI_SETHIGHCONTRAST || !wp))) {
+        w_theme_colors(configured_background, configured_foreground, configured_accent);
+        RedrawWindow(w,NULL,NULL,RDW_INVALIDATE|RDW_ERASE|RDW_ALLCHILDREN);
     } else if (msg == WM_ACTIVATE) {
         COLORREF edge = LOWORD(wp) == WA_INACTIVE ? w_tint(surface, ink, 24) : active;
         DwmSetWindowAttribute(w, 34, &edge, sizeof(edge));
@@ -125,8 +133,9 @@ bool w_theme_message(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT *result) {
         int saved = SaveDC(item->hDC);
         SelectObject(item->hDC, GetStockObject(DC_BRUSH));
         SelectObject(item->hDC, GetStockObject(DC_PEN));
-        COLORREF fill = pressed ? active : w_tint(surface, focused ? active : ink, 11);
-        COLORREF edge = pressed || focused ? active : w_tint(surface, ink, 28);
+        bool hot = !(item->itemState & ODS_DISABLED) && w_icon_button_hot(item->hwndItem);
+        COLORREF fill = pressed ? active : hot ? w_theme_selection(false) : w_tint(surface, focused ? active : ink, 11);
+        COLORREF edge = pressed || focused || hot ? active : w_tint(surface, ink, 28);
         SetDCBrushColor(item->hDC, high_contrast ? GetSysColor(pressed ? COLOR_HIGHLIGHT : COLOR_BTNFACE) : fill);
         SetDCPenColor(item->hDC, high_contrast ? GetSysColor(COLOR_BTNTEXT) : edge);
         int curve = MulDiv(9, GetDpiForWindow(w), 96);
@@ -134,8 +143,9 @@ bool w_theme_message(HWND w, UINT msg, WPARAM wp, LPARAM lp, LRESULT *result) {
         SetBkMode(item->hDC, TRANSPARENT);
         COLORREF caption = high_contrast ? GetSysColor(pressed ? COLOR_HIGHLIGHTTEXT : COLOR_BTNTEXT) : pressed ? surface : ink;
         SetTextColor(item->hDC, (item->itemState & ODS_DISABLED) ? GetSysColor(COLOR_GRAYTEXT) : caption);
-        DrawTextW(item->hDC, text, -1, &item->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE |
-                  ((item->itemState & ODS_NOACCEL) ? DT_HIDEPREFIX : 0));
+        if (!w_icon_button_draw(item))
+            DrawTextW(item->hDC, text, -1, &item->rcItem, DT_CENTER | DT_VCENTER | DT_SINGLELINE |
+                      DT_END_ELLIPSIS | ((item->itemState & ODS_NOACCEL) ? DT_HIDEPREFIX : 0));
         if (focused && !(item->itemState & ODS_NOFOCUSRECT)) {
             InflateRect(&box, -3, -3);
             DrawFocusRect(item->hDC, &box);
