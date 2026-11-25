@@ -15,7 +15,7 @@ static w_toolbar_layout initial, draft;
 static int group = 2;
 static HANDLE worker;
 static wchar_t path[os_path_cap], feedback[256];
-static bool saved;
+static bool saved, closing;
 // The picker includes every built-in, provider, explicit style and token in the three groups.
 static struct { wchar_t key[56], label[96]; } choices[48 + provider_limit + 32 + 3*layout_capacity];
 static int choice_count;
@@ -339,12 +339,17 @@ static LRESULT CALLBACK w_toolbar_proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
     }
     if (msg==save_done && worker) {
         WaitForSingleObject(worker,INFINITE); CloseHandle(worker); worker=NULL;
+        if (closing) { DestroyWindow(w); return 0; }
         if (saved) initial=draft;
         SetWindowTextW(status,feedback);
         w_controls();
         return 0;
     }
-    if (msg==WM_CLOSE && worker) return 0;
+    if (msg==WM_CLOSE && worker) {
+        closing=true;
+        ShowWindow(w,SW_HIDE);
+        return 0;
+    }
     if (msg==WM_DESTROY) { PostQuitMessage(0); return 0; }
     return DefWindowProcW(w,msg,wp,lp);
 }

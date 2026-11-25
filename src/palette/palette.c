@@ -466,9 +466,19 @@ static void w_dismiss(bool restore_focus) {
     pending_ticket = 0;
     pending_restore = restore_focus && GetForegroundWindow() == panel ? return_to : NULL;
     return_to = NULL;
+    HWND capture = GetCapture();
+    if (capture == panel || IsChild(panel, capture))
+        ReleaseCapture();
     ShowWindow(panel, SW_HIDE);
     if (pending_restore)
         PostMessageW(panel, restore_foreground, 0, 0);
+}
+
+bool w_palette_close(void) {
+    if (!w_palette_shown())
+        return false;
+    w_dismiss(true);
+    return true;
 }
 
 static void w_restore_window(HWND previous) {

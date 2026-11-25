@@ -34,5 +34,6 @@ void w_palette_line_result(UINT request, bool started);
 void w_palette_focus(void);
 void w_palette_position(HMONITOR monitor);
 bool w_palette_shown(void);
+bool w_palette_close(void);
 bool w_palette_visible(const wchar_t *title);
 bool w_palette_message(MSG *msg);

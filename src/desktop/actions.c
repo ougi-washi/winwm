@@ -487,7 +487,7 @@ bool w_desktop_run_on(const w_command *c, int output) {
         break;
     case cmd_confirm_sign_out:
         if (MessageBoxW(NULL, L"Sign out and close your applications?", L"Sign out",
-                        MB_YESNO | MB_DEFBUTTON2 | MB_ICONQUESTION) == IDYES)
+                        MB_OKCANCEL | MB_DEFBUTTON2 | MB_ICONQUESTION) == IDOK)
             ok = ExitWindowsEx(EWX_LOGOFF, 0) != 0;
         break;
     case cmd_sign_out:

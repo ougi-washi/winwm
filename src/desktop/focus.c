@@ -228,12 +228,37 @@ bool w_desktop_close_target(HWND window, DWORD pid, w_window_id owner) {
     return PostMessageW(window, WM_CLOSE, 0, 0) != 0;
 }
 
+static bool w_tool_panel(HWND window, DWORD pid) {
+    if (!pid || !w_can_activate(window) || IsIconic(window) || w_os_cloaked(window))
+        return false;
+    bool dialog = GetClassLongPtrW(window, GCW_ATOM) == (ULONG_PTR)WC_DIALOG;
+    if (pid == GetCurrentProcessId())
+        return dialog;
+    HWND owner = GetAncestor(window, GA_ROOTOWNER);
+    if (!dialog && !((GetWindowLongPtrW(window, GWL_EXSTYLE) | GetWindowLongPtrW(owner, GWL_EXSTYLE)) & WS_EX_TOOLWINDOW))
+        return false;
+    wchar_t self[os_path_cap], image[os_path_cap];
+    DWORD length = count_of(image);
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process)
+        return false;
+    bool matches = QueryFullProcessImageNameW(process, 0, image, &length) &&
+                   w_os_self(self, count_of(self)) && !_wcsicmp(image, self);
+    CloseHandle(process);
+    return matches;
+}
+
 bool w_desktop_close_foreground(void) {
     HWND window = GetForegroundWindow();
-    int slot = w_desktop_find(w_os_app_window(window));
-    if (slot < 0) return false;
     DWORD pid = 0;
     GetWindowThreadProcessId(window,&pid);
+    if (w_tool_panel(window, pid))
+        return GetForegroundWindow() == window && PostMessageW(window, WM_CLOSE, 0, 0);
+    if (w_bar_menu_close(NULL, true) || w_palette_close())
+        return true;
+    int slot = w_desktop_find(w_os_app_window(window));
+    if (slot < 0)
+        return false;
     return w_desktop_close_target(window,pid,(w_window_id){slot,desk.model.windows[slot].generation});
 }
 

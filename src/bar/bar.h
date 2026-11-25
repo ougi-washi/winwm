@@ -85,5 +85,5 @@ void w_bar_update(w_bar_window *b, const w_bar_view *v);
 bool w_bar_activate_hit(w_bar_window *bar, int hit);
 
 bool w_bar_menu_active(void);
-void w_bar_menu_close(const w_bar_window *bar, bool restore);
+bool w_bar_menu_close(const w_bar_window *bar, bool restore);
 void w_bar_menu_audio_error(void);

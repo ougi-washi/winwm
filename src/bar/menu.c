@@ -96,9 +96,11 @@ static void w_dismiss(w_flyout *menu, bool restore) {
         DestroyWindow(hwnd);
 }
 
-void w_bar_menu_close(const w_bar_window *bar, bool restore) {
-    if (open_menu && (!bar || bar == open_menu->bar))
-        w_dismiss(open_menu, restore);
+bool w_bar_menu_close(const w_bar_window *bar, bool restore) {
+    if (!open_menu || (bar && bar != open_menu->bar))
+        return false;
+    w_dismiss(open_menu, restore);
+    return true;
 }
 
 static void w_pick(w_flyout *menu, int index) {

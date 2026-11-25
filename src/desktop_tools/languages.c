@@ -507,9 +507,6 @@ static LRESULT CALLBACK w_setup_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_GETMINMAXINFO:
         w_tool_minimum(w, (MINMAXINFO *)lp, px(435), px(345));
         return 0;
-    case WM_CLOSE:
-        if (applying && operation != basic_typing) return 0;
-        break;
     case WM_DESTROY:
         PostQuitMessage(0);
         return 0;

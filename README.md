@@ -15,6 +15,7 @@ Tiling window manager and shell for Windows x64.
 - Hover to focus and center the pointer. Desktop gaps clear focus.
 - Configurable borders, animations, keybindings, and toolbar.
 - Win+D Menu for apps, commands, WinGet installs and updates.
+- Win+Shift+Q closes the active panel or app.
 - Audio, network, displays, power, languages, keyboards, and IMEs.
 - Clipboard history, screen capture, recording, and process monitoring.
 
