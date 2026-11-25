@@ -97,7 +97,7 @@ if ($Action -eq 'Stage') {
         [IO.Directory]::CreateDirectory((Split-Path -Parent $configPath)) | Out-Null
         Write-Atomic $configPath ($template+[Environment]::NewLine+$override+[Environment]::NewLine) -IfMissing
     }
-    $check=Start-Process -FilePath (Join-Path $destination 'winwm.exe') -ArgumentList 'ctl','validate-startup' -PassThru -Wait -WindowStyle Hidden
+    $check=Start-Process -FilePath (Join-Path $destination 'winwm.exe') -ArgumentList 'validate-startup' -PassThru -Wait -WindowStyle Hidden
     if ($check.ExitCode) {throw 'The staged release failed startup validation.'}
     $previous=$null
     if (Test-Path $manifest) {
@@ -115,7 +115,7 @@ $hostExe=Join-Path $stage.path 'winwm.exe'
 if (!(Test-Path -LiteralPath $hostExe -PathType Leaf)) {throw "Missing $hostExe"}
 $recoveryExe=Join-Path $stage.path 'winwm_recovery.exe'
 if (!(Test-Path -LiteralPath $recoveryExe -PathType Leaf)) {throw "Missing $recoveryExe. Stage the complete release first."}
-$check=Start-Process -FilePath $hostExe -ArgumentList 'ctl','validate-activation' -PassThru -Wait -WindowStyle Hidden
+$check=Start-Process -FilePath $hostExe -ArgumentList 'validate-activation' -PassThru -Wait -WindowStyle Hidden
 if ($check.ExitCode) {throw 'The release or Windows shell configuration prevents activation.'}
 $startup=@{path=$runKey;name='winwm';value=('"'+$hostExe+'"')}
 $startup.before=Get-RegValue $startup

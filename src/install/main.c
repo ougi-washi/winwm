@@ -180,7 +180,7 @@ static DWORD w_stage_file(const wchar_t *source, const wchar_t *destination) {
 
 static DWORD w_validate(const wchar_t *exe, const wchar_t *directory) {
     wchar_t command[path_cap + 32];
-    swprintf(command, length_of(command), L"\"%ls\" ctl validate-startup", exe);
+    swprintf(command, length_of(command), L"\"%ls\" validate-startup", exe);
     STARTUPINFOW startup = {.cb = sizeof(startup)};
     PROCESS_INFORMATION process;
     if (!CreateProcessW(exe, command, NULL, NULL, FALSE, CREATE_NO_WINDOW, NULL, directory, &startup,
@@ -372,7 +372,7 @@ static void w_report(bool interactive, enum operation op, bool files_busy, DWORD
         detail = L"Place winwm.exe and winwm_recovery.exe beside winwm_install.exe and retry.";
         break;
     case ERROR_INVALID_DATA:
-        detail = L"The staged release failed startup validation. Run winwm.exe ctl validate-startup for details.";
+        detail = L"The staged release failed startup validation. Run winwm.exe validate-startup for details.";
         break;
     default:
         detail = L"Windows could not complete this operation.";

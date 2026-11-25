@@ -8,11 +8,13 @@
 //~ Desktop Ctl
 
 int w_ctl_run(int argc, wchar_t **argv) {
-    if (argc < 2) {
-        fwprintf(
-            stderr,
-            L"Usage: winwm.exe ctl run ACTION [ARG] | query | subscribe | reload | validate | doctor\n");
-        return 2;
+    if (argc == 2 && (!wcscmp(argv[1],L"--help") || !wcscmp(argv[1],L"help"))) {
+        puts("winwm.exe [--preview]\nwinwm.exe ACTION [ARG...]\n"
+             "winwm.exe query [provider NAME] | subscribe | doctor | validate | reload\n"
+             "winwm.exe physical-modifier install|restore");
+        for (int i=1; i<cmd_count; ++i)
+            printf("%s%s",w_command_name((enum command_kind)i),i==cmd_count-1 ? "\n" : " ");
+        return 0;
     }
     if (argc == 3 && !wcscmp(argv[1], L"physical-modifier") &&
         (!wcscmp(argv[2], L"install") || !wcscmp(argv[2], L"restore"))) {
@@ -57,16 +59,32 @@ int w_ctl_run(int argc, wchar_t **argv) {
                cfg.app_count);
         return 0;
     }
-    char request[2048] = {0};
+    bool control = !wcscmp(argv[1],L"query") || !wcscmp(argv[1],L"subscribe") ||
+                   !wcscmp(argv[1],L"doctor") || !wcscmp(argv[1],L"reload") || !wcscmp(argv[1],L"reload-bar");
+    char request[2048] = "run ";
+    size_t used = control ? 0 : 4;
+    bool program = !wcscmp(argv[1],L"program");
+    w_command action;
     for (int i = 1; i < argc; i++) {
-        size_t n = strlen(request);
         if (i > 1) {
-            if (n + 2 >= sizeof(request))
+            if (used + 1 >= sizeof(request))
                 return 2;
-            request[n++] = ' ';
+            request[used++] = ' ';
         }
-        if (!w_os_utf8(argv[i], request + n, (int)(sizeof(request) - n)))
+        const wchar_t *arg = argv[i];
+        wchar_t quoted[2 * sizeof(action.arg) + 3];
+        if (i > 1 && program && (!*arg || wcspbrk(arg,L" \t\""))) {
+            if (2 * wcslen(arg) + 3 > count_of(quoted)) return 2;
+            w_os_quote_argument(quoted,arg);
+            arg = quoted;
+        }
+        if (!w_os_utf8(arg, request + used, (int)(sizeof(request) - used)))
             return 2;
+        used += strlen(request + used);
+    }
+    if (!control && !w_command_parse(request+4,&action)) {
+        fputs("Invalid command or arguments. See winwm.exe --help.\n",stderr);
+        return 2;
     }
     wchar_t name[96];
     if (!w_ipc_name(name, count_of(name)))

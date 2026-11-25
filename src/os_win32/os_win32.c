@@ -219,7 +219,7 @@ bool w_os_task_manager(const char *name, wchar_t *out, int cap) {
 }
 
 // Encode a single Windows argv field, including its terminal run of backslashes.
-static wchar_t *w_quote(wchar_t *p, const wchar_t *s) {
+wchar_t *w_os_quote_argument(wchar_t *p, const wchar_t *s) {
     *p++ = L'"';
     for (;;) {
         size_t slashes = 0;
@@ -249,10 +249,10 @@ static HANDLE w_launch_at(const wchar_t *exe, const wchar_t *arg, const wchar_t 
     wchar_t *line = calloc(len, sizeof(wchar_t));
     if (!line)
         return NULL;
-    wchar_t *p = w_quote(line, exe);
+    wchar_t *p = w_os_quote_argument(line, exe);
     if (arg && *arg) {
         *p++ = L' ';
-        w_quote(p, arg);
+        w_os_quote_argument(p, arg);
     }
     STARTUPINFOW si = {.cb = sizeof(si)};
     if (origin) {
@@ -298,7 +298,7 @@ bool w_os_run_executable(const wchar_t *exe, const wchar_t *argument, const wcha
     if (admin) {
         wchar_t quoted[2 * os_path_cap + 3];
         if (argument && wcslen(argument) >= os_path_cap) return false;
-        if (argument && *argument) w_quote(quoted, argument);
+        if (argument && *argument) w_os_quote_argument(quoted, argument);
         return w_os_shell_execute(exe, argument && *argument ? quoted : NULL, directory, true);
     }
     HANDLE child = w_launch_at(exe, argument, directory, NULL);

@@ -1,45 +1,43 @@
 # winwm
 
-Tiling window manager for Windows x64. Per-monitor workspaces, tabbed and floating windows, app menu, configurable bar.
+Windows x64 · Tiling · Per-monitor workspaces · Tabs · Floating windows · App menu · Status bar
 
 ## Build
 
-MinGW-w64 GCC, windres, mingw32-make.
+`gcc` · `windres` · `mingw32-make` (MinGW-w64)
 
 ```powershell
 .\build.bat
 ```
 
+## Install
+
+```powershell
+.\bin\winwm_install.exe /install
+.\bin\winwm_install.exe /uninstall
+```
+
 ## Run
 
-- Start winwm and exit Explorer — `.\bin\winwm.exe`
-- Preview alongside Explorer — `.\bin\winwm.exe --preview`
-- Quit and restore Explorer — `.\bin\winwm.exe ctl run quit`
-- Install at sign-in — `.\bin\winwm_install.exe /install`
-- Uninstall — `.\bin\winwm_install.exe /uninstall`
+```powershell
+.\bin\winwm.exe
+.\bin\winwm.exe --preview
+.\bin\winwm.exe menu
+.\bin\winwm.exe reload
+.\bin\winwm.exe quit
+.\bin\winwm.exe --help
+```
 
 ## Config
 
-Edit `~/.config/winwm/winwm.lua`. Reload with `Win+Shift+R`. [Hyprland Lua API subset](https://wiki.hypr.land/configuring/)
-
-`programs.terminal = "auto"` uses the Windows default terminal host. Set an executable path to override it.
-
-The toolbar editor saves module placement in `toolbar-layout.lua`. It loads last.
-
-Hover the tray arrow for minimized windows and background apps. Scroll for more icons. Right-click for app actions. Preview keeps native tray icons in Explorer.
-
-Open the bell or **Menu → Notifications** for searchable session history. Set `duration_ms = 0` for sticky toasts or `fade_ms = 0` for instant transitions.
-
-**Capture options → Read Windows notifications** requests Windows access. Set `capture = "visible"` to log on-screen Windows banners or `"off"` for winwm notices only.
-
-Panel opacity ranges from 0 to 1. Acrylic requires Windows 11 22H2+ and Transparency effects. Framed tools use the Windows frame shadow.
+`~/.config/winwm/winwm.lua`
 
 ```lua
 local mod = "SUPER + "
 local dsp = hl.dsp
 hl.config({
-    general = { layout = "dwindle", gaps_in = 6, border_size = 2 },
-    decoration = { rounding = 8, panels = { opacity = 0.94, blur = true, shadow = true } },
+    general = { layout = "dwindle", gaps_in = 2, gaps_out = 2, border_size = 1 },
+    decoration = { rounding = 2, inactive_opacity = 0.95, panels = { opacity = 0.94, blur = true, shadow = true } },
     notifications = { capture = "windows", corner = "top_right", duration_ms = 5000, fade_ms = 160, history_limit = 128 },
     bar = {
         modules_left = { "menu", "workspaces" },

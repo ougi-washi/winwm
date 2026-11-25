@@ -157,17 +157,17 @@ bool w_config_bind(w_desktop_config *c, const char *chord, const char *action) {
 
 void w_config_defaults(w_desktop_config *c) {
     memset(c, 0, sizeof(*c));
-    c->gap = 6;
-    c->outer_gap = 6;
-    c->border_size = 2;
+    c->gap = 2;
+    c->outer_gap = 2;
+    c->border_size = 1;
     c->resize_on_border = true;
-    c->rounding = 8;
+    c->rounding = 2;
     c->panel_material = (w_panel_material){.opacity = 240, .blur = true, .shadow = true};
     c->animations = motion_system;
     const int ms[motion_count] = {160, 190, 180, 140, 140, 160, 120, 160, 140};
     for (int i = 0; i < motion_count; i++)
         c->motion[i] = (w_transition){ms[i], {.22, 1, .36, 1}, style_default, -1};
-    c->inactive_alpha = 250;
+    c->inactive_alpha = 242;
     c->inactive_border = 0x292b33;
     c->follow_mouse = true;
     c->bar_height = 32;

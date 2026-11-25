@@ -114,8 +114,10 @@ static void CALLBACK w_observe(HWINEVENTHOOK hook, DWORD event, HWND w, LONG obj
         event_overflow = true;
         return;
     }
-    if (event == EVENT_SYSTEM_FOREGROUND && w_os_same_process(w))
+    if (event == EVENT_SYSTEM_FOREGROUND && w_os_same_process(w)) {
+        w_desktop_schedule();
         return;
+    }
     WPARAM record = (WPARAM)event | ((WPARAM)time << 32);
     if (PostMessageW(desk.root, msg_window, record, (LPARAM)w))
         pending_events++;
@@ -258,7 +260,7 @@ void w_desktop_request(const char *s, char *reply, size_t cap) {
         HANDLE exit_code = GetPropW(host, L"winwm.child_exit");
         HANDLE key_error = GetPropW(host, L"winwm.recovery_hotkey_error");
         if (key_error && n >= 0 && (size_t)n + 100 < cap)
-            n += snprintf(reply + n, cap - n, "Ctrl+Alt+F12 unavailable (Win32 %lu). Use ctl run rescue.\n",
+            n += snprintf(reply + n, cap - n, "Ctrl+Alt+F12 unavailable (Win32 %lu). Use winwm.exe rescue.\n",
                           (DWORD)(uintptr_t)key_error);
         if (n >= 0 && (size_t)n + 200 < cap)
             n += snprintf(reply + n, cap - n, "sign-in shell: %s\n",

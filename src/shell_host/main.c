@@ -31,6 +31,19 @@ static bool w_restart(const wchar_t *exe) {
     return true;
 }
 
+static DWORD w_check_previous(const wchar_t *exe,const wchar_t *args) {
+    wchar_t command[os_path_cap+32];
+    swprintf(command,count_of(command),L"\"%ls\" %ls",exe,args);
+    STARTUPINFOW si = {.cb=sizeof(si)};
+    PROCESS_INFORMATION pi;
+    if (!CreateProcessW(exe,command,NULL,NULL,FALSE,CREATE_NO_WINDOW,NULL,NULL,&si,&pi)) return ERROR_GEN_FAILURE;
+    CloseHandle(pi.hThread);
+    DWORD code = ERROR_TIMEOUT;
+    if (WaitForSingleObject(pi.hProcess,15000) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess,&code);
+    CloseHandle(pi.hProcess);
+    return code;
+}
+
 static bool w_start_managed_previous(void) {
     wchar_t record[os_path_cap], releases[os_path_cap], exe[os_path_cap];
     if (!w_os_data_path(record, count_of(record), L"previous.txt", false) ||
@@ -49,15 +62,9 @@ static bool w_start_managed_previous(void) {
     const wchar_t *file_name = wcsrchr(exe, L'\\');
     if (!file_name || _wcsicmp(file_name + 1, L"winwm.exe")) return false;
     // Validate the release's recovery companion and configuration before switching.
-    wchar_t command[os_path_cap+32];
-    swprintf(command,count_of(command),L"\"%ls\" ctl validate-startup",exe);
-    STARTUPINFOW si = {.cb=sizeof(si)};
-    PROCESS_INFORMATION pi;
-    if (!CreateProcessW(exe,command,NULL,NULL,FALSE,CREATE_NO_WINDOW,NULL,NULL,&si,&pi)) return false;
-    CloseHandle(pi.hThread);
-    DWORD code = ERROR_TIMEOUT;
-    if (WaitForSingleObject(pi.hProcess,15000) == WAIT_OBJECT_0) GetExitCodeProcess(pi.hProcess,&code);
-    CloseHandle(pi.hProcess);
+    DWORD code = w_check_previous(exe,L"validate-startup");
+    // Releases predating direct commands return 2 for unknown CLI syntax.
+    if (code == 2) code = w_check_previous(exe,L"ctl validate-startup");
     return !code && w_restart(exe);
 }
 

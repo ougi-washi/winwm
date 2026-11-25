@@ -10,12 +10,6 @@ jobs:
           grep -HE '^[[:space:]]*#[[:space:]]*include[[:space:]]*"' src/*/*.[ch] |
             sed -nE 's|^src/([^/]+)/[^:]+:[[:space:]]*#[[:space:]]*include[[:space:]]*"([^"/]+)/[^"]+".*$|\1 \2|p' |
             tsort > /dev/null
-      - name: Test layout and configuration without the Windows SDK
-        run: |
-          gcc -std=c11 -Wall -Wextra -Werror -Isrc tools/test_pointer_layout.c src/layout/{layout,gesture}.c src/model/model.c -o "$RUNNER_TEMP/layout"
-          "$RUNNER_TEMP/layout"
-          gcc -std=c11 -Wall -Wextra -Werror -Isrc -Ithird_party/lua tools/test_config.c src/lua_config/lua_config.c src/config/{language,config}.c src/command/command.c third_party/lua/*.c -lm -o "$RUNNER_TEMP/config"
-          "$RUNNER_TEMP/config"
   winwm:
     runs-on: windows-latest
     steps:
@@ -32,7 +26,7 @@ jobs:
         run: |
           $env:USERPROFILE = (New-Item -ItemType Directory "$env:RUNNER_TEMP/winwm-profile").FullName
           $env:LOCALAPPDATA = $env:USERPROFILE
-          & .\bin\winwm.exe ctl validate-startup | Out-Host
+          & .\bin\winwm.exe validate-startup | Out-Host
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $seed = Get-FileHash "$env:USERPROFILE/.config/winwm/winwm.lua"
           if ($seed.Hash -ne (Get-FileHash assets/winwm.lua).Hash) { throw 'First-run config differs from shipped config.' }

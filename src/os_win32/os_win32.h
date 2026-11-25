@@ -26,6 +26,7 @@ DWORD w_os_exit_shell(void);
 bool w_os_explorer_tray_present(void);
 DWORD w_os_ensure_shell(void);
 bool w_os_provider(const char *name, wchar_t *out, int cap);
+wchar_t *w_os_quote_argument(wchar_t *out, const wchar_t *argument);
 wchar_t *w_os_path_directories(void);
 wchar_t *w_os_next_directory(wchar_t **cursor);
 void w_os_path_extensions(wchar_t *out, DWORD cap);

@@ -49,14 +49,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR line, int show
         result = w_tools_run(argv[1] + 7);
     else if (argc == 10 && !wcsncmp(argv[1], L"--tool-", 7) && !wcscmp(argv[2], L"--bar-popup"))
         result = w_run_bar_tool(argv);
-    else if (!wcscmp(argv[1], L"ctl")) {
+    else {
         if (AttachConsole(ATTACH_PARENT_PROCESS)) {
             if (_fileno(stdout) < 0)
                 freopen("CONOUT$", "w", stdout);
             if (_fileno(stderr) < 0)
                 freopen("CONOUT$", "w", stderr);
         }
-        result = w_ctl_run(argc - 1, argv + 1);
+        result = w_ctl_run(argc, argv);
     }
     LocalFree(argv);
     return result;

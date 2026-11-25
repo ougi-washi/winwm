@@ -252,7 +252,7 @@ void w_desktop_notifications_receive(LPARAM payload) {
 static void w_show_notice(const wchar_t *title, const char *body, bool publish) {
     wchar_t message[1024];
     w_str_copy(desk.status,sizeof(desk.status),body);
-    if (!w_os_wide(body,message,count_of(message))) wcscpy(message,L"See winwm.exe ctl doctor for details.");
+    if (!w_os_wide(body,message,count_of(message))) wcscpy(message,L"See winwm.exe doctor for details.");
     if (publish && desk.config.notifications.enabled && w_queue_notice(title,message)) return;
     w_local_notice(title,message,true,NULL);
 }

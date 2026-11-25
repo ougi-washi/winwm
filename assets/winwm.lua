@@ -6,7 +6,7 @@ local repeat_key = { repeating = true }
 
 hl.config({
     general = {
-        layout = "dwindle", gaps_in = 6, gaps_out = 6, border_size = 2,
+        layout = "dwindle", gaps_in = 2, gaps_out = 2, border_size = 1,
         resize_on_border = true,
         col = {
             active_border = { colors = { "rgb(91aaf7)", "rgb(76daca)" }, angle = 45 },
@@ -14,7 +14,7 @@ hl.config({
         },
     },
     decoration = {
-        rounding = 8, inactive_opacity = 0.98,
+        rounding = 2, inactive_opacity = 0.95,
         panels = { opacity = 0.94, blur = true, shadow = true },
     },
     animations = { enabled = "auto" },

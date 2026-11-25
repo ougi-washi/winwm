@@ -137,7 +137,7 @@ static DWORD WINAPI w_save_toolbar(void *unused) {
     } else wcscpy(feedback,L"Another toolbar editor is saving. Try again.");
     if (mutex) CloseHandle(mutex);
     if (saved) {
-        wchar_t exe[os_path_cap], line[]=L"winwm.exe ctl reload-bar";
+        wchar_t exe[os_path_cap], line[]=L"winwm.exe reload-bar";
         STARTUPINFOW startup={.cb=sizeof(startup)};
         PROCESS_INFORMATION child={0};
         bool accepted=false;
