@@ -179,6 +179,13 @@ void w_desktop_navigate(enum direction dir, bool move) {
     int slot = m->focus;
     w_model_window *w = slot >= 0 && w_model_visible(m, slot) ? &m->windows[slot] : NULL;
     int from = w ? w->output : m->output;
+    if (!w && !move) {
+        int recent = w_model_recent(m, from, m->selected[from]);
+        if (recent >= 0) {
+            w_desktop_select(recent);
+            return;
+        }
+    }
     w_rect screens[output_limit] = {0};
     for (int i = 0; i < output_limit; i++)
         if (desk.outputs[i].live)
@@ -205,6 +212,8 @@ void w_desktop_navigate(enum direction dir, bool move) {
     }
     int target = w_layout_adjacent_output(screens, from, origin, dir);
     if (target < 0) {
+        if (!move && w && w_os_app_window(GetForegroundWindow()) != desk.windows[slot].hwnd)
+            w_desktop_select(slot);
         if (move && w->floating && !w->fullscreen) {
             w_rect r = origin, area = desk.outputs[from].work;
             int step = MulDiv(32, desk.outputs[from].dpi, 96);

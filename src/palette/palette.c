@@ -1,7 +1,10 @@
 #include "theme/theme.h"
 #include "theme/icon_button.h"
 #include "palette/palette.h"
+#include "bar/bar.h"
 #include <commctrl.h>
+#include <dwmapi.h>
+#include <imm.h>
 #include <windowsx.h>
 #include <usp10.h>
 #include <shellscalingapi.h>
@@ -47,6 +50,9 @@ static struct {
     HICON handle;
 } icon_cache[64];
 static UINT palette_dpi;
+static w_palette_site placement;
+static w_layer_fade fade;
+static bool closing;
 static int pressed_result = no_result;
 static bool grouped, manual_selection, filtering, composing;
 static palette_callback select_entry;
@@ -59,6 +65,11 @@ static const wchar_t *search_hint;
 static const wchar_t *launch_status;
 
 static int px(int units) { return MulDiv(units, palette_dpi, 96); }
+
+static RECT w_button_bounds(const w_popup_anchor *anchor, UINT dpi) {
+    return w_popup_bounds(anchor, w_popup_area(anchor->bar), MulDiv(432,dpi,96),
+                          MulDiv(grouped ? 512 : 404,dpi,96), MulDiv(6,dpi,96));
+}
 
 static void w_navigation_hint(void) {
     RECT area;
@@ -466,7 +477,11 @@ static void w_draw_result(NMLVCUSTOMDRAW *draw) {
 }
 
 bool w_palette_shown(void) {
-    return panel && IsWindowVisible(panel);
+    return panel && !closing && IsWindowVisible(panel);
+}
+
+const w_popup_anchor *w_palette_anchor(void) {
+    return placement.anchor.bar ? &placement.anchor : NULL;
 }
 
 void w_palette_focus(void) {
@@ -479,15 +494,39 @@ void w_palette_focus(void) {
 }
 
 static void w_dismiss(bool restore_focus) {
+    if (closing) return;
     pending_ticket = 0;
     pending_restore = restore_focus && GetForegroundWindow() == panel ? return_to : NULL;
     return_to = NULL;
     HWND capture = GetCapture();
     if (capture == panel || IsChild(panel, capture))
         ReleaseCapture();
+    if (placement.anchor.bar && placement.leave.ms && GetForegroundWindow() != panel && IsWindowVisible(panel)) {
+        closing = true;
+        SetWindowLongPtrW(panel, GWL_EXSTYLE, GetWindowLongPtrW(panel,GWL_EXSTYLE) | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+        if (w_bar_fade(panel, &fade, 0, placement.leave, true)) return;
+    }
+    KillTimer(panel, bar_fade_timer);
     ShowWindow(panel, SW_HIDE);
     if (pending_restore)
         PostMessageW(panel, restore_foreground, 0, 0);
+}
+
+static bool w_palette_contains(HWND hit) {
+    if (!hit) return false;
+    HWND root = GetAncestor(hit, GA_ROOT);
+    if (root == panel || GetAncestor(hit, GA_ROOTOWNER) == panel) return true;
+    // Some input methods show a separate, non-activating candidate window.
+    return composing && (root == ImmGetDefaultIMEWnd(edit) || (GetClassLongPtrW(root,GCL_STYLE) & CS_IME));
+}
+
+void w_palette_outside(HWND hit) {
+    if (!placement.anchor.bar || !w_palette_shown() || w_palette_contains(hit)) return;
+    HWND root = GetAncestor(hit, GA_ROOT);
+    wchar_t name[32];
+    if (root && w_os_same_process(root) && GetClassNameW(root, name, count_of(name)) && !wcscmp(name,L"WinwmBar"))
+        return;
+    w_dismiss(false);
 }
 
 bool w_palette_close(void) {
@@ -642,6 +681,10 @@ static LRESULT CALLBACK w_palette_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         HDC dc = msg == WM_PAINT ? BeginPaint(w, &ps) : (HDC)wp;
         RECT area;
         GetClientRect(w, &area);
+        if (placement.anchor.bar) {
+            HBRUSH stroke = CreateSolidBrush(w_theme_separator());
+            if (stroke) { FrameRect(dc, &area, stroke); DeleteObject(stroke); }
+        }
         RECT field = {px(16),px(50),area.right-px(16),px(89)};
         int saved = SaveDC(dc);
         w_round_rect(dc, field, w_theme_background(), w_theme_separator(), px(10));
@@ -656,7 +699,7 @@ static LRESULT CALLBACK w_palette_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         LRESULT hit = DefWindowProcW(w,msg,wp,lp);
         POINT p = {GET_X_LPARAM(lp),GET_Y_LPARAM(lp)};
         ScreenToClient(w,&p);
-        if (hit == HTCLIENT && p.y < px(48)) {
+        if (!placement.anchor.bar && hit == HTCLIENT && p.y < px(48)) {
             HWND child = ChildWindowFromPointEx(w,p,CWP_SKIPINVISIBLE|CWP_SKIPDISABLED);
             if (child != back && child != close_button) return HTCAPTION;
         }
@@ -685,8 +728,8 @@ static LRESULT CALLBACK w_palette_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     }
     if (msg == WM_SIZE) { w_palette_size(); return 0; }
     if (msg == WM_DPICHANGED) {
-        RECT *r = (RECT *)lp;
-        SetWindowPos(w, NULL, r->left,r->top,r->right-r->left,r->bottom-r->top,SWP_NOACTIVATE|SWP_NOZORDER);
+        RECT r = placement.anchor.bar ? w_button_bounds(&placement.anchor, HIWORD(wp)) : *(RECT *)lp;
+        SetWindowPos(w, NULL, r.left,r.top,r.right-r.left,r.bottom-r.top,SWP_NOACTIVATE|SWP_NOZORDER);
         w_palette_size();
         return 0;
     }
@@ -697,9 +740,18 @@ static LRESULT CALLBACK w_palette_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     if (msg == WM_CLOSE) { w_dismiss(true); return 0; }
+    if (msg == WM_TIMER && wp == bar_fade_timer) {
+        if (!w_bar_fade_tick(w, &fade, true) && closing) ShowWindow(w, SW_HIDE);
+        return 0;
+    }
+    if ((msg == WM_DISPLAYCHANGE || (msg == WM_SETTINGCHANGE && wp == SPI_SETWORKAREA)) &&
+        placement.anchor.bar && w_palette_shown()) {
+        w_dismiss(false);
+        return 0;
+    }
     if (msg == WM_ACTIVATE && LOWORD(wp) == WA_INACTIVE) PostMessageW(w,check_deactivation,0,0);
     if (msg == check_deactivation) {
-        if (IsWindowVisible(w) && GetForegroundWindow() != w) w_dismiss(false);
+        if (w_palette_shown() && !w_palette_contains(GetForegroundWindow())) w_dismiss(false);
         return 0;
     }
     return DefWindowProcW(w,msg,wp,lp);
@@ -774,7 +826,7 @@ static bool w_cache(const w_palette_entry *entries, int count) {
     return true;
 }
 
-void w_palette_open(HMONITOR monitor, const wchar_t *title, const w_palette_entry *entries, int count,
+void w_palette_open(const w_palette_site *site, const wchar_t *title, const w_palette_entry *entries, int count,
                     palette_callback cb, HANDLE app_images, palette_line_callback line_callback) {
     pending_restore = NULL;
     bool preserve = w_palette_visible(title);
@@ -812,6 +864,11 @@ void w_palette_open(HMONITOR monitor, const wchar_t *title, const w_palette_entr
     ListView_SetBkColor(list,w_theme_background());
     ListView_SetTextBkColor(list,w_theme_background());
     SetWindowTextW(panel,title);
+    if (preserve && (site->monitor != placement.monitor || site->anchor.bar != placement.anchor.bar ||
+        !EqualRect(&site->anchor.button, &placement.anchor.button) || strcmp(site->anchor.edge, placement.anchor.edge))) {
+        w_palette_position(site);
+        w_palette_focus();
+    }
     if (preserve && (!group || in_group[group])) {
         w_filter();
         if (selected != no_result) {
@@ -832,29 +889,54 @@ void w_palette_open(HMONITOR monitor, const wchar_t *title, const w_palette_entr
     w_route(palette_flat);
     if (preserve) return;
     if (!w_palette_shown()) return_to = GetForegroundWindow();
-    w_palette_position(monitor);
+    w_palette_position(site);
     w_palette_focus();
 }
 
-void w_palette_position(HMONITOR monitor) {
+void w_palette_position(const w_palette_site *site) {
     MONITORINFO mi = {.cbSize = sizeof(mi)};
+    HMONITOR monitor = site->monitor;
     if (!monitor || !GetMonitorInfoW(monitor,&mi)) {
         monitor = MonitorFromWindow(GetForegroundWindow(),MONITOR_DEFAULTTOPRIMARY);
         GetMonitorInfoW(monitor,&mi);
     }
     UINT dpi=96, vertical=96;
     GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpi, &vertical);
-    int width = MulDiv(520,dpi,96), height = MulDiv(grouped ? 512 : 404,dpi,96);
-    RECT current;
-    UINT old_dpi = GetDpiForWindow(panel);
-    if (w_palette_shown() && old_dpi && GetWindowRect(panel,&current)) {
-        width = MulDiv(current.right-current.left,dpi,old_dpi);
-        height = MulDiv(current.bottom-current.top,dpi,old_dpi);
+    bool attached = site->anchor.bar != NULL;
+    RECT bounds;
+    if (attached) {
+        bounds = w_button_bounds(&site->anchor, dpi);
+    } else {
+        int width = MulDiv(520,dpi,96), height = MulDiv(grouped ? 512 : 404,dpi,96);
+        UINT old_dpi = GetDpiForWindow(panel);
+        RECT current;
+        if (!placement.anchor.bar && w_palette_shown() && old_dpi && GetWindowRect(panel,&current)) {
+            width = MulDiv(current.right-current.left,dpi,old_dpi);
+            height = MulDiv(current.bottom-current.top,dpi,old_dpi);
+        }
+        width = min(mi.rcWork.right-mi.rcWork.left,width);
+        height = min(mi.rcWork.bottom-mi.rcWork.top,height);
+        bounds.left = mi.rcWork.left + (mi.rcWork.right-mi.rcWork.left-width)/2;
+        bounds.top = mi.rcWork.top + (mi.rcWork.bottom-mi.rcWork.top-height)/2;
+        bounds.right = bounds.left + width;
+        bounds.bottom = bounds.top + height;
     }
-    width = min(mi.rcWork.right-mi.rcWork.left,width);
-    height = min(mi.rcWork.bottom-mi.rcWork.top,height);
-    SetWindowPos(panel,HWND_TOPMOST,(mi.rcWork.left+mi.rcWork.right-width)/2,
-                 (mi.rcWork.top+mi.rcWork.bottom-height)/2,width,height,SWP_SHOWWINDOW|SWP_NOACTIVATE);
+    bool opening = !w_palette_shown();
+    closing = false;
+    placement = *site;
+    LONG_PTR style = GetWindowLongPtrW(panel,GWL_STYLE);
+    LONG_PTR ex = GetWindowLongPtrW(panel,GWL_EXSTYLE) & ~(LONG_PTR)(WS_EX_TRANSPARENT|WS_EX_NOACTIVATE);
+    SetWindowLongPtrW(panel, GWL_STYLE, attached ? style & ~(LONG_PTR)WS_THICKFRAME : style | WS_THICKFRAME);
+    SetWindowLongPtrW(panel, GWL_EXSTYLE, attached ? ex | WS_EX_LAYERED : ex & ~(LONG_PTR)WS_EX_LAYERED);
+    KillTimer(panel, bar_fade_timer);
+    if (attached) {
+        DWORD corner = DWMWCP_ROUND;
+        DwmSetWindowAttribute(panel, DWMWA_WINDOW_CORNER_PREFERENCE, &corner, sizeof(corner));
+        fade.value = opening ? 0 : 255;
+        w_bar_fade(panel, &fade, 255, site->enter, opening && site->enter.ms > 0);
+    }
+    SetWindowPos(panel,HWND_TOPMOST,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,
+                 SWP_SHOWWINDOW|SWP_NOACTIVATE|SWP_FRAMECHANGED);
 }
 
 bool w_palette_visible(const wchar_t *title) {

@@ -511,10 +511,11 @@ int w_activity_run(void) {
     }
     w_actions();
     w_layout(true);
-    ShowWindow(panel,SW_SHOW);
-    SetFocus(search);
-    SetTimer(panel,1,2000,NULL);
-    w_request_sample();
+    if (w_tool_show(panel)) {
+        SetFocus(search);
+        SetTimer(panel,1,2000,NULL);
+        w_request_sample();
+    }
     MSG msg;
     while (GetMessageW(&msg,NULL,0,0) > 0) {
         if (msg.message == WM_KEYDOWN) {

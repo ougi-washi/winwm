@@ -1,5 +1,6 @@
 #pragma once
 #include "bar/icons.h"
+#include "win_platform/popup.h"
 
 ////////////////
 //~ Bar
@@ -10,9 +11,9 @@ typedef struct w_bar_view {
     wchar_t title[256];
 } w_bar_view;
 
-typedef void (*bar_action)(int output, const char *action);
+typedef void (*bar_action)(int output, const char *action, const w_popup_anchor *anchor);
 typedef bool (*bar_custom)(const char *name, wchar_t *text, int cap, char *action, size_t action_cap);
-enum { bar_fade_timer = 1, bar_modules_timer, bar_tip_show_timer, bar_tip_hide_timer };
+enum { bar_fade_timer = 0x574d, bar_modules_timer, bar_tip_show_timer, bar_tip_hide_timer };
 typedef struct w_layer_fade {
     uint64_t start;
     BYTE from, value, target;
@@ -83,7 +84,10 @@ void w_bar_invalidate(w_bar_window *b, const char *module);
 void w_bar_set_audio(w_bar_window *b, int percent, bool muted);
 void w_bar_update(w_bar_window *b, const w_bar_view *v);
 bool w_bar_activate_hit(w_bar_window *bar, int hit);
+bool w_bar_anchor(const w_bar_window *bar, int hit, w_popup_anchor *anchor);
+void w_bar_invoke(w_bar_window *bar, int hit, const char *action);
 
 bool w_bar_menu_active(void);
 bool w_bar_menu_close(const w_bar_window *bar, bool restore);
+void w_bar_menu_outside(HWND hit);
 void w_bar_menu_audio_error(void);

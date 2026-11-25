@@ -5,10 +5,10 @@
 #include <stdio.h>
 #include <uxtheme.h>
 
-static HWND calendar, zone, clock_text, today, save_zone;
+static HWND calendar, zone, clock_text, date_text, zone_label, today, save_zone;
 static DYNAMIC_TIME_ZONE_INFORMATION *zones;
 static DWORD zone_count;
-static HFONT font;
+static HFONT font, time_font;
 
 static void w_calendar_colors(void) {
     HIGHCONTRASTW hc = {.cbSize=sizeof(hc)};
@@ -19,39 +19,47 @@ static void w_calendar_colors(void) {
     SendMessageW(calendar,MCM_SETCOLOR,MCSC_TEXT,contrast ? GetSysColor(COLOR_WINDOWTEXT) : w_theme_foreground());
     SendMessageW(calendar,MCM_SETCOLOR,MCSC_TRAILINGTEXT,contrast ? GetSysColor(COLOR_GRAYTEXT) : w_theme_hint());
     // The classic calendar also uses the title background ink for weekday and week-number labels.
-    SendMessageW(calendar,MCM_SETCOLOR,MCSC_TITLEBK,contrast ? GetSysColor(COLOR_HIGHLIGHT) : w_theme_foreground());
+    SendMessageW(calendar,MCM_SETCOLOR,MCSC_TITLEBK,contrast ? GetSysColor(COLOR_HIGHLIGHT) : w_theme_accent());
     SendMessageW(calendar,MCM_SETCOLOR,MCSC_TITLETEXT,contrast ? GetSysColor(COLOR_HIGHLIGHTTEXT) : paper);
 }
 
 static void w_clock_tick(void) {
     SYSTEMTIME now;
-    wchar_t time[80], date[128], text[224];
+    wchar_t time[80], date[128];
     GetLocalTime(&now);
-    if (GetTimeFormatEx(NULL, 0, &now, NULL, time, count_of(time)) &&
-        GetDateFormatEx(NULL, DATE_LONGDATE, &now, NULL, date, count_of(date), NULL)) {
-        swprintf(text, count_of(text), L"%ls     %ls", time, date);
-        SetWindowTextW(clock_text, text);
-    }
+    if (GetTimeFormatEx(NULL, 0, &now, NULL, time, count_of(time)))
+        SetWindowTextW(clock_text, time);
+    if (GetDateFormatEx(NULL, DATE_LONGDATE, &now, NULL, date, count_of(date), NULL))
+        SetWindowTextW(date_text, date);
 }
 
 static void w_clock_layout(HWND window) {
     UINT dpi = GetDpiForWindow(window);
     HFONT next = CreateFontW(-MulDiv(15, dpi, 96), 0,0,0, FW_NORMAL, FALSE,FALSE,FALSE,
                              DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
-    HWND controls[] = {calendar, zone, clock_text, today, save_zone};
+    HWND controls[] = {calendar, zone, date_text, zone_label, today, save_zone};
     for (size_t i = 0; i < count_of(controls); ++i)
         SendMessageW(controls[i], WM_SETFONT, (WPARAM)next, TRUE);
     DeleteObject(font);
     font = next;
+    next = CreateFontW(-MulDiv(26, dpi, 96), 0,0,0, FW_SEMIBOLD, FALSE,FALSE,FALSE,
+                       DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,0,L"Segoe UI");
+    SendMessageW(clock_text, WM_SETFONT, (WPARAM)next, TRUE);
+    DeleteObject(time_font);
+    time_font = next;
     RECT cal = {0}, client;
     SendMessageW(calendar, MCM_GETMINREQRECT, 0, (LPARAM)&cal);
     GetClientRect(window, &client);
     int gap = MulDiv(12, dpi, 96), button = MulDiv(34, dpi, 96);
-    int width = client.right - 2*gap, y = 2*gap + button;
+    int width = max(1, client.right - 2*gap), line = MulDiv(22, dpi, 96);
+    int y = 2*gap + button + line;
     MoveWindow(clock_text, gap, gap, width-button-gap, button, TRUE);
     MoveWindow(today, gap+width-button, gap, button, button, TRUE);
+    MoveWindow(date_text, gap, gap+button, width, line, TRUE);
     MoveWindow(calendar, (client.right-cal.right)/2, y, cal.right, cal.bottom, TRUE);
     y += cal.bottom + gap;
+    MoveWindow(zone_label, gap, y, width, line, TRUE);
+    y += line;
     MoveWindow(zone, gap, y, width-button-gap, 8*button, TRUE);
     MoveWindow(save_zone, gap+width-button, y, button, button, TRUE);
     RECT desired = {0, 0, client.right, y+button+gap};
@@ -62,14 +70,17 @@ static void w_clock_layout(HWND window) {
 }
 
 static void w_zone_choices(void) {
+    if (zone_count) return;
     DYNAMIC_TIME_ZONE_INFORMATION current = {0};
     GetDynamicTimeZoneInformation(&current);
+    SendMessageW(zone, WM_SETREDRAW, FALSE, 0);
     for (DWORD i = 0; ; ++i) {
         DYNAMIC_TIME_ZONE_INFORMATION entry;
         if (EnumDynamicTimeZoneInformation(i, &entry) != ERROR_SUCCESS) break;
         DYNAMIC_TIME_ZONE_INFORMATION *next = realloc(zones, (zone_count + 1) * sizeof(*zones));
         if (!next) break;
         zones = next;
+        if (!zone_count) SendMessageW(zone, CB_RESETCONTENT, 0, 0);
         LRESULT row = SendMessageW(zone, CB_ADDSTRING, 0, (LPARAM)entry.StandardName);
         if (row < 0) continue;
         zones[zone_count] = entry;
@@ -77,6 +88,8 @@ static void w_zone_choices(void) {
         if (!wcscmp(current.TimeZoneKeyName, entry.TimeZoneKeyName))
             SendMessageW(zone, CB_SETCURSEL, row, 0);
     }
+    SendMessageW(zone, WM_SETREDRAW, TRUE, 0);
+    InvalidateRect(zone, NULL, TRUE);
     EnableWindow(save_zone, FALSE);
 }
 
@@ -108,6 +121,11 @@ static LRESULT CALLBACK w_clock_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     }
     if (msg == WM_COMMAND && (HWND)lp == zone && HIWORD(wp) == CBN_SELCHANGE) {
         EnableWindow(save_zone, TRUE);
+        return 0;
+    }
+    if (msg == WM_COMMAND && zone && (HWND)lp == zone &&
+        (HIWORD(wp) == CBN_SETFOCUS || HIWORD(wp) == CBN_DROPDOWN)) {
+        w_zone_choices();
         return 0;
     }
     if (msg == WM_COMMAND && LOWORD(wp) == IDCANCEL && !lp) {
@@ -147,28 +165,34 @@ int w_clock_run(void) {
     RegisterClassW(&wc);
     MONITORINFO mon = {.cbSize = sizeof(mon)};
     UINT dpi = w_tool_work_area(&mon);
-    int width = MulDiv(408, dpi, 96);
+    int width = MulDiv(340, dpi, 96);
     HWND w = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"Date and time", WS_CAPTION|WS_SYSMENU,
                             (mon.rcWork.left+mon.rcWork.right-width)/2, (mon.rcWork.top+mon.rcWork.bottom-width)/2,
                             width, width, NULL, NULL, inst, NULL);
     if (!w) return 1;
     DWORD child = WS_CHILD|WS_VISIBLE|WS_TABSTOP;
     clock_text = CreateWindowW(L"STATIC", L"", WS_CHILD|WS_VISIBLE|SS_CENTERIMAGE|SS_ENDELLIPSIS, 0,0,0,0,w,NULL,inst,NULL);
+    date_text = CreateWindowW(L"STATIC", L"", WS_CHILD|WS_VISIBLE|SS_CENTERIMAGE|SS_ENDELLIPSIS, 0,0,0,0,w,NULL,inst,NULL);
+    zone_label = CreateWindowW(L"STATIC", L"Time zone", WS_CHILD|WS_VISIBLE|SS_CENTERIMAGE, 0,0,0,0,w,NULL,inst,NULL);
     calendar = CreateWindowW(MONTHCAL_CLASSW, L"Calendar", child|MCS_WEEKNUMBERS|MCS_NOTODAY, 0,0,0,0,w,NULL,inst,NULL);
     zone = CreateWindowW(L"COMBOBOX", L"", child|CBS_DROPDOWNLIST|CBS_SORT|WS_VSCROLL, 0,0,0,0,w,NULL,inst,NULL);
     today = CreateWindowW(L"BUTTON", L"Today", child|BS_OWNERDRAW, 0,0,0,0,w,NULL,inst,NULL);
     save_zone = CreateWindowW(L"BUTTON", L"Apply time zone", child|BS_OWNERDRAW, 0,0,0,0,w,NULL,inst,NULL);
-    if (!calendar || !zone || !clock_text || !today || !save_zone) { DestroyWindow(w); return 1; }
+    if (!calendar || !zone || !clock_text || !date_text || !zone_label || !today || !save_zone) { DestroyWindow(w); return 1; }
     SetWindowTheme(calendar,L"",L"");
     w_calendar_colors();
     w_icon_button(today,L"\uE8BF",L"Go to today");
     w_icon_button(save_zone,L"\uE8FB",L"Apply selected time zone");
-    w_zone_choices();
+    DYNAMIC_TIME_ZONE_INFORMATION current = {0};
+    if (GetDynamicTimeZoneInformation(&current) != TIME_ZONE_ID_INVALID) {
+        SendMessageW(zone, CB_ADDSTRING, 0, (LPARAM)current.StandardName);
+        SendMessageW(zone, CB_SETCURSEL, 0, 0);
+    }
+    EnableWindow(save_zone, FALSE);
     w_clock_tick();
     w_clock_layout(w);
     SetTimer(w, 1, 1000, NULL);
-    ShowWindow(w, SW_SHOW);
-    SetFocus(calendar);
+    if (w_tool_show(w)) SetFocus(calendar);
     MSG m;
     while (GetMessageW(&m,NULL,0,0) > 0) {
         if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE &&
@@ -176,6 +200,7 @@ int w_clock_run(void) {
         else if (!IsDialogMessageW(w,&m)) { TranslateMessage(&m); DispatchMessageW(&m); }
     }
     DeleteObject(font);
+    DeleteObject(time_font);
     free(zones);
     return 0;
 }

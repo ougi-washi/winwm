@@ -587,9 +587,10 @@ int w_packages_run(const wchar_t *mode) {
     SendMessageW(pages,CB_ADDSTRING,0,(LPARAM)L"Chocolatey");
     HRESULT apartment = CoInitializeEx(NULL,COINIT_APARTMENTTHREADED|COINIT_DISABLE_OLE1DDE);
     w_layout(true);
-    ShowWindow(window,SW_SHOW);
-    w_page(!wcscmp(mode,L"chocolatey") ? page_choco : !wcscmp(mode,L"updates") ? page_updates : page_winget);
-    if (!_wcsicmp(mode,L"google_japanese_input")) { SetWindowTextW(query,L"Google.JapaneseIME"); w_search(); }
+    if (w_tool_show(window)) {
+        w_page(!wcscmp(mode,L"chocolatey") ? page_choco : !wcscmp(mode,L"updates") ? page_updates : page_winget);
+        if (!_wcsicmp(mode,L"google_japanese_input")) { SetWindowTextW(query,L"Google.JapaneseIME"); w_search(); }
+    }
     MSG m;
     while (GetMessageW(&m,NULL,0,0) > 0) {
         if (m.message == WM_KEYDOWN && m.wParam == VK_ESCAPE && !SendMessageW(pages,CB_GETDROPPEDSTATE,0,0)) {

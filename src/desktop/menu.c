@@ -130,7 +130,12 @@ static void w_pick(int n, bool admin) {
             w_desktop_notice("The selected window is no longer available to close.");
     } else if (actions[n].kind) {
         dispatching_row = true;
-        w_desktop_run_on(&actions[n], row_output[n] >= 0 ? row_output[n] : palette_output, admin);
+        int output = row_output[n] >= 0 ? row_output[n] : palette_output;
+        const w_popup_anchor *anchor = w_palette_anchor();
+        if (anchor && !admin && output == palette_output)
+            w_desktop_run_anchored(&actions[n], output, false, anchor);
+        else
+            w_desktop_run_on(&actions[n], output, admin);
         dispatching_row = false;
     }
 }
@@ -343,22 +348,15 @@ void w_desktop_clear_clips(void) {
     desk.clip_count = 0;
 }
 
-void w_desktop_catalog_update(void) {
-    if (!w_palette_visible(L"Menu")) return;
-    int output = palette_output;
-    if (!desk.outputs[output].live) output = desk.model.output;
-    w_desktop_palette(cmd_menu, output);
-}
-
-void w_desktop_focus_menu(int output) {
-    if ((unsigned)output < output_limit && desk.outputs[output].live && output != palette_output) {
-        palette_output = output;
-        w_palette_position(desk.outputs[output].monitor);
+static void w_open_palette(enum command_kind kind, int output, const w_popup_anchor *anchor) {
+    w_palette_site site = {.monitor = desk.outputs[output].monitor};
+    if (anchor) {
+        site.anchor = *anchor;
+        if (desk.motion_allowed) {
+            site.enter = desk.config.motion[motion_layers_in];
+            site.leave = desk.config.motion[motion_layers_out];
+        }
     }
-    w_palette_focus();
-}
-
-void w_desktop_palette(enum command_kind kind, int output) {
     // A submenu opens after its parent hides. Keep the original application for its actions.
     if (!w_palette_shown() && !dispatching_row) {
         menu_target = GetForegroundWindow();
@@ -367,8 +365,6 @@ void w_desktop_palette(enum command_kind kind, int output) {
         int slot = w_desktop_find(w_os_app_window(menu_target));
         menu_owner = (w_window_id){slot,slot >= 0 ? desk.model.windows[slot].generation : 0};
     }
-    if (w_palette_visible(L"Menu") && kind == cmd_menu && palette_output != output)
-        w_palette_position(desk.outputs[output].monitor);
     group = palette_flat;
     current_palette = kind;
     palette_output = output;
@@ -449,7 +445,7 @@ void w_desktop_palette(enum command_kind kind, int output) {
             }
             w_catalog_release(snapshot);
             snapshot = next;
-            w_palette_open(desk.outputs[output].monitor,title,all ? all : entries,total,w_pick,
+            w_palette_open(&site,title,all ? all : entries,total,w_pick,
                            w_catalog_images(snapshot),w_desktop_run_line);
             free(all);
             return;
@@ -457,5 +453,41 @@ void w_desktop_palette(enum command_kind kind, int output) {
     }
     w_catalog_release(snapshot);
     snapshot = NULL;
-    w_palette_open(desk.outputs[output].monitor,title,entries,row_count,w_pick,NULL,NULL);
+    w_palette_open(&site,title,entries,row_count,w_pick,NULL,NULL);
+}
+
+void w_desktop_palette(enum command_kind kind, int output) {
+    w_open_palette(kind, output, NULL);
+}
+
+void w_desktop_bar_palette(enum command_kind kind, int output, const w_popup_anchor *anchor) {
+    const w_popup_anchor *open = w_palette_anchor();
+    if (w_palette_shown() && open && current_palette == kind && open->bar == anchor->bar &&
+        open->source == anchor->source) {
+        w_palette_close();
+        return;
+    }
+    w_open_palette(kind, output, anchor);
+}
+
+void w_desktop_catalog_update(void) {
+    if (!w_palette_visible(L"Menu")) return;
+    const w_popup_anchor *anchor = w_palette_anchor();
+    int output = palette_output;
+    if (anchor && (!IsWindowVisible(anchor->bar) || anchor->bar != desk.outputs[output].bar.hwnd)) {
+        w_palette_close();
+        return;
+    }
+    if (!desk.outputs[output].live) output = desk.model.output;
+    w_open_palette(cmd_menu, output, anchor);
+}
+
+void w_desktop_focus_menu(int output) {
+    if ((unsigned)output >= output_limit || !desk.outputs[output].live) output = palette_output;
+    if (output != palette_output || w_palette_anchor()) {
+        palette_output = output;
+        w_palette_site site = {.monitor = desk.outputs[output].monitor};
+        w_palette_position(&site);
+    }
+    w_palette_focus();
 }

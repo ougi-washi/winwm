@@ -13,6 +13,11 @@ int w_activity_run(void);
 int w_project_run(const w_desktop_config *config);
 int w_toolbar_run(void);
 UINT w_tool_work_area(MONITORINFO *monitor);
+bool w_tool_show(HWND window);
+bool w_tool_native_dialog(void);
+HMONITOR w_tool_popup_monitor(void);
+void w_tool_popup_preferences(const w_desktop_config *cfg);
+void w_tool_popup_cleanup(void);
 typedef enum w_input_page { input_languages, input_keyboards, input_methods } w_input_page;
 int w_language_setup(w_input_page page);
 

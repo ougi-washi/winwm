@@ -520,6 +520,11 @@ bool w_os_hidden_confirmed(HWND window) {
     return (uintptr_t)GetPropW(window, visibility_prop) == hidden_confirmed;
 }
 
+bool w_os_ready_for_focus(HWND window) {
+    uintptr_t state = (uintptr_t)GetPropW(window, visibility_prop);
+    return (!state || state == show_pending) && IsWindowVisible(window) && !IsIconic(window);
+}
+
 ////////////////
 //~ Visibility and appearance
 

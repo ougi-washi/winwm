@@ -190,6 +190,24 @@ void w_desktop_action(int output, const char *s) {
         w_desktop_run_on(&c, output, false);
 }
 
+void w_desktop_bar_action(int output, const char *action, const w_popup_anchor *anchor) {
+    w_command command;
+    if (action && w_command_parse(action, &command)) {
+        switch (command.kind) {
+        case cmd_menu: case cmd_switcher: case cmd_shortcuts: case cmd_settings:
+        case cmd_clipboard: case cmd_notifications:
+            break; // The palette handles same-button toggling and submenu transitions.
+        default:
+            w_palette_outside(NULL);
+            break;
+        }
+        w_desktop_run_anchored(&command, output, false, anchor);
+    } else {
+        w_desktop_popup_cancel();
+        w_palette_outside(NULL);
+    }
+}
+
 static bool w_open_files(const w_command *c, bool admin) {
     char utf8[4096];
     wchar_t path[os_path_cap];
@@ -269,6 +287,10 @@ bool w_desktop_run(const w_command *c) {
 }
 
 bool w_desktop_run_on(const w_command *c, int output, bool admin) {
+    return w_desktop_run_anchored(c, output, admin, NULL);
+}
+
+bool w_desktop_run_anchored(const w_command *c, int output, bool admin, const w_popup_anchor *anchor) {
     if (admin && !w_desktop_can_run_admin(c->kind))
         return false;
     w_desktop_model *m = &desk.model;
@@ -296,7 +318,16 @@ bool w_desktop_run_on(const w_command *c, int output, bool admin) {
         if (destination < 0 || destination >= workspace_limit)
             return false;
     }
-    if (w_panel_command(c->kind)) {
+    bool popup = anchor && !admin && w_panel_command(c->kind) &&
+                 c->kind != cmd_capture_region && c->kind != cmd_record && c->kind != cmd_pick_color;
+    if (!popup && (anchor || c->kind == cmd_workspace_select || c->kind == cmd_workspace_back ||
+                   c->kind == cmd_output_next || c->kind == cmd_menu))
+        w_desktop_popup_cancel();
+    if (popup) {
+        w_palette_close();
+        w_desktop_focus_cancel();
+        ok = w_desktop_popup_toggle(anchor, c->kind);
+    } else if (w_panel_command(c->kind)) {
         char mode[64];
         snprintf(mode, sizeof(mode), "--tool-%s", w_command_name(c->kind));
         w_rect work = desk.outputs[output].work;
@@ -351,7 +382,9 @@ bool w_desktop_run_on(const w_command *c, int output, bool admin) {
             desk.resize = false;
             w_input_mode(false);
         }
-        if (c->kind == cmd_menu && w_palette_visible(L"Menu"))
+        if (anchor)
+            w_desktop_bar_palette(c->kind, output, anchor);
+        else if (c->kind == cmd_menu && w_palette_visible(L"Menu"))
             w_desktop_focus_menu(explicit_output ? output : -1);
         else
             w_desktop_palette(c->kind, output);
@@ -393,7 +426,7 @@ bool w_desktop_run_on(const w_command *c, int output, bool admin) {
             m->focus = w_model_recent(m, output, m->selected[output]);
         }
         w_model_workspace(m, c->kind == cmd_workspace_back ? m->previous[m->output] : destination);
-        w_desktop_select(m->focus);
+        w_desktop_select(w_model_recent(m, output, m->selected[output]));
         break;
     case cmd_workspace_follow:
         if (w) {

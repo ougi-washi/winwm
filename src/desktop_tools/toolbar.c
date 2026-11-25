@@ -369,6 +369,7 @@ int w_toolbar_run(void) {
     }
     w_layout_read(&initial,cfg); draft=initial;
     w_theme_colors(cfg->background,cfg->foreground,cfg->accent);
+    w_tool_popup_preferences(cfg);
     HINSTANCE instance=GetModuleHandleW(NULL);
     WNDCLASSW wc={.lpfnWndProc=w_toolbar_proc,.hInstance=instance,.lpszClassName=L"WinwmToolbarLayout",
                   .hCursor=LoadCursorW(NULL,IDC_ARROW)};
@@ -420,7 +421,7 @@ int w_toolbar_run(void) {
     w_show_group(0);
     SendMessageW(available,CB_SETCURSEL,0,0); w_controls();
     w_arrange(true);
-    ShowWindow(window,SW_SHOW); SetFocus(list);
+    if (w_tool_show(window)) SetFocus(list);
     MSG m;
     while (GetMessageW(&m,NULL,0,0)>0) {
         if (m.hwnd==list && !worker && (m.message==WM_KEYDOWN || m.message==WM_SYSKEYDOWN)) {

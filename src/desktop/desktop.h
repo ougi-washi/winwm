@@ -1,6 +1,7 @@
 #pragma once
 #include "layout/layout.h"
 #include "bar/bar.h"
+#include "win_platform/popup.h"
 #include "palette/palette.h"
 #include "ipc/ipc.h"
 #include "providers/providers.h"
@@ -24,7 +25,7 @@ enum {
     msg_hover,
     msg_desktop_menu,
     msg_catalog,
-    msg_pointer_select, msg_drag_preview, msg_drag_limits, msg_run_result, msg_shell_started
+    msg_pointer_select, msg_drag_preview, msg_drag_limits, msg_run_result, msg_shell_started, msg_pointer_down
 };
 
 typedef struct w_output_state {
@@ -136,10 +137,19 @@ void w_effects_hide(int slot);
 void w_desktop_bind(void);
 bool w_desktop_defer(const w_command *cmd, int output);
 bool w_desktop_run_on(const w_command *cmd, int output, bool admin);
+bool w_desktop_run_anchored(const w_command *cmd, int output, bool admin, const w_popup_anchor *anchor);
+void w_desktop_bar_action(int output, const char *action, const w_popup_anchor *anchor);
+HANDLE w_desktop_popup_process(void);
+bool w_desktop_popup_toggle(const w_popup_anchor *anchor, enum command_kind kind);
+void w_desktop_popup_finished(void);
+void w_desktop_popup_cancel(void);
+void w_desktop_popup_outside(HWND hit);
+void w_desktop_popup_bar_hidden(HWND bar);
 bool w_desktop_can_run_admin(enum command_kind kind);
 bool w_desktop_run(const w_command *cmd);
 void w_desktop_action(int output, const char *text);
 void w_desktop_palette(enum command_kind kind, int output);
+void w_desktop_bar_palette(enum command_kind kind, int output, const w_popup_anchor *anchor);
 void w_desktop_focus_menu(int output);
 void w_desktop_catalog_update(void);
 void w_desktop_clear_clips(void);
@@ -153,6 +163,8 @@ int w_desktop_find(HWND w);
 void w_desktop_activate(int slot);
 void w_desktop_hover(POINT p);
 void w_desktop_focus_cancel(void);
+bool w_desktop_focus_pending(void);
+void w_desktop_focus_successor(void);
 bool w_desktop_focus_new(w_window_id id);
 void w_desktop_focus_empty(void);
 bool w_desktop_close_foreground(void);

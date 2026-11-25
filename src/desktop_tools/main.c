@@ -12,17 +12,19 @@
 UINT w_tool_work_area(MONITORINFO *info) {
     STARTUPINFOW startup = {.cb = sizeof(startup)};
     GetStartupInfoW(&startup);
-    HMONITOR monitor = NULL;
-    if (startup.dwFlags & STARTF_USEPOSITION)
+    HMONITOR monitor = w_tool_popup_monitor();
+    bool anchored = monitor != NULL;
+    if (!monitor && (startup.dwFlags & STARTF_USEPOSITION))
         monitor = MonitorFromPoint((POINT){(LONG)startup.dwX, (LONG)startup.dwY}, MONITOR_DEFAULTTONULL);
     if (!monitor) monitor = MonitorFromWindow(GetForegroundWindow(), MONITOR_DEFAULTTOPRIMARY);
     GetMonitorInfoW(monitor, info);
+    if (anchored) info->rcWork = info->rcMonitor;
     UINT dpi = 96, y = 96;
     if (FAILED(GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &dpi, &y))) dpi = 96;
     return dpi;
 }
 
-int w_tools_run(const wchar_t *mode) {
+static int w_run_tool(const wchar_t *mode) {
     if (!wcsncmp(mode,L"dns-",4)) return (int)w_adapter_apply_dns(mode+4);
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     if (!wcscmp(mode,L"bar_settings")) return w_toolbar_run();
@@ -33,6 +35,7 @@ int w_tools_run(const wchar_t *mode) {
         w_config_defaults(cfg);
         w_os_cache_read(cfg);
         w_theme_colors(cfg->background, cfg->foreground, cfg->accent);
+        w_tool_popup_preferences(cfg);
         if (!wcscmp(mode, L"project")) {
             int result = w_project_run(cfg);
             free(cfg);
@@ -40,6 +43,8 @@ int w_tools_run(const wchar_t *mode) {
         }
         free(cfg);
     } else if (!wcscmp(mode, L"project")) return 1;
+    if ((!wcscmp(mode,L"sleep") || !wcscmp(mode,L"restart") || !wcscmp(mode,L"wallpaper")) &&
+        !w_tool_native_dialog()) return 0;
     if (!wcscmp(mode, L"languages")) return w_language_setup(input_languages);
     if (!wcscmp(mode, L"keyboard_settings")) return w_language_setup(input_keyboards);
     if (!wcscmp(mode, L"input_methods")) return w_language_setup(input_methods);
@@ -73,5 +78,11 @@ int w_tools_run(const wchar_t *mode) {
         }
     } else
         result = w_settings_run(mode);
+    return result;
+}
+
+int w_tools_run(const wchar_t *mode) {
+    int result = w_run_tool(mode);
+    w_tool_popup_cleanup();
     return result;
 }

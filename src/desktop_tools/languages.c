@@ -583,9 +583,10 @@ int w_language_setup(w_input_page start_page) {
     SendMessageW(category, CB_ADDSTRING, 0, (LPARAM)L"Input methods");
     SendMessageW(category, CB_SETCURSEL, start_page, 0);
     w_load_choices(false);
-    ShowWindow(panel, SW_SHOW);
-    SetForegroundWindow(panel);
-    SetFocus(search);
+    if (w_tool_show(panel)) {
+        SetForegroundWindow(panel);
+        SetFocus(search);
+    }
     MSG msg;
     bool done = false;
     while (!done) {

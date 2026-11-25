@@ -52,7 +52,7 @@ static int w_format_module(w_bar_window *b, const char *key, wchar_t *s, int cap
             GetDateFormatEx(LOCALE_NAME_USER_DEFAULT, 0, &t, L"MMM d", s, cap, NULL);
         else
             swprintf(s, cap, L"%02u:%02u", t.wHour, t.wMinute);
-        strcpy(action, "settings");
+        strcpy(action, "date_time");
     } else if (!strcmp(key, "battery")) {
         SYSTEM_POWER_STATUS p;
         if (GetSystemPowerStatus(&p) && p.BatteryFlag != 128 && p.BatteryLifePercent <= 100)
@@ -304,7 +304,7 @@ static void w_place_group(w_bar_window *b, RECT bounds, const w_bar_group *group
 
 static void w_paint_hit(w_bar_window *b,HDC dc,struct w_bar_hit *hit,COLORREF background,bool vertical,uint64_t now) {
     RECT box=hit->box;
-    bool hovered=b->pointer_inside && PtInRect(&box,b->pointer);
+    bool hovered=(b->pointer_inside && PtInRect(&box,b->pointer)) || w_bar_menu_at(b,hit);
     COLORREF paper=hit->active ? w_rgb_value(b->config->accent) :
                    hovered ? w_mix(b->config->background,b->config->foreground,12) : background;
     uint32_t color=hit->active ? b->config->background :
@@ -494,6 +494,23 @@ static void w_bar_layout(w_bar_window *b,HDC dc,RECT r,bool vertical) {
     w_place_group(b,r,&right,vertical,right_start,length-margin,sizeof(b->config->bar_left)+sizeof(b->config->bar_center));
 }
 
+bool w_bar_anchor(const w_bar_window *b, int hit, w_popup_anchor *anchor) {
+    if (hit < 0 || hit >= b->hit_count)
+        return false;
+    anchor->bar = b->hwnd;
+    anchor->source = b->hits[hit].source;
+    anchor->button = b->hits[hit].box;
+    MapWindowPoints(b->hwnd, HWND_DESKTOP, (POINT *)&anchor->button, 2);
+    w_str_copy(anchor->edge, sizeof(anchor->edge), b->docked_edge ? b->docked_edge : b->config->edge);
+    return true;
+}
+
+void w_bar_invoke(w_bar_window *b, int hit, const char *action) {
+    w_popup_anchor anchor;
+    w_bar_remember_foreground();
+    b->invoke(b->output, action, w_bar_anchor(b,hit,&anchor) ? &anchor : NULL);
+}
+
 bool w_bar_activate_hit(w_bar_window *b, int hit) {
     if (hit < 0 || hit >= b->hit_count) return false;
     const struct w_bar_hit *item = &b->hits[hit];
@@ -503,9 +520,8 @@ bool w_bar_activate_hit(w_bar_window *b, int hit) {
     char action[sizeof(item->action)];
     strcpy(action,item->action);
     w_bar_menu_close(NULL,true);
-    if (!*action) return false;
-    b->invoke(b->output,action);
-    return true;
+    w_bar_invoke(b,hit,*action ? action : NULL);
+    return *action != 0;
 }
 
 static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
@@ -540,6 +556,8 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     }
     if (msg == WM_MOVE || msg == WM_SIZE || msg == WM_THEMECHANGED || msg == WM_SETTINGCHANGE ||
         msg == WM_SYSCOLORCHANGE) {
+        if (msg == WM_MOVE || msg == WM_SIZE)
+            w_bar_menu_close(b, false);
         if (msg == WM_SIZE) InvalidateRect(w,NULL,FALSE);
         if (msg != WM_MOVE && msg != WM_SIZE) {
             HIGHCONTRASTW hc={.cbSize=sizeof(hc)};
@@ -615,6 +633,10 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_LBUTTONDOWN) {
         b->press = (POINT){GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
         int hit=w_hit_at(b,b->press);
+        if (hit < 0) {
+            w_bar_menu_close(NULL, true);
+            w_bar_invoke(b,-1,NULL);
+        }
         strcpy(b->press_instance,hit>=0 ? b->hits[hit].instance : "");
         b->press_workspace=hit>=0 ? b->hits[hit].workspace : 0;
         ClientToScreen(w, &b->press);
@@ -632,7 +654,8 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         bool drag = b->dragging;
         ReleaseCapture();
         if (drag) {
-            w_bar_menu_close(b, true);
+            w_bar_menu_close(NULL, true);
+            w_bar_invoke(b,-1,NULL);
             w_rect s = b->screen;
             int distance[] = {abs(p.y - s.y), abs(p.y - (s.y + s.h - 1)), abs(p.x - s.x),
                               abs(p.x - (s.x + s.w - 1))};
@@ -664,8 +687,11 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     }
     if (msg == WM_MBUTTONUP || msg == WM_RBUTTONUP) {
         int hit = w_hit_at(b, (POINT){GET_X_LPARAM(lp), GET_Y_LPARAM(lp)});
-        if (hit < 0)
+        if (hit < 0) {
+            w_bar_menu_close(NULL, true);
+            w_bar_invoke(b,-1,NULL);
             return 0;
+        }
         const char *key = b->hits[hit].module, *action = NULL;
         const w_module_style *style=b->hits[hit].style;
         if (style && *(msg==WM_MBUTTONUP ? style->middle_click : style->right_click))
@@ -687,10 +713,8 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             else if (!strcmp(key, "battery")) action = "power_settings";
             else if (!strcmp(key, "network") || !strcmp(key, "throughput")) action = "network_settings";
         }
-        if (action) {
-            w_bar_menu_close(NULL, true);
-            b->invoke(b->output, action);
-        }
+        w_bar_menu_close(NULL, true);
+        w_bar_invoke(b,hit,action);
         return 0;
     }
     if (msg == WM_MOUSEWHEEL) {
@@ -715,13 +739,13 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             action = steps > 0 ? "volume_up" : "volume_down";
         if (*action) {
             for (int i = 0; i < abs(steps); i++)
-                b->invoke(b->output, action);
+                w_bar_invoke(b,hit,action);
         } else if (!strcmp(b->hits[hit].module, "workspaces")) {
             char select[40];
             int ws = (b->view.selected - steps) % workspace_limit;
             snprintf(select, sizeof(select), "workspace_select %d",
                      (ws + workspace_limit) % workspace_limit + 1);
-            b->invoke(b->output, select);
+            w_bar_invoke(b,hit,select);
         } else if (!strcmp(b->hits[hit].module, "keyboard")) {
             w_bar_cycle_layout(-steps);
         }

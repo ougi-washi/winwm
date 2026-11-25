@@ -20,6 +20,7 @@ src/desktop/focus.c
 src/desktop/main.c
 src/desktop/menu.c
 src/desktop/navigation.c
+src/desktop/popup.c
 src/desktop/status.c
 src/desktop/tabs.c
 src/desktop/windows.c
@@ -33,6 +34,7 @@ src/desktop_tools/bluetooth.c
 src/desktop_tools/clock.c
 src/desktop_tools/color.c
 src/desktop_tools/main.c
+src/desktop_tools/popup.c
 src/desktop_tools/languages.c
 src/desktop_tools/network.c
 src/desktop_tools/packages.c

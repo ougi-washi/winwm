@@ -4,7 +4,7 @@
 //~ Input
 
 static HWND target;
-static UINT action_msg, hover_msg, context_msg;
+static UINT action_msg, hover_msg, context_msg, press_msg;
 static bool desktop_context_press;
 static POINT hover_point;
 static bool hover_pending, hover_known;
@@ -300,8 +300,10 @@ static LRESULT CALLBACK w_mouse_proc(int code, WPARAM event, LPARAM data) {
     const MSLLHOOKSTRUCT *m = (const MSLLHOOKSTRUCT *)data;
     w_input_cancel_pointer();
     if (event == WM_LBUTTONDOWN || event == WM_RBUTTONDOWN || event == WM_MBUTTONDOWN ||
-        event == WM_XBUTTONDOWN)
+        event == WM_XBUTTONDOWN) {
         pointer_presses++;
+        PostMessageW(target, press_msg, (WPARAM)(LONG_PTR)m->pt.x, (LPARAM)m->pt.y);
+    }
     if (event == WM_MOUSEMOVE)
         w_queue_hover(m->pt);
     if ((secondary_button == WM_LBUTTONDOWN && event == WM_LBUTTONUP) ||
@@ -415,7 +417,7 @@ void w_input_reset(void) {
     ReleaseSRWLockExclusive(&matcher_lock);
 }
 
-void w_input_bind(HWND w, UINT message, UINT hover_message, UINT context_message, const w_desktop_config *c,
+void w_input_bind(HWND w, UINT message, UINT hover_message, UINT context_message, UINT press_message, const w_desktop_config *c,
                 bool *status, input_drag_callback resize_drag) {
     if (!target)
         w_os_modifier_keys(mapped_super);
@@ -424,6 +426,7 @@ void w_input_bind(HWND w, UINT message, UINT hover_message, UINT context_message
     action_msg = message;
     hover_msg = c->follow_mouse ? hover_message : 0;
     context_msg = context_message;
+    press_msg = press_message;
     binding_count = c->binding_count;
     menu_binding = -1;
     memset(bound, 0, sizeof(bound));

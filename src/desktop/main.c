@@ -75,7 +75,7 @@ void w_desktop_schedule(void) {
 void w_desktop_bind(void) {
     w_effects_preferences();
     w_theme_colors(desk.config.background, desk.config.foreground, desk.config.accent);
-    w_input_bind(desk.root, msg_command, msg_hover, desk.preview ? 0 : msg_desktop_menu,
+    w_input_bind(desk.root, msg_command, msg_hover, desk.preview ? 0 : msg_desktop_menu, msg_pointer_down,
                &desk.config, desk.registered, w_desktop_drag);
 }
 
@@ -308,6 +308,19 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         w_desktop_hover(p);
         return 0;
     }
+    case msg_pointer_down: {
+        HWND hit = WindowFromPoint((POINT){(LONG)(LONG_PTR)wp, (LONG)lp});
+        w_bar_menu_outside(hit);
+        w_palette_outside(hit);
+        w_desktop_popup_outside(hit);
+        return 0;
+    }
+    case winwm_popup_released: {
+        HANDLE popup = w_desktop_popup_process();
+        if (popup && GetProcessId(popup) == (DWORD)wp)
+            w_desktop_popup_finished();
+        return 0;
+    }
     case msg_pointer_select: {
         w_window_id id = {(int)wp, (uint32_t)lp};
         if (w_model_valid(&desk.model, id) && w_model_visible(&desk.model, id.slot))
@@ -441,6 +454,7 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         w_desktop_apply();
         return 0;
     case WM_DISPLAYCHANGE:
+        w_desktop_popup_cancel();
         w_position_desktop();
         if (desk.ready)
             w_desktop_outputs();
@@ -563,15 +577,18 @@ int w_session_run(HINSTANCE instance, bool preview) {
     PostMessageW(desk.root, msg_init, 0, 0);
     int result = 0;
     for (;;) {
-        HANDLE handles[2*ipc_slots+1];
+        HANDLE handles[2*ipc_slots+2];
         DWORD count = desk.ipc_live ? 2*ipc_slots : 0;
         for (DWORD i = 0; i < count / 2; i++) {
             handles[2*i] = desk.channels[i].peer_event;
             handles[2*i+1] = desk.channels[i].event;
         }
         handles[count] = recovery;
-        DWORD wait = MsgWaitForMultipleObjectsEx(count+1, handles, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+        HANDLE popup = w_desktop_popup_process();
+        if (popup) handles[count+1] = popup;
+        DWORD wait = MsgWaitForMultipleObjectsEx(count+1+(popup != NULL), handles, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         if (wait == WAIT_OBJECT_0+count) break;
+        if (popup && wait == WAIT_OBJECT_0+count+1) w_desktop_popup_finished();
         if (wait == WAIT_FAILED) {
             result = 4;
             break;
@@ -607,6 +624,8 @@ int w_session_run(HINSTANCE instance, bool preview) {
         }
     }
 done:
+    w_desktop_popup_cancel();
+    if (w_desktop_popup_process()) w_desktop_popup_finished();
     if ((DWORD)(uintptr_t)GetPropW(host_window,L"winwm.session_pid") == GetCurrentProcessId())
         PostMessageW(host_window,recovery_session_closing,GetCurrentProcessId(),result);
     KillTimer(desk.root, animation_timer);

@@ -11,7 +11,7 @@ typedef bool (*input_drag_callback)(enum input_drag_event event, POINT point);
 ////////////////
 //~ Input Interface
 
-void w_input_bind(HWND target, UINT message, UINT hover_message, UINT context_message,
+void w_input_bind(HWND target, UINT message, UINT hover_message, UINT context_message, UINT press_message,
                 const w_desktop_config *config, bool *status, input_drag_callback drag);
 uint64_t w_input_pointer_press_count(void);
 void w_input_hover_point(POINT *out);

@@ -45,6 +45,7 @@ bool w_os_remember(HWND w, w_rect *original);
 void w_os_restore(HWND w);
 bool w_os_shell_hidden(HWND window);
 bool w_os_hidden_confirmed(HWND window);
+bool w_os_ready_for_focus(HWND window);
 bool w_os_set_visible(HWND w, bool wanted);
 void w_os_window_appearance(HWND w, DWORD border, DWORD corner);
 bool w_os_window_opacity(HWND w, BYTE alpha, bool retain_layer);

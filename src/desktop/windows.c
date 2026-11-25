@@ -96,8 +96,8 @@ static BOOL CALLBACK w_visit_monitor(HMONITOR mon, HDC dc, LPRECT bounds, LPARAM
     UINT x = 96, y = 96;
     GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &x, &y);
     o->dpi = (int)x;
-    if (!o->bar.hwnd)
-        w_bar_create(&o->bar, slot, &desk.config, w_desktop_action);
+    if (!o->bar.hwnd && w_bar_create(&o->bar, slot, &desk.config, w_desktop_bar_action) && desk.preview)
+        SetPropW(o->bar.hwnd, L"winwm.preview", (HANDLE)1);
     w_audio_state audio = w_audio_read();
     w_bar_set_audio(&o->bar, audio.available ? audio.percent : -1, audio.muted);
     o->bar.custom = w_custom_text;
@@ -200,9 +200,11 @@ static bool w_matches(const char *needle, const wchar_t *s, bool exact) {
 }
 
 static void w_forget(int i) {
+    bool selected = desk.model.focus == i;
     w_effects_hide(i);
     w_model_remove(&desk.model, (w_window_id){i, desk.model.windows[i].generation});
     desk.windows[i] = (w_window_state){0};
+    if (selected) w_desktop_focus_successor();
     // Discovery and placement can both observe teardown before its destroy
     // notification arrives. Recompute even when the current layout pass has
     // already measured this slot.
@@ -305,6 +307,8 @@ static void w_observe_visibility(int slot) {
         w->withdrawn = false;
     else if (!shell_hidden)
         w->withdrawn = true;
+    if (desk.model.focus == slot && !w_model_visible(&desk.model, slot))
+        w_desktop_focus_successor();
 }
 
 static bool w_in_native_move(HWND window) {
@@ -570,6 +574,7 @@ static BOOL CALLBACK w_sync_owned(HWND w, LPARAM unused) {
 }
 
 static void w_follow_native_activation(HWND foreground, HWND owner, bool activated) {
+    if (w_desktop_focus_pending()) return;
     int slot = w_desktop_find(owner);
     if (slot < 0 || desk.windows[slot].wants_visible || IsIconic(owner) || w_os_cloaked(foreground) ||
         (foreground != owner && w_os_cloaked(owner)))
@@ -618,6 +623,7 @@ void w_desktop_apply(void) {
     static int previous_workspace[output_limit];
     static HWND previous_foreground;
     bool visibility_changed = false;
+    HWND outgoing = NULL;
     HWND foreground = GetForegroundWindow();
     HWND active = w_os_app_window(foreground);
     w_follow_native_activation(foreground, active, foreground != previous_foreground);
@@ -631,6 +637,7 @@ void w_desktop_apply(void) {
             int recent = w_model_recent(&desk.model, o, ws);
             bool hide = desk.hide_bars || (recent >= 0 && desk.model.windows[recent].fullscreen);
             if (hide != output->bar_hidden) {
+                if (hide) w_desktop_popup_bar_hidden(output->bar.hwnd);
                 output->work = w_bar_position(&output->bar, output->screen, output->available, output->dpi, hide);
                 output->bar_hidden = hide;
             }
@@ -673,7 +680,12 @@ void w_desktop_apply(void) {
                     s->has_issued = false;
                     continue;
                 }
-                visibility_changed |= w_os_set_visible(hwnd, visible);
+                // Queue the incoming tab's show before hiding its foreground peer.
+                // Windows otherwise activates an arbitrary app during the handoff.
+                if (!visible && hwnd == active && w_desktop_focus_pending())
+                    outgoing = hwnd;
+                else
+                    visibility_changed |= w_os_set_visible(hwnd, visible);
                 if (!visible) {
                     w_effects_hide(i);
                     s->has_issued = false;
@@ -802,5 +814,6 @@ void w_desktop_apply(void) {
         EnumWindows(w_sync_owned, 0);
     }
     w_desktop_focus_apply();
+    if (outgoing && w_os_set_visible(outgoing, false)) w_desktop_schedule();
     w_desktop_drag_preview();
 }

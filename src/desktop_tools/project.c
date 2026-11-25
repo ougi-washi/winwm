@@ -352,8 +352,7 @@ int w_project_run(const w_desktop_config *config) {
     }
     w_buttons(false);
     w_layout_project(true);
-    ShowWindow(panel,SW_SHOW);
-    SetFocus(folder);
+    if (w_tool_show(panel)) SetFocus(folder);
     SendMessageW(folder,EM_SETSEL,0,-1);
     MSG msg;
     while (GetMessageW(&msg,NULL,0,0)>0) {

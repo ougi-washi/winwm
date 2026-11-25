@@ -44,9 +44,10 @@ size_t w_network_problems(w_adapter_problem *out, size_t capacity, bool wireless
         const wchar_t *reason = problem == CM_PROB_FAILED_INSTALL ? L"Driver missing" :
                                 problem == CM_PROB_DISABLED ? L"Disabled" : L"Device problem";
         swprintf(out[count].label, 192, L"%.135ls   ·   %ls", name, reason);
-        swprintf(out[count].detail, 256, L"%.95ls   ·   Code %lu. %ls", instance, problem,
+        swprintf(out[count].detail, 256, L"%ls  (Code %lu)\n%.95ls",
                  problem == CM_PROB_FAILED_INSTALL ? L"Install the PC manufacturer's network driver." :
-                 problem == CM_PROB_DISABLED ? L"Enable this adapter to make it available." : L"Check the device and its driver.");
+                 problem == CM_PROB_DISABLED ? L"Enable this adapter to make it available." : L"Check the device and its driver.",
+                 problem, instance);
         ++count;
     }
     SetupDiDestroyDeviceInfoList(devices);

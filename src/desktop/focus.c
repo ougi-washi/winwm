@@ -17,6 +17,26 @@ void w_desktop_focus_cancel(void) {
     pending.window.generation = 0;
 }
 
+bool w_desktop_focus_pending(void) {
+    return w_model_valid(&desk.model, pending.window) &&
+           pending.pointer_presses == w_input_pointer_press_count();
+}
+
+static void w_request_focus(int slot) {
+    w_model_focus(&desk.model, slot);
+    pending.window = (w_window_id){slot, desk.model.windows[slot].generation};
+    pending.pointer_presses = w_input_pointer_press_count();
+}
+
+void w_desktop_focus_successor(void) {
+    w_desktop_model *m = &desk.model;
+    int slot = w_model_recent(m, m->output, m->selected[m->output]);
+    w_desktop_focus_cancel();
+    if (slot >= 0) w_request_focus(slot);
+    else m->focus = -1;
+    w_desktop_schedule();
+}
+
 static HWND w_desktop_surface(void) {
     if (desk.root && IsWindowVisible(desk.root))
         return desk.root;
@@ -66,7 +86,7 @@ static bool w_release_app(HWND foreground, HWND surface) {
 
 void w_desktop_focus_empty(void) {
     w_desktop_focus_cancel();
-    if (!w_palette_shown() && !w_bar_menu_active())
+    if (!w_palette_shown() && !w_bar_menu_active() && !w_desktop_popup_process())
         w_release_app(GetForegroundWindow(), w_desktop_surface());
     desk.model.focus = -1;
     w_desktop_schedule();
@@ -74,16 +94,20 @@ void w_desktop_focus_empty(void) {
 
 static void w_select_owner(HWND owner) {
     int current = desk.model.focus;
+    // Windows can give the desktop temporary foreground while hiding or
+    // destroying a window. Keep the workspace's keyboard selection.
+    if (w_os_desktop_surface(owner))
+        return;
     if (current >= 0 && desk.windows[current].hwnd == owner && w_model_visible(&desk.model, current) &&
         desk.model.output == desk.model.windows[current].output)
         return;
     int slot = w_desktop_find(owner);
-    if (slot < 0 || !w_model_visible(&desk.model, slot)) {
+    if (slot < 0) {
         if (desk.model.focus >= 0) {
             desk.model.focus = -1;
             w_desktop_schedule();
         }
-    } else if (desk.model.focus != slot || desk.model.output != desk.model.windows[slot].output) {
+    } else if (w_model_visible(&desk.model, slot) && w_os_ready_for_focus(owner)) {
         w_model_focus(&desk.model, slot);
         w_desktop_schedule();
     }
@@ -97,7 +121,7 @@ static bool w_thread_owns_pointer(DWORD thread_id) {
 }
 
 bool w_desktop_focus_new(w_window_id id) {
-    if (!w_model_visible(&desk.model, id.slot) || w_palette_shown() || w_bar_menu_active() ||
+    if (!w_model_visible(&desk.model, id.slot) || w_palette_shown() || w_bar_menu_active() || w_desktop_popup_process() ||
         w_thread_owns_pointer(0) || w_thread_owns_pointer(GetCurrentThreadId()))
         return false;
     HWND owner = desk.windows[id.slot].hwnd;
@@ -105,9 +129,7 @@ bool w_desktop_focus_new(w_window_id id) {
         return false;
     // Make the new tab visible in the next layout pass. The same pass applies
     // foreground activation after asynchronous workspace and popup visibility.
-    w_model_focus(&desk.model, id.slot);
-    pending.window = id;
-    pending.pointer_presses = w_input_pointer_press_count();
+    w_request_focus(id.slot);
     return true;
 }
 
@@ -209,9 +231,7 @@ void w_desktop_activate(int slot) {
             return;
         w->minimized = false;
     }
-    w_model_focus(&desk.model, slot);
-    pending.window = (w_window_id){slot, w->generation};
-    pending.pointer_presses = w_input_pointer_press_count();
+    w_request_focus(slot);
     w_desktop_apply();
 }
 
@@ -255,6 +275,10 @@ bool w_desktop_close_foreground(void) {
         return GetForegroundWindow() == window && PostMessageW(window, WM_CLOSE, 0, 0);
     if (w_bar_menu_close(NULL, true) || w_palette_close())
         return true;
+    if (w_desktop_popup_process()) {
+        w_desktop_popup_cancel();
+        return true;
+    }
     int slot = w_desktop_find(w_os_app_window(window));
     if (slot < 0)
         return false;
@@ -277,7 +301,7 @@ void w_desktop_focus_apply(void) {
         return;
     }
     HWND owner = desk.windows[slot].hwnd;
-    if (!IsWindowVisible(owner) || IsIconic(owner))
+    if (w_desktop_popup_process() || !w_os_ready_for_focus(owner))
         return;
     HWND target = w_activation_target(owner, NULL);
     if (!target) {
@@ -290,8 +314,7 @@ void w_desktop_focus_apply(void) {
         return;
     }
     w_desktop_focus_cancel();
-    if (!w_foreground(target))
-        w_select_owner(w_os_app_window(GetForegroundWindow()));
+    w_foreground(target);
 }
 
 ////////////////
@@ -301,7 +324,8 @@ void w_desktop_hover(POINT point) {
     static HWND last_hit, denied_by;
     static uint32_t last_generation;
     static bool denied;
-    if (!desk.config.follow_mouse || w_palette_shown() || w_bar_menu_active() ||
+    if (!desk.config.follow_mouse || w_desktop_focus_pending() || w_palette_shown() ||
+        w_bar_menu_active() || w_desktop_popup_process() ||
         GetAsyncKeyState(VK_LBUTTON) < 0 || GetAsyncKeyState(VK_RBUTTON) < 0 ||
         GetAsyncKeyState(VK_MBUTTON) < 0 || GetAsyncKeyState(VK_XBUTTON1) < 0 || GetAsyncKeyState(VK_XBUTTON2) < 0)
         return;
@@ -309,13 +333,17 @@ void w_desktop_hover(POINT point) {
     HWND foreground = GetForegroundWindow();
     HWND owner = w_os_app_window(hit);
     int slot = w_desktop_find(owner);
-    uint32_t generation = slot >= 0 ? desk.model.windows[slot].generation : 0;
+    if (slot < 0 || !desk.windows[slot].wants_visible || !w_model_visible(&desk.model, slot) ||
+        (GetWindowLongPtrW(hit, GWL_EXSTYLE) & WS_EX_NOACTIVATE)) {
+        last_hit = NULL;
+        return;
+    }
+    uint32_t generation = desk.model.windows[slot].generation;
     bool same_hit = hit == last_hit && generation == last_generation;
     if (same_hit && denied && denied_by == foreground)
         return;
-    if (same_hit && !denied && slot >= 0 && foreground == hit) {
-        if (!w_model_valid(&desk.model, pending.window))
-            w_select_owner(owner);
+    if (same_hit && !denied && foreground == hit) {
+        w_select_owner(owner);
         return;
     }
     // Foreign menus, modal move/size loops and drags own the pointer until
@@ -325,19 +353,6 @@ void w_desktop_hover(POINT point) {
     last_hit = hit;
     last_generation = generation;
     denied = false;
-    if (w_os_desktop_surface(hit)) {
-        w_desktop_focus_cancel();
-        if (!w_release_app(foreground, hit ? hit : w_desktop_surface())) {
-            denied = true;
-            denied_by = foreground;
-            return;
-        }
-        w_select_owner(NULL);
-        return;
-    }
-    if (slot < 0 || !w_model_visible(&desk.model, slot) ||
-        (GetWindowLongPtrW(hit, GWL_EXSTYLE) & WS_EX_NOACTIVATE))
-        return;
     HWND target = w_activation_target(owner, hit);
     if (!target)
         return;

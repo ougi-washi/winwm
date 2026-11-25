@@ -37,7 +37,9 @@ typedef struct w_flyout {
     HFONT heading, symbols;
     COLORREF surface, ink, accent, border, selected, selected_ink;
     DWORD language_thread;
-    int count, pressed_row, anchor_hit;
+    int count, pressed_row, source;
+    w_popup_anchor anchor;
+    bar_icon icon;
     bool closing, owns_memory;
     w_layer_fade fade;
     char module[56], instance[56];
@@ -45,6 +47,9 @@ typedef struct w_flyout {
 } w_flyout;
 
 static w_flyout *open_menu;
+static HWND fading_menu;
+static HWND last_foreground;
+static DWORD last_foreground_thread;
 
 ////////////////
 //~ Menu Functions
@@ -76,14 +81,40 @@ bool w_bar_menu_active(void) {
     return open_menu && !open_menu->closing;
 }
 
+bool w_bar_menu_at(const w_bar_window *bar, const struct w_bar_hit *hit) {
+    return open_menu && open_menu->bar == bar && open_menu->source == hit->source &&
+           !strcmp(open_menu->instance,hit->instance);
+}
+
+HWND w_bar_remember_foreground(void) {
+    if (open_menu) return open_menu->previous;
+    HWND foreground = GetForegroundWindow();
+    bool transient = false;
+    for (HWND w = foreground; w && !transient; w = GetWindow(w,GW_OWNER))
+        transient = GetPropW(w,L"winwm.popup_bar") != NULL || w == fading_menu;
+    if (foreground && !transient && w_os_same_process(foreground)) {
+        wchar_t name[48];
+        transient = GetClassNameW(foreground,name,count_of(name)) && !wcscmp(name,L"WinwmPalette");
+    }
+    // Switching toolbar panels must keep the input layout directed at the application.
+    if (transient)
+        return last_foreground && GetWindowThreadProcessId(last_foreground,NULL) == last_foreground_thread &&
+               IsWindowVisible(last_foreground) ? last_foreground : NULL;
+    last_foreground = foreground;
+    last_foreground_thread = foreground ? GetWindowThreadProcessId(foreground,NULL) : 0;
+    return foreground;
+}
+
 static void w_dismiss(w_flyout *menu, bool restore) {
     if (!menu || menu->closing)
         return;
     menu->closing = true;
     if (open_menu == menu)
         open_menu = NULL;
+    InvalidateRect(menu->bar->hwnd, NULL, FALSE);
     HWND target = menu->previous;
     HWND hwnd = menu->window;
+    fading_menu = hwnd;
     bool had_focus = GetForegroundWindow() == hwnd;
     SetWindowLongPtrW(hwnd,GWL_EXSTYLE,GetWindowLongPtrW(hwnd,GWL_EXSTYLE)|WS_EX_TRANSPARENT|WS_EX_NOACTIVATE);
     HWND capture = GetCapture();
@@ -103,6 +134,15 @@ bool w_bar_menu_close(const w_bar_window *bar, bool restore) {
     return true;
 }
 
+void w_bar_menu_outside(HWND hit) {
+    if (!open_menu) return;
+    HWND root = GetAncestor(hit,GA_ROOT);
+    if (root == open_menu->window) return;
+    wchar_t name[48];
+    if (root && GetClassNameW(root,name,count_of(name)) && !wcscmp(name,L"WinwmBar")) return;
+    w_dismiss(open_menu,false);
+}
+
 static void w_pick(w_flyout *menu, int index) {
     if (menu->closing || index < 0 || index + 1 >= menu->count)
         return;
@@ -112,14 +152,20 @@ static void w_pick(w_flyout *menu, int index) {
     HWND target = menu->language_target;
     DWORD thread = menu->language_thread;
     w_bar_window *bar = menu->bar;
+    w_popup_anchor anchor = menu->anchor;
+    for (int i = 0; i < bar->hit_count; i++)
+        if (w_bar_menu_at(bar,&bar->hits[i])) {
+            w_bar_anchor(bar,i,&anchor);
+            break;
+        }
     w_dismiss(menu, true);
     if (selected.layout) {
         if (!IsWindow(target) || GetWindowThreadProcessId(target, NULL) != thread ||
             !PostMessageW(target, WM_INPUTLANGCHANGEREQUEST, 0, (LPARAM)selected.layout))
-            bar->invoke(bar->output, "notify Focus an application before switching input layout");
+            bar->invoke(bar->output, "notify Focus an application before switching input layout", &anchor);
     }
     else if (selected.action)
-        bar->invoke(bar->output, selected.action);
+        bar->invoke(bar->output, selected.action, &anchor);
 }
 
 static LRESULT CALLBACK w_flyout_control(HWND control, UINT message, WPARAM wp, LPARAM lp, UINT_PTR id,
@@ -172,6 +218,19 @@ static void w_fill(HDC dc, RECT r, COLORREF value) {
     FillRect(dc, &r, GetStockObject(DC_BRUSH));
 }
 
+static void w_rounded_fill(HDC dc, RECT r, COLORREF color, int radius) {
+    if (!radius) {
+        w_fill(dc,r,color);
+        return;
+    }
+    HGDIOBJ brush = SelectObject(dc,GetStockObject(DC_BRUSH));
+    HGDIOBJ pen = SelectObject(dc,GetStockObject(NULL_PEN));
+    SetDCBrushColor(dc,color);
+    RoundRect(dc,r.left,r.top,r.right,r.bottom,2*radius,2*radius);
+    SelectObject(dc,pen);
+    SelectObject(dc,brush);
+}
+
 // Owner drawing supplies the glyphs. Keep their meaning in the native list's
 // accessible text as well, including when the keyboard focus is on another row.
 static void w_row_name(const w_menu_row *row, wchar_t text[256]) {
@@ -194,7 +253,7 @@ static void w_request_volume(w_flyout *menu, int percent) {
     char action[24];
     snprintf(action, sizeof(action), "volume_set %d", percent);
     w_volume_header(menu, percent);
-    menu->bar->invoke(menu->bar->output, action);
+    menu->bar->invoke(menu->bar->output, action, &menu->anchor);
 }
 
 static const wchar_t *w_mute_label(const w_bar_window *bar) {
@@ -233,12 +292,12 @@ static LRESULT CALLBACK w_flyout_proc(HWND w, UINT message, WPARAM wp, LPARAM lp
     case WM_COMMAND:
         if (menu->closing || HIWORD(wp) != BN_CLICKED || !lp) break;
         if ((HWND)lp == menu->mute && IsWindowEnabled(menu->mute)) {
-            bar->invoke(bar->output,"mute");
+            bar->invoke(bar->output,"mute",&menu->anchor);
             return 0;
         }
         for (size_t i = 0; i < count_of(playback); ++i) {
             if ((HWND)lp == menu->transport[i]) {
-                bar->invoke(bar->output,playback[i].action);
+                bar->invoke(bar->output,playback[i].action,&menu->anchor);
                 return 0;
             }
         }
@@ -282,13 +341,25 @@ static LRESULT CALLBACK w_flyout_proc(HWND w, UINT message, WPARAM wp, LPARAM lp
         GetClientRect(w, &r);
         w_fill(dc, r, menu->border);
         InflateRect(&r, -1, -1);
-        w_fill(dc, r, menu->surface);
+        w_rounded_fill(dc,r,menu->surface,w_scale(bar,min(12,bar->config->rounding)));
+        RECT list_rect;
+        if (menu->list && GetWindowRect(menu->list,&list_rect)) {
+            MapWindowPoints(HWND_DESKTOP,w,(POINT *)&list_rect,2);
+            RECT line = {r.left+w_scale(bar,14),list_rect.top-1,r.right-w_scale(bar,14),list_rect.top};
+            w_fill(dc,line,menu->border);
+        }
         r.left += w_scale(bar, 16);
         r.right -= w_scale(bar, 16);
         r.bottom = w_scale(bar, 38);
         HGDIOBJ old = SelectObject(dc, menu->heading ? menu->heading : bar->font);
         SetTextColor(dc, menu->ink);
         SetBkMode(dc, TRANSPARENT);
+        if (menu->icon && bar->icons.size > 0) {
+            RECT glyph = r;
+            glyph.right = glyph.left + bar->icons.size;
+            w_icons_draw(&bar->icons,dc,menu->icon,glyph,menu->accent,menu->surface);
+            r.left = glyph.right + w_scale(bar,9);
+        }
         const wchar_t *heading = menu->rows[0].label;
         if (menu->slider && bar->audio_percent >= 0 && wcschr(heading, L'%')) {
             wchar_t percentage[12];
@@ -318,7 +389,7 @@ static LRESULT CALLBACK w_flyout_proc(HWND w, UINT message, WPARAM wp, LPARAM lp
         w_fill(item->hDC, r, menu->surface);
         if (selected) {
             InflateRect(&r, -w_scale(bar, 2), -w_scale(bar, 2));
-            w_fill(item->hDC, r, menu->selected);
+            w_rounded_fill(item->hDC,r,menu->selected,w_scale(bar,min(7,bar->config->rounding)));
         }
         SetBkMode(item->hDC, TRANSPARENT);
         COLORREF ink = row->disabled ? GetSysColor(COLOR_GRAYTEXT) : selected ? menu->selected_ink : menu->ink;
@@ -343,6 +414,8 @@ static LRESULT CALLBACK w_flyout_proc(HWND w, UINT message, WPARAM wp, LPARAM lp
     case WM_NCDESTROY:
         if (open_menu == menu)
             open_menu = NULL;
+        if (fading_menu == w)
+            fading_menu = NULL;
         SetWindowLongPtrW(w, GWLP_USERDATA, 0);
         DeleteObject(menu->heading);
         DeleteObject(menu->symbols);
@@ -356,31 +429,33 @@ static LRESULT CALLBACK w_flyout_proc(HWND w, UINT message, WPARAM wp, LPARAM lp
 static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count, HWND language_target) {
     if (count < 2)
         return;
+    HWND previous = w_bar_remember_foreground();
     if (open_menu) {
-        bool same = open_menu->bar == bar && open_menu->anchor_hit == hit &&
-                    !strcmp(open_menu->instance,bar->hits[hit].instance);
+        bool same = w_bar_menu_at(bar,&bar->hits[hit]);
         w_dismiss(open_menu, true);
         if (same)
             return;
     }
+    if (fading_menu) DestroyWindow(fading_menu);
     w_flyout *menu = calloc(1, sizeof(*menu) + (size_t)count * sizeof(*rows));
     if (!menu)
         return;
     menu->bar = bar;
+    w_bar_anchor(bar,hit,&menu->anchor);
+    menu->previous = previous;
+    bar->invoke(bar->output,NULL,&menu->anchor);
     w_menu_colors(menu);
-    menu->previous = GetForegroundWindow();
     menu->language_target = language_target;
     if (language_target)
         menu->language_thread = GetWindowThreadProcessId(language_target, NULL);
     menu->count = count;
     menu->pressed_row = -1;
-    menu->anchor_hit = hit;
+    menu->source = bar->hits[hit].source;
+    menu->icon = bar->hits[hit].icon;
     w_str_copy(menu->module, sizeof(menu->module), bar->hits[hit].module);
     w_str_copy(menu->instance, sizeof(menu->instance), bar->hits[hit].instance);
     memcpy(menu->rows, rows, (size_t)count * sizeof(*rows));
 
-    RECT anchor = bar->hits[hit].box;
-    MapWindowPoints(bar->hwnd, HWND_DESKTOP, (POINT *)&anchor, 2);
     bool audio = !strcmp(menu->module, "audio");
     bool media = !strcmp(menu->module, "media");
     int margin = w_scale(bar, 6), row_height = w_scale(bar, 35), header = w_scale(bar, audio || media ? 76 : 38);
@@ -394,20 +469,10 @@ static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count
     }
     SelectObject(dc, old);
     ReleaseDC(bar->hwnd, dc);
-    w_rect screen = bar->screen;
-    width = min(width, screen.w);
-    int height = min(screen.h, header + min(10, count - 1) * row_height + margin + 1);
-    const char *edge = bar->docked_edge ? bar->docked_edge : bar->config->edge;
-    int x = anchor.left < screen.x + screen.w / 2 ? anchor.left : anchor.right - width;
-    int y = anchor.bottom + margin;
-    if (!strcmp(edge, "bottom"))
-        y = anchor.top - height - margin;
-    if (!strcmp(edge, "left") || !strcmp(edge, "right")) {
-        x = !strcmp(edge, "left") ? anchor.right + margin : anchor.left - width - margin;
-        y = anchor.top;
-    }
-    x = w_clamp_int(x, screen.x, screen.x + screen.w - width);
-    y = w_clamp_int(y, screen.y, screen.y + screen.h - height);
+    int height = header + min(10, count - 1) * row_height + margin + 1;
+    RECT bounds = w_popup_bounds(&menu->anchor,w_popup_area(bar->hwnd),width,height,margin);
+    width = bounds.right - bounds.left;
+    height = bounds.bottom - bounds.top;
     HINSTANCE instance = GetModuleHandleW(NULL);
     WNDCLASSW wc = {.lpfnWndProc = w_flyout_proc,
                     .hInstance = instance,
@@ -416,12 +481,17 @@ static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count
     RegisterClassW(&wc);
     HWND popup =
         CreateWindowExW(WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW, wc.lpszClassName, rows[0].label,
-                        WS_POPUP | WS_CLIPCHILDREN, x, y, width, height, bar->hwnd, NULL, instance, menu);
+                        WS_POPUP | WS_CLIPCHILDREN, bounds.left, bounds.top, width, height, bar->hwnd, NULL, instance, menu);
     if (!popup) {
         free(menu);
         return;
     }
     menu->owns_memory = true;
+    int radius = w_scale(bar,min(12,bar->config->rounding));
+    if (radius) {
+        HRGN shape = CreateRoundRectRgn(0,0,width+1,height+1,2*radius,2*radius);
+        if (shape && !SetWindowRgn(popup,shape,FALSE)) DeleteObject(shape);
+    }
     menu->heading = CreateFontW(-w_scale(bar, 15), 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE, DEFAULT_CHARSET,
                                 OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, L"Segoe UI");
     menu->symbols = CreateFontW(-w_scale(bar,15),0,0,0,FW_NORMAL,FALSE,FALSE,FALSE,DEFAULT_CHARSET,
@@ -457,7 +527,7 @@ static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count
     menu->list = CreateWindowExW(0, L"LISTBOX", rows[0].label,
                                  WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_OWNERDRAWFIXED |
                                      LBS_HASSTRINGS | LBS_NOINTEGRALHEIGHT,
-                                 margin, header, width - 2 * margin, height - header - margin, popup, NULL,
+                                 margin, header, max(1,width - 2 * margin), max(1,height - header - margin), popup, NULL,
                                  instance, NULL);
     if (!menu->list || !SetWindowSubclass(menu->list, w_flyout_control, 1, (DWORD_PTR)menu)) {
         DestroyWindow(popup);
@@ -478,6 +548,7 @@ static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count
     }
     SendMessageW(menu->list, LB_SETCURSEL, selected, 0);
     open_menu = menu;
+    InvalidateRect(bar->hwnd,&bar->hits[hit].box,FALSE);
     w_bar_fade(popup,&menu->fade,255,bar->config->motion[motion_layers_in],bar->motion_allowed);
     ShowWindow(popup, SW_SHOW);
     SetForegroundWindow(popup);
@@ -514,12 +585,12 @@ void w_bar_menu_audio_changed(w_bar_window *b) {
 //~ Language selection
 
 HWND w_bar_input_target(void) {
-    HWND target = w_bar_menu_active() ? open_menu->previous : GetForegroundWindow();
+    HWND target = w_bar_remember_foreground();
     if (!target)
         return NULL;
     DWORD thread = GetWindowThreadProcessId(target, NULL);
     GUITHREADINFO gui = {.cbSize = sizeof(gui)};
-    if (GetGUIThreadInfo(thread, &gui) && gui.hwndFocus)
+    if (GetGUIThreadInfo(thread, &gui) && gui.hwndFocus && GetAncestor(gui.hwndFocus,GA_ROOT) == target)
         target = gui.hwndFocus;
     return target;
 }
@@ -613,11 +684,6 @@ bool w_bar_menu_open(w_bar_window *b, int hit) {
     const char *key = b->hits[hit].module;
     if (!strcmp(key, "keyboard")) {
         w_language_menu(b, hit);
-        return true;
-    }
-    if (!strcmp(key, "clock")) {
-        w_bar_menu_close(NULL, true);
-        b->invoke(b->output, "date_time");
         return true;
     }
     w_menu_row rows[9] = {0};

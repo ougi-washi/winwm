@@ -602,6 +602,8 @@ static void w_size_controls(bool update_font) {
     GetClientRect(window, &area);
     int width = MulDiv(area.right, 96, dpi);
     int dx = width - 544, dy = MulDiv(area.bottom, 96, dpi) - 344;
+    bool empty_bluetooth = page == page_bluetooth && SendMessageW(list,LB_GETCOUNT,0,0) == 0;
+    if (page == page_bluetooth) ShowWindow(list,empty_bluetooth ? SW_HIDE : SW_SHOWNA);
     bool wrap = width < 456 && page == page_display;
     int extra_row = wrap ? 38 : 0;
     for (size_t i = 0; i < position_count; ++i) {
@@ -616,6 +618,10 @@ static void w_size_controls(bool update_font) {
         if (c == refresh_sound || c == default_device || c == calls_device) OffsetRect(&r,dx,0);
         if (c == sound_slider && sound_view == sound_apps) r.right = width - 12;
         if (c == sound_tab) r.right += dx;
+        if (c == status && empty_bluetooth) {
+            r.top = max(12,(300 + dy) / 2 - 24);
+            r.bottom = max(r.top + 24,288 + dy);
+        }
         if (c == sound_tab && update_font)
             TabCtrl_SetItemSize(c,MulDiv(79,dpi,96),MulDiv(30,dpi,96));
         if (wrap && positions[i].logical.left >= 320)
@@ -762,7 +768,9 @@ int w_settings_run(const wchar_t *name) {
     MONITORINFO monitor = {.cbSize = sizeof(monitor)};
     UINT dpi = w_tool_work_area(&monitor);
     DWORD style = WS_CAPTION | WS_SYSMENU | WS_THICKFRAME | WS_MAXIMIZEBOX;
-    RECT bounds = {0, 0, MulDiv(544, dpi, 96), MulDiv(344, dpi, 96)};
+    bool radio_page = page == page_bluetooth || page == page_wifi || page == page_network;
+    bool compact = radio_page && w_tool_popup_monitor();
+    RECT bounds = {0, 0, MulDiv(compact ? 472 : 544, dpi, 96), MulDiv(compact ? 258 : 344, dpi, 96)};
     AdjustWindowRectExForDpi(&bounds, style, FALSE, WS_EX_TOOLWINDOW, dpi);
     int width = min(bounds.right - bounds.left, monitor.rcWork.right - monitor.rcWork.left);
     int height = min(bounds.bottom - bounds.top, monitor.rcWork.bottom - monitor.rcWork.top);
@@ -772,11 +780,12 @@ int w_settings_run(const wchar_t *name) {
                             width, height, NULL, NULL, inst, NULL);
     if (!window)
         return 1;
-    list = CreateWindowExW(page == page_audio ? 0 : WS_EX_CLIENTEDGE, L"LISTBOX", L"",
+    list = CreateWindowExW(page == page_audio || radio_page ? 0 : WS_EX_CLIENTEDGE, L"LISTBOX", L"",
                            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_HASSTRINGS |
                            LBS_OWNERDRAWFIXED | LBS_NOINTEGRALHEIGHT, 12, 10, 520, 238,
                            window, NULL, inst, NULL);
     status = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE, 12, 258, 520, 34, window, NULL, inst, NULL);
+    if (radio_page) MoveWindow(status,12,250,520,47,FALSE);
     const wchar_t *labels[] = {L"Mute / unmute", L"Connect", L"Device properties", L"Preview", L"Activate", L"Details"};
     apply = CreateWindowW(L"BUTTON", labels[page],
                           BS_OWNERDRAW | WS_CHILD | WS_TABSTOP | (page == page_network ? 0 : WS_VISIBLE),
@@ -836,20 +845,20 @@ int w_settings_run(const wchar_t *name) {
     if (page == page_power) w_power_create(window, list, status, apply);
     w_measure_controls();
     w_size_controls(true);
-    ShowWindow(window, SW_SHOW);
-    UpdateWindow(window);
-    if (page == page_audio) {
-        w_audio_open_view(sound_view);
-        SetTimer(window, 2, 1000, NULL);
+    if (w_tool_show(window)) {
+        UpdateWindow(window);
+        if (page == page_audio) {
+            w_audio_open_view(sound_view);
+            SetTimer(window, 2, 1000, NULL);
+        } else if (page == page_wifi || page == page_network)
+            w_open_network_page(page);
+        else if (page == page_bluetooth) {
+            w_bluetooth_open(window, list, status, apply, lower);
+            SendMessageW(list, LB_SETCURSEL, 0, 0);
+        }
+        w_selected();
+        SetFocus(IsWindowVisible(list) ? list : lower);
     }
-    else if (page == page_wifi || page == page_network)
-        w_open_network_page(page);
-    else if (page == page_bluetooth)
-        w_bluetooth_open(window, list, status, apply, lower);
-    if (page == page_bluetooth)
-        SendMessageW(list, LB_SETCURSEL, 0, 0);
-    w_selected();
-    SetFocus(list);
     MSG m;
     for (;;) {
         HANDLE inquiry = w_bluetooth_pending();
@@ -857,6 +866,7 @@ int w_settings_run(const wchar_t *name) {
             DWORD wait = MsgWaitForMultipleObjectsEx(1, &inquiry, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
             if (wait == WAIT_OBJECT_0) {
                 w_bluetooth_finish();
+                w_size_controls(false);
                 continue;
             }
             if (wait == WAIT_FAILED) break;
