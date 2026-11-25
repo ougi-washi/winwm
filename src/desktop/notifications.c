@@ -10,7 +10,7 @@
 static bool listening, banners, banner_ready, capture_healthy, explicitly_denied;
 static int profile_source = -1;
 static enum w_capture_source source;
-static enum w_notification_access access;
+static enum w_notification_access notification_access;
 static PTP_WORK publish_work;
 static HANDLE native_receipt;
 enum { publish_failed = -1, balloon_shown = 0, balloon_complete, native_submitted, native_complete };
@@ -101,9 +101,9 @@ static bool w_notice_work(HMONITOR monitor, RECT *bounds) {
 const char *w_desktop_notification_status(void) {
     if (source == notice_capture_off) return "disabled";
     if (source == notice_capture_visible) return banner_ready ? "visible banners" : "visible banners unavailable";
-    if (!listening || access == notification_unavailable) return "unavailable";
-    if (access == notification_denied) return "permission denied";
-    if (access == notification_unspecified) return "awaiting access";
+    if (!listening || notification_access == notification_unavailable) return "unavailable";
+    if (notification_access == notification_denied) return "permission denied";
+    if (notification_access == notification_unspecified) return "awaiting access";
     return capture_healthy ? "connected" : "temporarily unavailable";
 }
 
@@ -138,7 +138,7 @@ static void w_set_source(enum w_capture_source next) {
         w_notification_stop();
         listening = capture_healthy = false;
         explicitly_denied = false;
-        access = notification_unspecified;
+        notification_access = notification_unspecified;
     }
     if (next != notice_capture_visible && banners) {
         w_banners_stop();
@@ -209,10 +209,10 @@ void w_desktop_banner_receive(WPARAM status, LPARAM payload) {
 void w_desktop_notifications_receive(LPARAM payload) {
     w_notification_snapshot *batch = (w_notification_snapshot *)payload;
     if (!batch) return;
-    access = batch->access;
-    explicitly_denied = access == notification_denied && batch->error == E_ACCESSDENIED;
-    capture_healthy = access == notification_allowed && SUCCEEDED(batch->error);
-    switch (access) {
+    notification_access = batch->access;
+    explicitly_denied = notification_access == notification_denied && batch->error == E_ACCESSDENIED;
+    capture_healthy = notification_access == notification_allowed && SUCCEEDED(batch->error);
+    switch (notification_access) {
     case notification_allowed:
         w_notice_access(capture_healthy ? L"Windows notifications connected." :
                                           L"Windows notifications temporarily unavailable.",w_capture_options);
