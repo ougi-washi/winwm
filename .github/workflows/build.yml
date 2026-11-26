@@ -132,6 +132,10 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           name: winwm-windows-x64
@@ -140,5 +144,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" winwm.exe \
-            --repo "$GITHUB_REPOSITORY" --verify-tag --title "WinWM $GITHUB_REF_NAME" \
+            --verify-tag --title "WinWM $GITHUB_REF_NAME" \
             --notes-from-tag
