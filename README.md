@@ -31,18 +31,6 @@ Windows x64 · Tiling · Per-monitor workspaces · Tabs · Floating windows · A
 .\bin\winwm.exe --help
 ```
 
-Normal startup gives winwm the full monitor and reserves space for its configured bar. Once its input bindings and bars are ready, winwm closes the Windows Explorer shell and watches for it to return. Separately opened File Explorer folder windows can stay open. Exiting winwm restores the Windows desktop. Use `--preview` to run alongside Explorer and `winwm.exe doctor` to check the current shell and tray.
-
-**Windows Settings** opens winwm’s device and system controls. **Windows Update** shows recent history and checks for available updates. **Windows Security** shows protection status and firewall profiles, opens the firewall console, and can start a Microsoft Defender quick scan or update its security intelligence. These panels run without Explorer in a normal winwm session.
-
-## Architecture
-
-The desktop thread owns workspace selection, layout, and the focused window. The input thread matches shortcuts and queues commands. Native window events report visibility and activation back to the desktop thread. The portable model and layout code can run without a Windows SDK or a desktop session. Window placement, input delivery, and composition use Windows APIs.
-
-The input thread receives keyboard and pointer events through low-level hooks. Registering a raw keyboard input sink in the same process can suppress those hook callbacks when a winwm window takes focus, including on an empty workspace.
-
-Production modules have explicit dependency levels in `tools/check_includes.py`. CI checks project includes, compiles the portable core on Linux, and checks references in the Windows object files. To run the full dependency check locally after a build, use `python tools/check_includes.py src build/obj` with MinGW’s `nm` on the path.
-
 ## Config
 
 `~/.config/winwm/winwm.lua`
