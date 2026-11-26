@@ -62,11 +62,13 @@ jobs:
         shell: pwsh
         run: |
           $env:USERPROFILE = "$env:RUNNER_TEMP/winwm-profile"
+          $env:LOCALAPPDATA = (New-Item -ItemType Directory -Force "$env:USERPROFILE/AppData/Local").FullName
+          $env:TEMP = $env:TMP = (New-Item -ItemType Directory -Force "$env:LOCALAPPDATA/Temp").FullName
           $exe = (Resolve-Path bin/winwm.exe).Path
           $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
           function Run-Setup($binary, $verb) {
-            $result = Start-Process $binary -ArgumentList $verb -PassThru -Wait -WindowStyle Hidden
-            if ($result.ExitCode) { throw "$verb failed ($($result.ExitCode))" }
+            & $binary $verb | Out-Host
+            if ($LASTEXITCODE) { throw "$binary $verb failed ($LASTEXITCODE)" }
           }
           Run-Setup $exe install
           try {
