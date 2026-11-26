@@ -267,15 +267,19 @@ static int w_match_tier(const wchar_t *text, const wchar_t *query, const w_query
         }
     }
     if (count > 1) {
-        bool used[palette_text_capacity] = {0};
+        const wchar_t *used[(palette_text_capacity+1)/2];
         int i;
         for (i = 0; i < count; i++) {
             const wchar_t *p = wcschr(text,*words[i].start);
-            while (p && (used[p - text] || !w_word_start(text,p) || wcsncmp(p,words[i].start,words[i].length)))
+            while (p) {
+                int j=0;
+                while (j<i && used[j]!=p) ++j;
+                if (j==i && w_word_start(text,p) && !wcsncmp(p,words[i].start,words[i].length)) break;
                 p = wcschr(p+1,*words[i].start);
+            }
             if (!p)
                 break;
-            used[p - text] = true;
+            used[i] = p;
         }
         if (i == count)
             return 3;
@@ -305,6 +309,19 @@ static int w_match_tier(const wchar_t *text, const wchar_t *query, const w_query
     return *fuzzy ? -1 : 6;
 }
 
+static int w_keyword_match(const wchar_t *text, const wchar_t *query, const w_query_word *words,
+                           int count, int *cost) {
+    // Exact keywords outrank partial labels. Windows supplies keywords in no relevance order.
+    size_t len=wcslen(query);
+    bool prefix=false;
+    for (const wchar_t *p=wcsstr(text,query); p; p=wcsstr(p+1,query)) {
+        if (!w_word_start(text,p)) continue;
+        if (!p[len] || !IsCharAlphaNumericW(p[len])) return 0;
+        prefix=true;
+    }
+    if (prefix) return 1;
+    return w_match_tier(text,query,words,count,cost);
+}
 
 static const wchar_t *w_label(int source) {
     if (source == command_prompt) return L"Run a command…";
@@ -414,7 +431,7 @@ static void w_search_results(void) {
                     }
                 }
                 if (tier != 0 && r->entry.keywords) {
-                    int extra=0, match=w_match_tier(r->entry.keywords,query,words,word_count,&extra);
+                    int extra=0, match=w_keyword_match(r->entry.keywords,query,words,word_count,&extra);
                     if (match>=0 && (tier<0 || match<tier)) { tier=match; cost=extra+2*palette_text_capacity; }
                 }
                 if (!tier && !*r->alias && r->entry.group==palette_apps) --cost;
@@ -984,9 +1001,10 @@ static bool w_cache(const w_palette_entry *entries, int count, const w_palette_a
         grouped |= r->entry.group != palette_flat;
         if (!same_label) w_search_text(r->normalized, r->entry.label);
         r->alias[0] = 0;
-        if (r->entry.command_name) {
+        if (r->entry.alias) {
             wchar_t alias[palette_text_capacity];
-            if (w_os_wide(r->entry.command_name,alias,count_of(alias))) w_search_text(r->alias,alias);
+            lstrcpynW(alias,r->entry.alias,count_of(alias));
+            w_search_text(r->alias,alias);
         }
     }
     row_count = total;

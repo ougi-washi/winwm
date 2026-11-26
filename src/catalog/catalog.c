@@ -1,5 +1,6 @@
 #define COBJMACROS
 #include "catalog/catalog.h"
+#include "catalog/metadata.h"
 #include <shlobj.h>
 #include <shellapi.h>
 #include <shobjidl.h>
@@ -12,9 +13,11 @@
 //~ Catalog
 
 typedef struct w_catalog_row {
-    wchar_t *name;
-    const wchar_t *target; // Stored after name in the same allocation.
+    const wchar_t *name, *target, *label, *keywords; // One allocation, starting at name.
+    PIDLIST_ABSOLUTE task;
     uint64_t identity;
+    FILETIME modified;
+    uint64_t file_size;
     bool packaged;
     unsigned path_order; // Nonzero for command aliases, in PATH and extension order.
     int icon, variant;
@@ -46,9 +49,14 @@ static w_catalog_state *w_new_catalog(void) {
     return c;
 }
 
+static void w_free_row(w_catalog_row *row) {
+    free((void *)row->name);
+    CoTaskMemFree(row->task);
+}
+
 void w_catalog_release(w_catalog_state *c) {
     if (c && InterlockedDecrement(&c->refs) == 0) {
-        for (int i = 0; i < c->count; ++i) free(c->rows[i].name);
+        for (int i = 0; i < c->count; ++i) w_free_row(&c->rows[i]);
         free(c->rows);
         free(c);
     }
@@ -62,8 +70,7 @@ w_catalog_state *w_catalog_acquire(void) {
     return c;
 }
 
-static void w_append(w_catalog_state *c, const wchar_t *name, const wchar_t *target, bool packaged,
-                     LPCWSTR icon_path, UINT flags) {
+static void w_append(w_catalog_state *c, w_catalog_row row) {
     if (c->count == c->capacity) {
         int capacity = c->capacity ? c->capacity * 2 : 64;
         w_catalog_row *next = realloc(c->rows, (size_t)capacity * sizeof(*next));
@@ -71,64 +78,75 @@ static void w_append(w_catalog_state *c, const wchar_t *name, const wchar_t *tar
         c->rows = next;
         c->capacity = capacity;
     }
-    SHFILEINFOW info = {0};
-    int icon = 0;
-    if (icon_path) {
-        HANDLE list = (HANDLE)SHGetFileInfoW(icon_path, 0, &info, sizeof(info),
-                              SHGFI_SYSICONINDEX | SHGFI_SMALLICON | flags);
-        if (list) {
-            c->images = list;
-            icon = info.iIcon + 1;
-            if ((flags & SHGFI_DISPLAYNAME) && *info.szDisplayName)
-                name = info.szDisplayName;
-        }
-    }
-    size_t names = wcslen(name)+1, chars = names+wcslen(target)+1;
-    wchar_t *strings = malloc(chars*sizeof(*strings));
+    if (!row.keywords) row.keywords=L"";
+    if (!row.label) row.label=row.name;
+    size_t names=wcslen(row.name)+1, targets=wcslen(row.target)+1, labels=wcslen(row.label)+1;
+    wchar_t *strings=malloc((names+targets+labels+wcslen(row.keywords)+1)*sizeof(*strings));
     if (!strings) { c->failed = true; return; }
-    memcpy(strings,name,names*sizeof(*strings));
-    wcscpy(strings+names,target);
-    uint64_t hash = UINT64_C(14695981039346656037) ^ packaged;
-    for (size_t i = 0; i < chars; ++i)
+    if (row.task && !(row.task=ILCloneFull(row.task))) { free(strings); c->failed=true; return; }
+    row.name=wcscpy(strings,row.name);
+    row.target=wcscpy(strings+names,row.target);
+    row.label=wcscpy(strings+names+targets,row.label);
+    row.keywords=wcscpy(strings+names+targets+labels,row.keywords);
+    uint64_t hash = UINT64_C(14695981039346656037) ^ (row.task ? 2 : row.packaged);
+    for (size_t i = 0; i < names+targets; ++i)
         hash = (hash ^ (uint16_t)strings[i]) * UINT64_C(1099511628211);
-    c->rows[c->count++] = (w_catalog_row){.name=strings,.target=strings+names,.packaged=packaged,
-                                           .identity=hash ? hash : 1,.icon=icon};
+    row.identity=hash ? hash : 1;
+    row.variant=0;
+    c->rows[c->count++]=row;
+}
+
+static void w_add_shell_item(w_catalog_state *c, IShellItem2 *item, w_catalog_row row, LPCWSTR icon_path, UINT flags) {
+    SHFILEINFOW info={0};
+    HANDLE list=icon_path ? (HANDLE)SHGetFileInfoW(icon_path,0,&info,sizeof(info),
+                                    SHGFI_SYSICONINDEX|SHGFI_SMALLICON|flags) : NULL;
+    if (list) { c->images=list; row.icon=info.iIcon+1; }
+    if (*info.szDisplayName && (flags & SHGFI_DISPLAYNAME)) row.name=info.szDisplayName;
+    w_catalog_metadata meta={0};
+    if (item) w_catalog_shell_metadata(item,row.packaged ? row.target : NULL,row.task!=NULL,&meta);
+    wchar_t label[catalog_label_cap];
+    w_catalog_caption(label,count_of(label),row.name,meta.process);
+    row.label=label;
+    row.keywords=meta.keywords;
+    w_append(c,row);
 }
 
 static int w_compare_apps(const void *a, const void *b) {
     const w_catalog_row *x = a, *y = b;
     int order = _wcsicmp(x->name, y->name);
+    if (!order && !!x->task != !!y->task) return x->task ? 1 : -1;
     if (!order && x->path_order != y->path_order) return x->path_order < y->path_order ? -1 : 1;
     if (!order) order = (int)x->packaged - (int)y->packaged;
     return order ? order : _wcsicmp(x->target, y->target);
 }
 
+static int w_compare_captions(const void *a, const void *b) {
+    const w_catalog_row *x=a, *y=b;
+    int order=_wcsicmp(x->label,y->label);
+    return order ? order : w_compare_apps(a,b);
+}
+
 static void w_sort_apps(w_catalog_state *c) {
     if (c->count < 2) return;
-    // Snapshots written by this version are already in menu order.
-    for (int i = 1; i < c->count; ++i) {
-        if (w_compare_apps(&c->rows[i-1],&c->rows[i]) > 0) {
-            qsort(c->rows, c->count, sizeof(*c->rows), w_compare_apps);
-            break;
-        }
-    }
-    int unique = 1, first = 0;
+    // Resolve command shadowing by the original alias before sorting the visible captions.
+    qsort(c->rows,c->count,sizeof(*c->rows),w_compare_apps);
+    int unique = 1;
     for (int i = 1; i < c->count; ++i) {
         if ((!_wcsicmp(c->rows[unique-1].name,c->rows[i].name) && c->rows[i].path_order) ||
             !w_compare_apps(&c->rows[unique-1], &c->rows[i])) {
             if (!c->rows[unique-1].icon) c->rows[unique-1].icon = c->rows[i].icon;
-            free(c->rows[i].name);
+            w_free_row(&c->rows[i]);
             continue;
         }
         if (unique != i) c->rows[unique] = c->rows[i];
-        if (_wcsicmp(c->rows[first].name, c->rows[unique].name)) first = unique;
-        else {
-            c->rows[first].variant = 1;
-            c->rows[unique].variant = unique-first+1;
-        }
         ++unique;
     }
     c->count = unique;
+    qsort(c->rows,c->count,sizeof(*c->rows),w_compare_captions);
+    for (int i=1, first=0; i<c->count; ++i) {
+        if (_wcsicmp(c->rows[first].label,c->rows[i].label)) first=i;
+        else { c->rows[first].variant=1; c->rows[i].variant=i-first+1; }
+    }
 }
 
 static bool w_walk(w_catalog_state *c, const wchar_t *folder, int depth) {
@@ -161,18 +179,23 @@ static bool w_walk(w_catalog_state *c, const wchar_t *folder, int depth) {
         // Preserve the shortcut itself. Its destination can be a shell item,
         // a registered document, a packaged app or an executable with arguments.
         *ext = 0;
-        w_append(c, f.cFileName, path, false, path, SHGFI_DISPLAYNAME);
+        IShellItem2 *item=NULL;
+        SHCreateItemFromParsingName(path,NULL,&IID_IShellItem2,(void **)&item);
+        w_add_shell_item(c,item,(w_catalog_row){.name=f.cFileName,.target=path},path,SHGFI_DISPLAYNAME);
+        if (item) IShellItem2_Release(item);
     } while (!c->failed && FindNextFileW(listing, &f));
     if (c->failed || GetLastError() != ERROR_NO_MORE_FILES) complete = false;
     FindClose(listing);
     return complete;
 }
 
-static bool w_packaged_items(w_catalog_state *c) {
+static bool w_shell_items(w_catalog_state *c, bool tasks) {
     IShellItem *apps = NULL;
     IEnumShellItems *all = NULL;
-    if (SUCCEEDED(SHGetKnownFolderItem(&FOLDERID_AppsFolder, KF_FLAG_DEFAULT, NULL, &IID_IShellItem,
-                                       (void **)&apps))) {
+    HRESULT opened=tasks ? SHCreateItemFromParsingName(L"shell:::{ED7BA470-8E54-465E-825C-99712043E01C}",
+                                   NULL,&IID_IShellItem,(void **)&apps) :
+                           SHGetKnownFolderItem(&FOLDERID_AppsFolder,KF_FLAG_DEFAULT,NULL,&IID_IShellItem,(void **)&apps);
+    if (SUCCEEDED(opened)) {
         IShellItem_BindToHandler(apps, NULL, &BHID_EnumItems, &IID_IEnumShellItems, (void **)&all);
         IShellItem_Release(apps);
     }
@@ -184,12 +207,15 @@ static bool w_packaged_items(w_catalog_state *c) {
         IShellItem2 *details = NULL;
         PWSTR id = NULL, name = NULL;
         if (SUCCEEDED(IShellItem_QueryInterface(item, &IID_IShellItem2, (void **)&details)) &&
-            SUCCEEDED(IShellItem2_GetString(details, &PKEY_AppUserModel_ID, &id)) && id && wcschr(id, L'!') &&
+            (tasks ? SUCCEEDED(IShellItem_GetDisplayName(item,SIGDN_DESKTOPABSOLUTEPARSING,&id)) :
+                     SUCCEEDED(IShellItem2_GetString(details,&PKEY_AppUserModel_ID,&id)) && id && wcschr(id,L'!')) &&
+            id && *id &&
             SUCCEEDED(IShellItem_GetDisplayName(item, SIGDN_NORMALDISPLAY, &name)) && name &&
             *name && wcslen(id) < os_path_cap && wcslen(name) < MAX_PATH) {
             PIDLIST_ABSOLUTE pidl = NULL;
             SHGetIDListFromObject((IUnknown *)item, &pidl);
-            w_append(c, name, id, true, (LPCWSTR)pidl, SHGFI_PIDL);
+            if (!tasks || pidl) w_add_shell_item(c,details,(w_catalog_row){.name=name,.target=id,
+                .packaged=!tasks,.task=tasks ? pidl : NULL},(LPCWSTR)pidl,SHGFI_PIDL);
             CoTaskMemFree(pidl);
         }
         CoTaskMemFree(id);
@@ -202,30 +228,33 @@ static bool w_packaged_items(w_catalog_state *c) {
     return hr == S_FALSE;
 }
 
-enum { cache_v2 = 0x4e444132, cache_limit = 65536 };
+enum { cache_v3 = 0x4e444133, cache_limit = 65536 };
+
+static bool w_read_string(FILE *f, wchar_t *out, size_t cap, uint16_t len) {
+    if (len>=cap || fread(out,sizeof(*out),len,f)!=len || wmemchr(out,0,len)) return false;
+    out[len]=0;
+    return true;
+}
 
 static w_catalog_state *w_read_cache(const wchar_t *path) {
     FILE *f = _wfopen(path,L"rb");
     if (!f) return NULL;
     uint32_t header[3];
     w_catalog_state *c = NULL;
-    if (fread(header,sizeof(header),1,f)==1 && header[0]==cache_v2 && !header[1] && header[2]<=cache_limit) {
+    if (fread(header,sizeof(header),1,f)==1 && header[0]==cache_v3 && !header[1] && header[2]<=cache_limit) {
         c=w_new_catalog();
         if (c) {
             for (unsigned i=0;i<header[2] && !c->failed;++i) {
                 wchar_t name[MAX_PATH], target[os_path_cap];
-                uint16_t lengths[3];
-                if (fread(lengths,sizeof(lengths),1,f)!=1 || lengths[2]>1 ||
-                    !lengths[0] || lengths[0]>=count_of(name) || !lengths[1] || lengths[1]>=count_of(target) ||
-                    fread(name,sizeof(wchar_t),lengths[0],f)!=lengths[0] ||
-                    fread(target,sizeof(wchar_t),lengths[1],f)!=lengths[1] ||
-                    wmemchr(name,0,lengths[0]) || wmemchr(target,0,lengths[1])) {
+                wchar_t label[catalog_label_cap], keywords[catalog_keywords_cap];
+                uint16_t lengths[5];
+                if (fread(lengths,sizeof(lengths),1,f)!=1 || lengths[4]>1 || !lengths[0] || !lengths[1] || !lengths[2] ||
+                    !w_read_string(f,name,count_of(name),lengths[0]) || !w_read_string(f,target,count_of(target),lengths[1]) ||
+                    !w_read_string(f,label,count_of(label),lengths[2]) || !w_read_string(f,keywords,count_of(keywords),lengths[3])) {
                     c->failed=true;
                     break;
                 }
-                name[lengths[0]]=0;
-                target[lengths[1]]=0;
-                w_append(c,name,target,lengths[2]!=0,NULL,0);
+                w_append(c,(w_catalog_row){.name=name,.target=target,.label=label,.keywords=keywords,.packaged=lengths[4]!=0});
             }
             if (c->failed || fgetc(f)!=EOF || ferror(f)) {
                 w_catalog_release(c);
@@ -251,14 +280,17 @@ static bool w_save_cache(const wchar_t *path, const w_catalog_state *c) {
     swprintf(tmp, count_of(tmp), L"%ls.%lu.tmp", path, GetCurrentProcessId());
     FILE *f = _wfopen(tmp, L"wb");
     if (!f) return false;
-    uint32_t header[] = {cache_v2, 0, (uint32_t)c->count};
+    uint32_t header[] = {cache_v3, 0, (uint32_t)c->count};
     bool ok = fwrite(header, sizeof(header), 1, f) == 1;
     for (int i = 0; ok && i < c->count; ++i) {
         const w_catalog_row *row = &c->rows[i];
-        uint16_t sizes[] = {(uint16_t)wcslen(row->name),(uint16_t)wcslen(row->target),row->packaged};
+        uint16_t sizes[] = {(uint16_t)wcslen(row->name),(uint16_t)wcslen(row->target),
+                            (uint16_t)wcslen(row->label),(uint16_t)wcslen(row->keywords),row->packaged};
         ok = fwrite(sizes,sizeof(sizes),1,f) == 1 &&
              fwrite(row->name,sizeof(wchar_t),sizes[0],f) == sizes[0] &&
-             fwrite(row->target,sizeof(wchar_t),sizes[1],f) == sizes[1];
+             fwrite(row->target,sizeof(wchar_t),sizes[1],f) == sizes[1] &&
+             fwrite(row->label,sizeof(wchar_t),sizes[2],f) == sizes[2] &&
+             fwrite(row->keywords,sizeof(wchar_t),sizes[3],f) == sizes[3];
     }
     if (fclose(f) != 0 || !ok || !MoveFileExW(tmp, path, MOVEFILE_REPLACE_EXISTING)) {
         DeleteFileW(tmp);
@@ -276,8 +308,7 @@ static void w_keep_missing_sources(w_catalog_state *next, const w_catalog_state 
     for (int i = 0; i < current->count && !next->failed; i++) {
         const w_catalog_row *old = &current->rows[i];
         if (old->packaged ? packaged_complete : shortcuts_complete) continue;
-        w_append(next, old->name,old->target,old->packaged,NULL,0);
-        if (!next->failed) next->rows[next->count-1].icon = old->icon;
+        w_append(next,*old);
     }
     if (!next->images) next->images = current->images;
 }
@@ -298,7 +329,7 @@ typedef struct {
     w_catalog_watch *watches;
     unsigned outstanding;
     int retry;
-    w_catalog_state *shell, *commands;
+    w_catalog_state *shell, *tasks, *commands;
     wchar_t cache[os_path_cap];
     wchar_t extensions[32768];
 } w_index;
@@ -306,7 +337,7 @@ typedef struct {
 static bool w_watch_read(w_catalog_watch *watch) {
     ZeroMemory(&watch->request,sizeof(watch->request));
     return ReadDirectoryChangesW(watch->dir,watch->data,sizeof(watch->data),watch->recursive,
-        (*watch->child ? FILE_NOTIFY_CHANGE_DIR_NAME : FILE_NOTIFY_CHANGE_FILE_NAME) |
+        (*watch->child ? FILE_NOTIFY_CHANGE_DIR_NAME : FILE_NOTIFY_CHANGE_FILE_NAME|FILE_NOTIFY_CHANGE_LAST_WRITE) |
         (watch->recursive ? FILE_NOTIFY_CHANGE_DIR_NAME : 0),NULL,&watch->request,NULL) != FALSE;
 }
 
@@ -389,12 +420,7 @@ static void w_sweep_watches(w_index *index, int source) {
 static void w_copy_rows(w_catalog_state *next,const w_catalog_state *source) {
     if (!source) return;
     for (int i=0;i<source->count && !next->failed;++i) {
-        const w_catalog_row *r=&source->rows[i];
-        w_append(next,r->name,r->target,r->packaged,NULL,0);
-        if (!next->failed) {
-            next->rows[next->count-1].icon=r->icon;
-            next->rows[next->count-1].path_order=r->path_order;
-        }
+        w_append(next,source->rows[i]);
     }
     if (!next->images) next->images=source->images;
 }
@@ -404,7 +430,8 @@ static bool w_same_rows(const w_catalog_state *a,const w_catalog_state *b,bool i
     for (int i=0;i<a->count;++i) {
         const w_catalog_row *old=&a->rows[i], *row=&b->rows[i];
         if (old->identity!=row->identity || (icons && old->icon!=row->icon) ||
-            wcscmp(old->target,row->target) || wcscmp(old->name,row->name)) return false;
+            wcscmp(old->target,row->target) || wcscmp(old->name,row->name) ||
+            wcscmp(old->label,row->label) || wcscmp(old->keywords,row->keywords)) return false;
     }
     return true;
 }
@@ -414,6 +441,7 @@ static void w_update_menu(w_index *index) {
     if (!next) return;
     w_copy_rows(next,index->shell);
     w_copy_rows(next,index->commands);
+    w_copy_rows(next,index->tasks);
     if (!next->failed) {
         w_sort_apps(next);
         w_catalog_state *old=w_catalog_acquire();
@@ -437,7 +465,7 @@ static void w_scan_shell(w_index *index) {
             CoTaskMemFree(path);
         } else shortcuts=false;
     }
-    bool packaged=w_packaged_items(next);
+    bool packaged=w_shell_items(next,false);
     if (!shortcuts || !packaged) index->retry |= index_shell;
     w_keep_missing_sources(next,index->shell,shortcuts,packaged);
     if (next->failed) { w_catalog_release(next); return; }
@@ -447,6 +475,22 @@ static void w_scan_shell(w_index *index) {
         next->persisted=w_save_cache(index->cache,next);
     w_catalog_release(index->shell);
     index->shell=next;
+
+    // Task parsing names identify rows, but some cannot be parsed back into actionable
+    // Shell items. Keep the original PIDLs in the live snapshot, out of the disk cache.
+    next=w_new_catalog();
+    if (!next) return;
+    if (w_shell_items(next,true) && !next->failed) {
+        w_catalog_release(index->tasks);
+        index->tasks=next;
+    } else {
+        w_catalog_release(next);
+        index->retry |= index_shell;
+    }
+}
+
+static int w_compare_paths(const void *left, const void *right) {
+    return _wcsicmp(((const w_catalog_row *)left)->target,((const w_catalog_row *)right)->target);
 }
 
 static void w_scan_directory(w_index *index,w_catalog_state *next,const wchar_t *dir,
@@ -468,9 +512,23 @@ static void w_scan_directory(w_index *index,w_catalog_state *next,const wchar_t 
             if (!ext || suffix==file.cFileName || (file.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ||
                 prefix+wcslen(file.cFileName)>=count_of(path)) continue;
             wcscpy(path+prefix,file.cFileName);
+            wchar_t description[catalog_label_cap]=L"", label[catalog_label_cap];
+            w_catalog_row row={.target=path,.path_order=order+(unsigned)ext,.modified=file.ftLastWriteTime,
+                               .file_size=((uint64_t)file.nFileSizeHigh<<32)|file.nFileSizeLow};
+            const w_catalog_row *old=index->commands && index->commands->count ?
+                bsearch(&row,index->commands->rows,index->commands->count,sizeof(row),w_compare_paths) : NULL;
+            if (old && !CompareFileTime(&old->modified,&row.modified) && old->file_size==row.file_size) {
+                row.label=old->label;
+            } else if (!(file.dwFileAttributes & (FILE_ATTRIBUTE_OFFLINE|FILE_ATTRIBUTE_REPARSE_POINT))) {
+                w_catalog_file_description(path,description,count_of(description));
+                if (*description) {
+                    w_catalog_caption(label,count_of(label),description,file.cFileName);
+                    row.label=label;
+                }
+            }
             file.cFileName[suffix-file.cFileName]=0;
-            w_append(next,file.cFileName,path,false,NULL,0);
-            if (!next->failed) next->rows[next->count-1].path_order=order+(unsigned)ext;
+            row.name=file.cFileName;
+            w_append(next,row);
         } while (!next->failed && FindNextFileW(list,&file));
         err=GetLastError();
         FindClose(list);
@@ -484,8 +542,9 @@ static void w_scan_directory(w_index *index,w_catalog_state *next,const wchar_t 
         const wchar_t *suffix=wcsrchr(r->target,L'.');
         int ext=suffix ? w_os_extension_order(suffix,extensions) : 0;
         if (!ext) continue;
-        w_append(next,r->name,r->target,false,NULL,0);
-        if (!next->failed) next->rows[next->count-1].path_order=order+(unsigned)ext;
+        w_catalog_row row=*r;
+        row.path_order=order+(unsigned)ext;
+        w_append(next,row);
     }
 }
 
@@ -525,6 +584,7 @@ static void w_scan_commands(w_index *index) {
     for (unsigned i=0;i<dirs;++i) free(seen[i]);
     free(seen);
     if (next->failed) { w_catalog_release(next); return; }
+    if (next->count>1) qsort(next->rows,next->count,sizeof(*next->rows),w_compare_paths);
     w_catalog_release(index->commands);
     index->commands=next;
 }
@@ -642,7 +702,7 @@ static DWORD WINAPI w_index_worker(void *unused) {
     w_index index={.port=changed};
     HRESULT apartment=CoInitializeEx(NULL,COINIT_APARTMENTTHREADED);
     ULONG shell_watch=0;
-    if (w_os_data_path(index.cache,count_of(index.cache),L"apps.v2.bin",true)) {
+    if (w_os_data_path(index.cache,count_of(index.cache),L"apps.v3.bin",true)) {
         index.shell=w_read_cache(index.cache);
         if (index.shell) w_update_menu(&index);
     }
@@ -688,6 +748,7 @@ static DWORD WINAPI w_index_worker(void *unused) {
         w_receive_change(&index,INFINITE,&received);
     }
     w_catalog_release(index.shell);
+    w_catalog_release(index.tasks);
     w_catalog_release(index.commands);
     if (SUCCEEDED(apartment)) CoUninitialize();
     AcquireSRWLockExclusive(&catalog_lock);
@@ -741,18 +802,19 @@ HANDLE w_catalog_images(const w_catalog_state *c) {
     return c ? c->images : NULL;
 }
 
-void w_catalog_label(const w_catalog_state *c, int i, wchar_t *out, int cap, int *icon) {
+w_catalog_info w_catalog_label(const w_catalog_state *c, int i, wchar_t *out, int cap) {
     const w_catalog_row *r = &c->rows[i];
-    *icon = r->icon;
-    if (!r->variant) lstrcpynW(out, r->name, cap);
+    if (!r->variant) lstrcpynW(out, r->label, cap);
     else {
         const wchar_t *file = wcsrchr(r->target, L'\\');
-        swprintf(out, cap, L"%.150ls  ·  %.80ls (%d)", r->name, file ? file+1 : r->target, r->variant);
+        swprintf(out, cap, L"%.150ls  ·  %.80ls (%d)", r->label, file ? file+1 : r->target, r->variant);
     }
+    return (w_catalog_info){r->name,*r->keywords ? r->keywords : NULL,r->icon,r->task!=NULL};
 }
 
 typedef struct w_catalog_launch_job {
     bool admin, packaged;
+    PIDLIST_ABSOLUTE task;
     wchar_t target[];
 } w_catalog_launch_job;
 
@@ -760,13 +822,16 @@ static DWORD WINAPI w_launch_entry(void *ptr) {
     w_catalog_launch_job *job = ptr;
     bool launched = false;
     DWORD error = ERROR_SUCCESS;
-    if (job->admin && job->packaged) {
+    if (job->task || (job->admin && job->packaged)) {
         HRESULT apartment = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
         wchar_t name[os_path_cap + 32];
-        PIDLIST_ABSOLUTE item = NULL;
-        swprintf(name, count_of(name), L"shell:AppsFolder\\%ls", job->target);
-        if (SUCCEEDED(SHParseDisplayName(name, NULL, &item, 0, NULL))) {
-            SHELLEXECUTEINFOW info = {.cbSize=sizeof(info), .lpIDList=item, .lpVerb=L"runas",
+        PIDLIST_ABSOLUTE item = job->task;
+        if (!item) {
+            swprintf(name, count_of(name), L"shell:AppsFolder\\%ls", job->target);
+            SHParseDisplayName(name, NULL, &item, 0, NULL);
+        }
+        if (item) {
+            SHELLEXECUTEINFOW info = {.cbSize=sizeof(info), .lpIDList=item, .lpVerb=job->admin ? L"runas" : NULL,
                 .fMask=SEE_MASK_INVOKEIDLIST | SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI, .nShow=SW_SHOWNORMAL};
             launched = ShellExecuteExW(&info) != FALSE;
             if (!launched) error = GetLastError();
@@ -802,10 +867,13 @@ bool w_catalog_launch_item(const w_catalog_state *c, int index, bool admin) {
     if (!entry)
         return false;
     entry->packaged = row->packaged;
+    entry->task = row->task ? ILCloneFull(row->task) : NULL;
+    if (row->task && !entry->task) { free(entry); return false; }
     memcpy(entry->target,row->target,size);
     entry->admin = admin;
     if (QueueUserWorkItem(w_launch_entry, entry, WT_EXECUTEDEFAULT))
         return true;
+    CoTaskMemFree(entry->task);
     free(entry);
     return false;
 }
@@ -815,14 +883,11 @@ bool w_catalog_launch(const char *name, bool admin) {
     if (!w_os_wide(name, wide, count_of(wide))) return false;
     w_catalog_state *c = w_catalog_acquire();
     bool ok = false;
-    int first = 0, end = w_catalog_count(c);
-    while (first < end) {
-        int mid = first+(end-first)/2;
-        if (_wcsicmp(c->rows[mid].name,wide) < 0) first=mid+1;
-        else end=mid;
+    int best=-1;
+    for (int i=0; i<w_catalog_count(c); ++i) {
+        if (!_wcsicmp(c->rows[i].name,wide) && (best<0 || w_compare_apps(&c->rows[i],&c->rows[best])<0)) best=i;
     }
-    if (first < w_catalog_count(c) && !_wcsicmp(c->rows[first].name,wide))
-        ok = w_catalog_launch_item(c,first,admin);
+    if (best>=0) ok=w_catalog_launch_item(c,best,admin);
     w_catalog_release(c);
     return ok;
 }

@@ -17,8 +17,8 @@ typedef struct w_palette_entry {
     int id;
     enum w_palette_group group;
     wchar_t glyph;
-    const char *command_name;
-    const wchar_t *keywords; // Normalized search terms for built-in actions; static lifetime.
+    const wchar_t *alias;
+    const wchar_t *keywords; // Lowercase search terms, valid while the entries are displayed.
     int system_icon; // One-based index in the shell's small icon image list, or zero.
     uint64_t identity;
     bool can_run_admin;

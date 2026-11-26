@@ -23,6 +23,7 @@ src/win_platform/layer.c
 src/win_platform/material.c
 src/base/json.c
 src/catalog/catalog.c
+src/catalog/metadata.c
 src/command/command.c
 src/config/config.c
 src/lua_config/lua_config.c
@@ -107,6 +108,8 @@ src/win_platform/win_platform.c
 -lshell32
 -lrstrtmgr
 -lshlwapi
+-lxmllite
+-lversion
 -luuid
 -lpowrprof
 -lpdh

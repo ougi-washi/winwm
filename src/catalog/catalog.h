@@ -14,6 +14,12 @@ void w_catalog_release(w_catalog_state *snapshot);
 int w_catalog_count(const w_catalog_state *snapshot);
 uint64_t w_catalog_identity(const w_catalog_state *snapshot, int index);
 HANDLE w_catalog_images(const w_catalog_state *snapshot);
-void w_catalog_label(const w_catalog_state *snapshot, int index, wchar_t *label, int cap, int *icon);
+typedef struct {
+    const wchar_t *name, *keywords;
+    int icon;
+    bool task;
+} w_catalog_info;
+w_catalog_info w_catalog_label(const w_catalog_state *snapshot, int index, wchar_t *label, int cap);
+void w_catalog_program_caption(wchar_t *out, int cap, const wchar_t *name, const char *program, bool command_line);
 bool w_catalog_launch_item(const w_catalog_state *snapshot, int index, bool admin);
 bool w_catalog_launch(const char *name, bool admin);

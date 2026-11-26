@@ -4,7 +4,7 @@
 
 static wchar_t clip_rows[count_of(desk.clips)][count_of(desk.clips[0])];
 static w_catalog_state *snapshot;
-static char aliases[window_limit][128];
+static wchar_t aliases[window_limit][128];
 static enum w_palette_group group;
 static w_palette_entry entries[window_limit];
 static w_command actions[window_limit];
@@ -82,13 +82,15 @@ static void w_add_row(const wchar_t *label, const char *action, w_window_id targ
     row_output[n] = -1;
     entries[n] = (w_palette_entry){.id = n, .group = group, .glyph = command_glyphs[command.kind]};
     entries[n].can_run_admin = w_desktop_can_run_admin(command.kind);
-    wcsncpy(entries[n].label, label, 255);
+    if (group!=palette_flat && command.kind==cmd_program)
+        w_catalog_program_caption(entries[n].label,count_of(entries[n].label),label,command.arg,true);
+    else wcsncpy(entries[n].label, label, 255);
     entries[n].label[255] = 0;
     if (IS_HIGH_SURROGATE(entries[n].label[254])) entries[n].label[254] = 0;
     actions[n] = command;
     if (action && group != palette_flat &&
-        w_str_copy(aliases[n], sizeof(aliases[n]), action))
-        entries[n].command_name = aliases[n];
+        w_os_wide(action,aliases[n],count_of(aliases[n])))
+        entries[n].alias = aliases[n];
     targets[n] = target;
 }
 
@@ -346,7 +348,11 @@ static void w_menu_actions(bool run) {
     for (int i = 0; i < desk.config.app_count; ++i) {
         char command[160];
         snprintf(command,sizeof(command),"launch %s",desk.config.apps[i].name);
+        int previous=row_count;
         w_action_row(desk.config.apps[i].name,command);
+        wchar_t name[80];
+        if (row_count>previous && w_os_wide(desk.config.apps[i].name,name,count_of(name)))
+            w_catalog_program_caption(entries[previous].label,count_of(entries[previous].label),name,desk.config.apps[i].path,false);
     }
 }
 
@@ -356,15 +362,18 @@ static int w_compare_label(const void *a, const void *b) {
 
 static void w_installed_row(int index, w_palette_entry *row) {
     row->identity = w_catalog_identity(snapshot,index);
-    w_catalog_label(snapshot,index,row->label,count_of(row->label),&row->system_icon);
+    w_catalog_info info=w_catalog_label(snapshot,index,row->label,count_of(row->label));
+    row->system_icon=info.icon;
+    row->alias=info.name;
+    row->keywords=info.keywords;
     const wchar_t *label = row->label;
     int configured = row_count-configured_start;
     if (configured && bsearch(&label,configured_labels,configured,sizeof(label),w_compare_label) &&
-        wcslen(label)+15 < count_of(row->label))
+        wcslen(row->label)+15 < count_of(row->label))
         wcscat(row->label,L"  ·  Installed");
     row->id = window_limit+index;
-    row->group = palette_apps;
-    row->can_run_admin = true;
+    row->group = info.task ? palette_settings : palette_apps;
+    row->can_run_admin = !info.task;
 }
 
 static void w_open_palette(enum command_kind kind, int output, const w_popup_anchor *anchor) {
@@ -431,17 +440,18 @@ static void w_open_palette(enum command_kind kind, int output, const w_popup_anc
             int configured = row_count-configured_start;
             for (int i=0; i<configured; ++i) configured_labels[i] = entries[configured_start+i].label;
             qsort(configured_labels,configured,sizeof(*configured_labels),w_compare_label);
-            w_catalog_release(snapshot);
+            w_catalog_state *previous=snapshot;
             snapshot = next;
             w_palette_apps apps = {.count=w_catalog_count(snapshot),.read=w_installed_row};
             w_palette_open(&site,title,entries,row_count,w_pick,
                            w_catalog_images(snapshot),w_desktop_run_line,&apps);
+            w_catalog_release(previous);
             return;
         }
     }
+    w_palette_open(&site,title,entries,row_count,w_pick,NULL,NULL,NULL);
     w_catalog_release(snapshot);
     snapshot = NULL;
-    w_palette_open(&site,title,entries,row_count,w_pick,NULL,NULL,NULL);
 }
 
 void w_desktop_palette(enum command_kind kind, int output) {
