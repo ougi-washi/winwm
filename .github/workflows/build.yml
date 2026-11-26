@@ -44,6 +44,11 @@ jobs:
           ./build/test_panel_geometry.exe bin/winwm.exe
           gcc -std=c11 -Wall -Wextra -Werror -municode -Isrc tools/test_material.c build/obj/win_platform/layer.o build/obj/config/config.o build/obj/command/command.o -lcomctl32 -ldwmapi -lgdi32 -o build/test_material.exe
           ./build/test_material.exe
+      - name: Check focus across application windows, popups, and edit controls
+        shell: msys2 {0}
+        run: |
+          gcc -std=c11 -O2 -flto -Wall -Wextra -Werror -DUNICODE -D_UNICODE -Isrc tools/test_focus.c src/model/model.c src/os_win32/os_win32.c -ldwmapi -o build/test_focus.exe
+          ./build/test_focus.exe
       - name: Validate first startup with the shipped configuration
         shell: pwsh
         run: |

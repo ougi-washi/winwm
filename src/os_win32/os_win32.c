@@ -433,12 +433,18 @@ bool w_os_desktop_surface(HWND window) {
             (!wcscmp(name, L"WinwmEvents") && w_os_same_process(window)));
 }
 
-// An explicitly taskbar-visible owned window is an independent app window.
-// Its dialogs stop at that window, even if its own owner is a hidden helper.
+// An owned window can request its own taskbar entry. Tool and no-activate
+// surfaces are ineligible for management even if they also set APPWINDOW.
+static HWND w_app_owner(HWND window, LONG_PTR ex) {
+    if ((ex & (WS_EX_APPWINDOW | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) == WS_EX_APPWINDOW)
+        return NULL;
+    return GetWindow(window, GW_OWNER);
+}
+
 HWND w_os_app_window(HWND w) {
     w = GetAncestor(w, GA_ROOT);
-    while (w && !(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_APPWINDOW)) {
-        HWND owner = GetWindow(w, GW_OWNER);
+    while (w) {
+        HWND owner = w_app_owner(w, GetWindowLongPtrW(w, GWL_EXSTYLE));
         if (!owner)
             break;
         w = owner;
@@ -456,8 +462,7 @@ bool w_os_candidate(HWND w, DWORD *pid) {
         !GetWindowThreadProcessId(w, pid) || *pid == GetCurrentProcessId() || GetPropW(w, L"winwm.ignore"))
         return false;
     LONG_PTR ex = GetWindowLongPtrW(w, GWL_EXSTYLE), style = GetWindowLongPtrW(w, GWL_STYLE);
-    if ((ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) || (style & WS_CHILD) ||
-        (!(ex & WS_EX_APPWINDOW) && GetWindow(w, GW_OWNER)))
+    if ((ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) || (style & WS_CHILD) || w_app_owner(w, ex))
         return false;
     wchar_t cls[128] = {0};
     GetClassNameW(w, cls, count_of(cls));

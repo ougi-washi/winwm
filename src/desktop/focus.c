@@ -49,28 +49,33 @@ static bool w_can_activate(HWND window) {
            !(GetWindowLongPtrW(window, GWL_EXSTYLE) & WS_EX_NOACTIVATE);
 }
 
-static bool w_foreground(HWND target) {
-    HWND previous = GetForegroundWindow();
-    if (previous == target)
-        return true;
-    if (previous && !w_os_same_process(previous) && !IsHungAppWindow(previous)) {
+// Native focus can change between hit testing, target selection and the
+// foreground app handling SC_HOTKEY. Respect a handoff at either boundary.
+static bool w_foreground(HWND previous, HWND target) {
+    HWND current = GetForegroundWindow();
+    if (previous && current == previous && current != target && !w_os_same_process(previous) &&
+        !IsHungAppWindow(previous)) {
         // The foreground app can transfer activation directly. A rejected
         // SetForegroundWindow call makes Windows flash the target's taskbar button.
         DWORD_PTR result;
         SendMessageTimeoutW(previous, WM_SYSCOMMAND, SC_HOTKEY, (LPARAM)target,
                             SMTO_ABORTIFHUNG | SMTO_BLOCK, 75, &result);
-        HWND current = GetForegroundWindow();
-        if (current == target)
-            return true;
-        if (current != previous)
-            return w_os_app_window(current) == w_os_app_window(target);
+        current = GetForegroundWindow();
+    }
+    if (current == target)
+        return true;
+    if (current != previous) {
+        HWND owner = w_os_app_window(target);
+        return owner && w_os_app_window(current) == owner;
     }
     return SetForegroundWindow(target) != 0;
 }
 
-static HWND w_activation_target(HWND owner, HWND hit) {
-    if (hit && w_os_app_window(hit) == owner && w_can_activate(hit))
-        return hit;
+static HWND w_activation_target(HWND owner, HWND foreground) {
+    // WinWM selects a managed window. The app owns activation among its
+    // top-level surfaces and keyboard focus among their child controls.
+    if ((foreground == owner || w_os_app_window(foreground) == owner) && w_can_activate(foreground))
+        return foreground;
     HWND popup = GetLastActivePopup(owner);
     if (w_os_app_window(popup) == owner && w_can_activate(popup))
         return popup;
@@ -81,7 +86,7 @@ static HWND w_activation_target(HWND owner, HWND hit) {
 }
 
 static bool w_release_app(HWND foreground, HWND surface) {
-    return w_desktop_find(w_os_app_window(foreground)) < 0 || w_foreground(surface);
+    return w_desktop_find(w_os_app_window(foreground)) < 0 || w_foreground(foreground, surface);
 }
 
 void w_desktop_focus_empty(void) {
@@ -125,7 +130,7 @@ bool w_desktop_focus_new(w_window_id id) {
         w_thread_owns_pointer(0) || w_thread_owns_pointer(GetCurrentThreadId()))
         return false;
     HWND owner = desk.windows[id.slot].hwnd;
-    if (!w_activation_target(owner, NULL))
+    if (!w_activation_target(owner, GetForegroundWindow()))
         return false;
     // Make the new tab visible in the next layout pass. The same pass applies
     // foreground activation after asynchronous workspace and popup visibility.
@@ -304,7 +309,8 @@ void w_desktop_focus_apply(void) {
     HWND owner = desk.windows[slot].hwnd;
     if (w_desktop_popup_process() || !w_os_ready_for_focus(owner))
         return;
-    HWND target = w_activation_target(owner, NULL);
+    HWND foreground = GetForegroundWindow();
+    HWND target = w_activation_target(owner, foreground);
     if (!target) {
         // Only a shell-hidden owned dialog has a show operation to await. An
         // independently disabled owner cannot become an activation target.
@@ -315,16 +321,27 @@ void w_desktop_focus_apply(void) {
         return;
     }
     w_desktop_focus_cancel();
-    w_foreground(target);
+    w_foreground(foreground, target);
 }
 
 ////////////////
 //~ Pointer focus
 
+// Some toolkits use an unowned tool window or put their popups under a
+// private helper HWND. There is no document to select from that ownership
+// chain. Leave the application's active tool alone on passive mouse motion.
+static bool w_active_app_tool(HWND foreground, HWND app, DWORD target_pid) {
+    if (!foreground || w_desktop_find(app) >= 0)
+        return false;
+    if (foreground == app && !(GetWindowLongPtrW(foreground, GWL_EXSTYLE) & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)))
+        return false;
+    DWORD pid = 0;
+    return GetWindowThreadProcessId(foreground, &pid) && pid == target_pid;
+}
+
 void w_desktop_hover(POINT point) {
-    static HWND last_hit, denied_by;
-    static uint32_t last_generation;
-    static bool denied;
+    static w_window_id denied;
+    static HWND denied_by;
     if (!desk.config.follow_mouse || w_desktop_focus_pending() || w_palette_shown() || w_notice_visible() ||
         w_bar_menu_active() || w_desktop_popup_process() ||
         GetAsyncKeyState(VK_LBUTTON) < 0 || GetAsyncKeyState(VK_RBUTTON) < 0 ||
@@ -336,29 +353,29 @@ void w_desktop_hover(POINT point) {
     int slot = w_desktop_find(owner);
     if (slot < 0 || !desk.windows[slot].wants_visible || !w_model_visible(&desk.model, slot) ||
         (GetWindowLongPtrW(hit, GWL_EXSTYLE) & WS_EX_NOACTIVATE)) {
-        last_hit = NULL;
+        denied.generation = 0;
         return;
     }
-    uint32_t generation = desk.model.windows[slot].generation;
-    bool same_hit = hit == last_hit && generation == last_generation;
-    if (same_hit && denied && denied_by == foreground)
-        return;
-    if (same_hit && !denied && foreground == hit) {
+    HWND active = foreground == hit || foreground == owner ? owner : w_os_app_window(foreground);
+    if (active == owner) {
+        denied.generation = 0;
         w_select_owner(owner);
         return;
     }
+    if (denied.slot == slot && w_model_valid(&desk.model, denied) && denied_by == foreground)
+        return;
+    denied.generation = 0;
+    if (w_active_app_tool(foreground, active, desk.windows[slot].pid))
+        return;
     // Foreign menus, modal move/size loops and drags own the pointer until
     // their thread releases it. GetCapture() only sees our own input queue.
     if (w_thread_owns_pointer(0) || w_thread_owns_pointer(GetCurrentThreadId()))
         return;
-    last_hit = hit;
-    last_generation = generation;
-    denied = false;
-    HWND target = w_activation_target(owner, hit);
+    HWND target = w_activation_target(owner, foreground);
     if (!target)
         return;
-    if (foreground != target && !w_foreground(target)) {
-        denied = true;
+    if (!w_foreground(foreground, target)) {
+        denied = (w_window_id){slot, desk.model.windows[slot].generation};
         denied_by = foreground;
         return;
     }
