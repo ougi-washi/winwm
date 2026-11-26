@@ -433,7 +433,7 @@ static void w_hover(w_bar_window *b, int hit) {
     if (hit == b->hover)
         return;
     int previous = b->hover;
-    b->wheel_remainder = 0;
+    if (hit<0 || b->hits[hit].source!=b->wheel_source) b->wheel_remainder=0;
     b->hover = hit;
     if (previous >= 0 && previous < b->hit_count)
         InvalidateRect(b->hwnd, &b->hits[previous].box, FALSE);
@@ -699,6 +699,16 @@ void w_bar_invoke(w_bar_window *b, int hit, const char *action) {
     b->invoke(b->output, action, w_bar_anchor(b,hit,&anchor) ? &anchor : NULL);
 }
 
+static void w_bar_click(w_bar_window *b,int hit,const char *action) {
+    if (w_bar_menu_active()) {
+        w_command command;
+        // Navigation dismisses the flyout as it selects the destination's foreground.
+        if (!action || !w_command_parse(action,&command) || !w_command_navigates(command.kind))
+            w_bar_menu_close(NULL,true);
+    }
+    w_bar_invoke(b,hit,action);
+}
+
 bool w_bar_activate_hit(w_bar_window *b, int hit) {
     if (hit < 0 || hit >= b->hit_count) return false;
     const struct w_bar_hit *item = &b->hits[hit];
@@ -708,8 +718,7 @@ bool w_bar_activate_hit(w_bar_window *b, int hit) {
         return true;
     char action[sizeof(item->action)];
     strcpy(action,item->action);
-    w_bar_menu_close(NULL,true);
-    w_bar_invoke(b,hit,*action ? action : NULL);
+    w_bar_click(b,hit,*action ? action : NULL);
     return *action != 0;
 }
 
@@ -866,8 +875,7 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             InvalidateRect(w,&b->hits[hit].box,FALSE);
         }
         if (hit < 0) {
-            w_bar_menu_close(NULL, true);
-            w_bar_invoke(b,-1,NULL);
+            w_bar_click(b,-1,NULL);
         }
         strcpy(b->press_instance,hit>=0 ? b->hits[hit].instance : "");
         b->press_workspace=hit>=0 ? b->hits[hit].workspace : 0;
@@ -890,8 +898,7 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
         bool drag = b->dragging;
         ReleaseCapture();
         if (drag) {
-            w_bar_menu_close(NULL, true);
-            w_bar_invoke(b,-1,NULL);
+            w_bar_click(b,-1,NULL);
             w_rect s = b->screen;
             int distance[] = {abs(p.y - s.y), abs(p.y - (s.y + s.h - 1)), abs(p.x - s.x),
                               abs(p.x - (s.x + s.w - 1))};
@@ -937,8 +944,7 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             if (b->tray.context_key!=(hit>=0 ? b->hits[hit].tray_key : 0)) return 0;
         }
         if (hit < 0) {
-            w_bar_menu_close(NULL, true);
-            w_bar_invoke(b,-1,NULL);
+            w_bar_click(b,-1,NULL);
             return 0;
         }
         const char *key = b->hits[hit].module, *action = NULL;
@@ -963,8 +969,7 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
             else if (!strcmp(key, "battery")) action = "power_settings";
             else if (!strcmp(key, "network") || !strcmp(key, "throughput")) action = "network_settings";
         }
-        w_bar_menu_close(NULL, true);
-        w_bar_invoke(b,hit,action);
+        w_bar_click(b,hit,action);
         return 0;
     }
     if (msg == WM_MOUSEWHEEL) {
@@ -996,7 +1001,8 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
                 w_bar_invoke(b,hit,action);
         } else if (!strcmp(b->hits[hit].module, "workspaces")) {
             char select[40];
-            int ws = (b->view.selected - steps) % workspace_limit;
+            // Input can outrun the deferred layout that supplies the painted view.
+            int ws = (*b->selected_workspace - steps) % workspace_limit;
             snprintf(select, sizeof(select), "workspace_select %d",
                      (ws + workspace_limit) % workspace_limit + 1);
             w_bar_invoke(b,hit,select);
@@ -1026,7 +1032,7 @@ static LRESULT CALLBACK w_bar_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
 ////////////////
 //~ Bar lifecycle
 
-bool w_bar_create(w_bar_window *b, int output, const w_desktop_config *cfg, bar_action invoke) {
+bool w_bar_create(w_bar_window *b, int output, const int *selected_workspace, const w_desktop_config *cfg, bar_action invoke) {
     WNDCLASSW wc = {.hInstance = GetModuleHandleW(NULL),.style=CS_DBLCLKS,
                     .lpszClassName = L"WinwmBar",
                     .lpfnWndProc = w_bar_proc,
@@ -1039,6 +1045,7 @@ bool w_bar_create(w_bar_window *b, int output, const w_desktop_config *cfg, bar_
     b->config = cfg;
     b->measure_dirty = true;
     b->output = output;
+    b->selected_workspace = selected_workspace;
     b->invoke = invoke;
     b->hwnd = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE | WS_EX_TOPMOST, wc.lpszClassName,
                               L"winwm bar", WS_POPUP, 0, 0, 1, 1, NULL, NULL, wc.hInstance, b);

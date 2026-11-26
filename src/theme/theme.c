@@ -306,25 +306,27 @@ void w_theme_publish(HWND manager) {
     if (theme_changed) EnumWindows(w_notify_tool,0);
 }
 
-static void w_follow_theme(void) {
+bool w_theme_read_published(void) {
     HWND manager=FindWindowW(L"WinwmEvents",NULL);
     UINT_PTR revision=manager ? (UINT_PTR)GetPropW(manager,revision_property) : 0;
-    if (!revision) return;
+    if (!revision) return false;
     wchar_t name[96];
     w_mapping_name(manager,revision,name);
     HANDLE mapping=OpenFileMappingW(FILE_MAP_READ,FALSE,name);
-    if (!mapping) return; // A newer publication also posts a new notification.
+    if (!mapping) return false; // A newer publication also posts a new notification.
     const w_theme_profile *view=MapViewOfFile(mapping,FILE_MAP_READ,0,0,sizeof(profile));
-    if (view) {
+    bool mapped=view!=NULL;
+    if (mapped) {
         w_set_theme(view);
         UnmapViewOfFile(view);
     }
     CloseHandle(mapping);
+    return mapped;
 }
 
 static LRESULT CALLBACK w_subscriber(HWND w,UINT msg,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PTR kind) {
     if (msg==theme_changed && theme_changed) {
-        w_follow_theme();
+        w_theme_read_published();
         return 0;
     }
     if (kind==follows_panel && msg==WM_SETTINGCHANGE && wp==SPI_SETNONCLIENTMETRICS &&
@@ -349,7 +351,7 @@ static LRESULT CALLBACK w_subscriber(HWND w,UINT msg,WPARAM wp,LPARAM lp,UINT_PT
 static void w_subscribe(HWND window,UINT_PTR kind) {
     if (!theme_changed) theme_changed=RegisterWindowMessageW(L"winwm.theme.changed");
     if (theme_changed && SetWindowSubclass(window,w_subscriber,1,kind) && SetPropW(window,tool_property,(HANDLE)kind))
-        w_follow_theme();
+        w_theme_read_published();
 }
 
 void w_theme_follow(HWND tool) {

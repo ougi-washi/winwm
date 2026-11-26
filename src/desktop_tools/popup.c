@@ -281,7 +281,7 @@ static LRESULT CALLBACK w_popup_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp, UIN
             closing = false;
             if (framed) {
                 SetWindowLongPtrW(w,GWL_EXSTYLE,GetWindowLongPtrW(w,GWL_EXSTYLE)&~(LONG_PTR)WS_EX_TRANSPARENT);
-                w_layer_fade_to(w,&fade,255,w_theme_layer_timing(true),motion);
+                w_layer_present(w,&fade);
             }
         } else w_release_popup();
         return result;
@@ -342,7 +342,7 @@ bool w_tool_show(HWND w) {
         }
         w_theme_material(w);
         motion=w_theme_motion_enabled();
-        w_layer_fade_to(w,&fade,255,w_theme_layer_timing(true),motion);
+        w_layer_present(w,&fade);
     }
     ShowWindow(w,SW_SHOW);
     if (anchor.bar) SetForegroundWindow(w);

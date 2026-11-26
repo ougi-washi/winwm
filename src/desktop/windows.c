@@ -1,5 +1,6 @@
 #include "desktop/desktop.h"
 #include "desktop/tray.h"
+#include "os_win32/work_area.h"
 #include "providers/audio.h"
 #include <dwmapi.h>
 #include <shellscalingapi.h>
@@ -79,13 +80,31 @@ static bool w_module_detail(const char *name, wchar_t *text, int cap) {
     return true;
 }
 
+static void w_position_bar(int output) {
+    w_output_state *o = &desk.outputs[output];
+    o->work = w_bar_position(&o->bar, o->screen, o->available, o->dpi, o->bar_hidden);
+    if (desk.publish_work)
+        w_work_area_publish(output, o->monitor, w_os_to_rect(o->work));
+}
+
+bool w_desktop_work_changed(void) {
+    for (int i=0;i<output_limit;++i) {
+        w_output_state *o = &desk.outputs[i];
+        MONITORINFO info = {.cbSize=sizeof(info)};
+        RECT expected = w_os_to_rect(o->work);
+        if (o->live && GetMonitorInfoW(o->monitor,&info) && !EqualRect(&info.rcWork,&expected))
+            return true;
+    }
+    return false;
+}
+
 static void w_dock_bar(int output) {
     w_output_state *o = &desk.outputs[output];
     if ((int)GetDpiForWindow(o->bar.hwnd) != o->dpi) {
         w_desktop_outputs();
         return;
     }
-    o->work = w_bar_position(&o->bar, o->screen, o->available, o->dpi, o->bar_hidden);
+    w_position_bar(output);
     w_notice_reposition();
     w_bar_invalidate(&o->bar, NULL);
     w_desktop_schedule();
@@ -116,13 +135,16 @@ static BOOL CALLBACK w_visit_monitor(HMONITOR mon, HDC dc, LPRECT bounds, LPARAM
     wcscpy(o->device, mi.szDevice);
     RECT r = mi.rcMonitor;
     o->screen = (w_rect){r.left, r.top, r.right - r.left, r.bottom - r.top};
-    r = desk.preview ? mi.rcWork : mi.rcMonitor;
+    r = desk.preview ? mi.rcWork : desk.publish_work ? w_work_area_available(slot,&mi) : mi.rcMonitor;
     o->available = (w_rect){r.left, r.top, r.right - r.left, r.bottom - r.top};
     UINT x = 96, y = 96;
     GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &x, &y);
     o->dpi = (int)x;
-    if (!o->bar.hwnd && w_bar_create(&o->bar, slot, &desk.config, w_desktop_bar_action) && desk.preview)
-        SetPropW(o->bar.hwnd, L"winwm.preview", (HANDLE)1);
+    if (!o->bar.hwnd) w_bar_create(&o->bar, slot, &desk.model.selected[slot], &desk.config, w_desktop_bar_action);
+    if (o->bar.hwnd) {
+        if (desk.preview) SetPropW(o->bar.hwnd, L"winwm.preview", (HANDLE)1);
+        else RemovePropW(o->bar.hwnd, L"winwm.preview");
+    }
     w_audio_state audio = w_audio_read();
     w_bar_set_audio(&o->bar, audio.available ? audio.percent : -1, audio.muted);
     o->bar.custom = w_custom_text;
@@ -130,8 +152,9 @@ static BOOL CALLBACK w_visit_monitor(HMONITOR mon, HDC dc, LPRECT bounds, LPARAM
     o->bar.dock = w_dock_bar;
     o->bar.anchors_changed = w_desktop_popup_layout;
     w_desktop_tray_bind(&o->bar);
-    o->bar_hidden = desk.hide_bars;
-    o->work = w_bar_position(&o->bar, o->screen, o->available, o->dpi, desk.hide_bars);
+    int recent = w_model_recent(&desk.model,slot,desk.model.selected[slot]);
+    o->bar_hidden = desk.hide_bars || (recent >= 0 && desk.model.windows[recent].fullscreen);
+    w_position_bar(slot);
     return TRUE;
 }
 
@@ -339,9 +362,11 @@ static int w_discover(HWND w, bool *focus_new) {
 
 static void w_observe_visibility(int slot) {
     w_model_window *w = &desk.model.windows[slot];
-    HWND hwnd = desk.windows[slot].hwnd;
+    w_window_state *state = &desk.windows[slot];
+    HWND hwnd = state->hwnd;
     bool visible = IsWindowVisible(hwnd) != 0;
     bool shell_hidden = w_os_shell_hidden(hwnd);
+    bool unavailable = w->minimized || w->withdrawn || w->cloaked;
     w->cloaked = w_os_cloaked(hwnd);
     if (visible || !shell_hidden)
         w->minimized = IsIconic(hwnd) != 0;
@@ -349,6 +374,8 @@ static void w_observe_visibility(int slot) {
         w->withdrawn = false;
     else if (!shell_hidden)
         w->withdrawn = true;
+    if (unavailable && visible && !w->minimized && !w->cloaked && !state->wants_visible)
+        state->externally_shown = true;
     if (desk.model.focus == slot && !w_model_visible(&desk.model, slot))
         w_desktop_focus_successor();
 }
@@ -462,13 +489,15 @@ void w_desktop_scan(bool focus_new) {
         if (desk.model.windows[i].live && !IsWindow(desk.windows[i].hwnd))
             w_forget(i);
     owned_visibility_dirty = true;
+    w_desktop_place_chooser(GetForegroundWindow(), EVENT_OBJECT_LOCATIONCHANGE);
     w_desktop_focus_observe(GetForegroundWindow());
     w_desktop_schedule();
 }
 
-static void w_follow_native_activation(HWND foreground, HWND owner, bool activated);
+static void w_follow_native_activation(HWND window, DWORD event, DWORD event_tick);
 
 void w_desktop_event(HWND w, DWORD event, DWORD event_tick) {
+    w_desktop_place_chooser(w, event);
     w_desktop_tray_observe(w,event);
     HWND event_window = w;
     if (event == EVENT_OBJECT_DESTROY || !IsWindow(w)) {
@@ -477,6 +506,11 @@ void w_desktop_event(HWND w, DWORD event, DWORD event_tick) {
             w_forget(i);
         return;
     }
+    if (event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_HIDE)
+        w_os_visibility_event(w, event, event_tick);
+    if (event == EVENT_SYSTEM_FOREGROUND || event == EVENT_OBJECT_SHOW ||
+        event == EVENT_SYSTEM_MINIMIZEEND || event == EVENT_OBJECT_UNCLOAKED)
+        w_follow_native_activation(event_window, event, event_tick);
     if (event == EVENT_SYSTEM_FOREGROUND)
         w = w_os_app_window(w);
     bool focus_new = event != EVENT_OBJECT_HIDE && event != EVENT_OBJECT_CLOAKED &&
@@ -484,7 +518,14 @@ void w_desktop_event(HWND w, DWORD event, DWORD event_tick) {
     int i = w_discover(w, &focus_new);
     if (i < 0) {
         if (event == EVENT_SYSTEM_FOREGROUND) {
-            w_desktop_focus_observe(w);
+            w_desktop_model *m = &desk.model;
+            // Windows may briefly give a hidden helper (for example, a
+            // console host) keyboard ownership when the last app disappears.
+            if (GetForegroundWindow() == event_window && !IsWindowVisible(event_window) &&
+                desk.outputs[m->output].selection_tick && w_model_recent(m,m->output,m->selected[m->output]) < 0)
+                w_desktop_reclaim_focus();
+            else
+                w_desktop_focus_observe(w);
             w_desktop_schedule();
         }
         if ((event == EVENT_OBJECT_SHOW || event == EVENT_OBJECT_HIDE) && GetWindow(w, GW_OWNER) &&
@@ -521,10 +562,6 @@ void w_desktop_event(HWND w, DWORD event, DWORD event_tick) {
         return;
     }
     if (event == EVENT_SYSTEM_FOREGROUND) {
-        ULONGLONG now = GetTickCount64();
-        DWORD event_age = (DWORD)now - event_tick;
-        if (GetForegroundWindow() == event_window && event_age <= now - state->workspace_hide_tick)
-            w_follow_native_activation(event_window, w, true);
         w_desktop_focus_observe(w);
     }
     if (event == EVENT_SYSTEM_MOVESIZESTART) {
@@ -629,22 +666,50 @@ static BOOL CALLBACK w_sync_owned(HWND w, LPARAM unused) {
     return TRUE;
 }
 
-static void w_follow_native_activation(HWND foreground, HWND owner, bool activated) {
+static void w_follow_native_activation(HWND window, DWORD event, DWORD event_tick) {
     if (w_desktop_focus_pending()) return;
+    HWND foreground = GetForegroundWindow();
+    if (!foreground || (window != foreground &&
+        (event == EVENT_SYSTEM_FOREGROUND || window != w_os_app_window(foreground)))) return;
+    HWND owner = w_os_app_window(foreground);
     int slot = w_desktop_find(owner);
     if (slot < 0 || desk.windows[slot].wants_visible || IsIconic(owner) || w_os_cloaked(foreground) ||
         (foreground != owner && w_os_cloaked(owner)))
         return;
-    bool hidden = w_os_hidden_confirmed(owner);
-    if (!(activated && (hidden || desk.windows[slot].externally_shown)) &&
-        !(hidden && IsWindowVisible(foreground)))
+    w_window_state *state = &desk.windows[slot];
+    w_model_window *w = &desk.model.windows[slot];
+    bool restored = (w->minimized || w->withdrawn || w->cloaked) && IsWindowVisible(owner);
+    if (state->withdrawing_foreground && !state->externally_shown && !restored &&
+        !IsWindowVisible(foreground) && state->withdrawal_intent == w_desktop_activation_intent()) {
+        // An application we just withdrew can reacquire foreground *after*
+        // USER32 confirmed the hide. Its event is fresh, but the invisible
+        // window has no new user action, show, or restoration to follow.
+        if (event == EVENT_SYSTEM_FOREGROUND) w_desktop_reclaim_focus();
+        return;
+    }
+    if (!w_os_hidden_confirmed(owner) && !state->externally_shown && !restored)
+        return;
+    if (event != EVENT_SYSTEM_FOREGROUND && (!IsWindowVisible(window) ||
+        (w_os_shell_hidden(window) && !w_os_hidden_confirmed(window))))
+        return;
+    // WinEvents can be queued across several selections, including a move
+    // between two empty workspaces that never changes this HWND's hide time.
+    w_output_state *output = &desk.outputs[w->output];
+    ULONGLONG now = GetTickCount64();
+    DWORD age = (DWORD)now - event_tick;
+    if (age > now - state->workspace_hide_tick || age > now - output->selection_tick)
+        return;
+    // USER timestamps are coarse. On a tie a changed foreground HWND or a
+    // newly visible foreground window still proves a later native activation.
+    if (output->selection_tick && age == now - output->selection_tick &&
+        output->selection_foreground == foreground &&
+        (output->selection_foreground_visible || !IsWindowVisible(foreground)))
         return;
     // A single-instance app can reopen its existing window on another workspace.
     // The show and foreground notifications can arrive in either order, even
     // after we have hidden a window that initially reopened in the background.
     // Windows Security can take foreground without showing its hidden HWND.
     w_observe_visibility(slot);
-    w_model_window *w = &desk.model.windows[slot];
     w_desktop_focus_cancel();
     desk.model.output = w->output;
     w_model_workspace(&desk.model, w->workspace);
@@ -705,14 +770,13 @@ void w_desktop_titles(void) {
 
 void w_desktop_apply(void) {
     static int previous_workspace[output_limit];
-    static HWND previous_foreground;
     bool visibility_changed = false;
     HWND outgoing = NULL;
     HWND foreground = GetForegroundWindow();
     HWND active = w_os_app_window(foreground);
     bool bar_title = w_config_has_module(&desk.config, "title");
-    w_follow_native_activation(foreground, active, foreground != previous_foreground);
-    previous_foreground = foreground;
+    // Layout only reconciles visibility. A dated show or foreground notification
+    // is required to change a workspace on behalf of a native application.
     for (int o = 0; o < output_limit; o++)
         if (desk.outputs[o].live) {
             w_output_state *output = &desk.outputs[o];
@@ -723,8 +787,8 @@ void w_desktop_apply(void) {
             bool hide = desk.hide_bars || (recent >= 0 && desk.model.windows[recent].fullscreen);
             if (hide != output->bar_hidden) {
                 if (hide) w_desktop_popup_bar_hidden(output->bar.hwnd);
-                output->work = w_bar_position(&output->bar, output->screen, output->available, output->dpi, hide);
                 output->bar_hidden = hide;
+                w_position_bar(o);
             }
             w_desktop_measure_output(o);
             const w_tab_layout *tabs = &output->tab_layout;
@@ -750,12 +814,18 @@ void w_desktop_apply(void) {
                 if (visible && desk.model.spaces[o][ws].layout == layout_tabs && !w->floating && i != tabs->selected)
                     visible = false;
                 bool entering = !s->wants_visible;
-                if (s->wants_visible && !visible)
+                if (s->wants_visible && !visible) {
                     s->workspace_hide_tick = GetTickCount64();
+                    if (hwnd == active && !w->minimized && !w->withdrawn && !w->cloaked) {
+                        s->withdrawing_foreground = true;
+                        s->withdrawal_intent = w_desktop_activation_intent();
+                    }
+                }
                 s->wants_visible = visible;
-                if (visible)
+                if (visible) {
                     s->externally_shown = false;
-                else if (w_os_hidden_confirmed(hwnd) && IsWindowVisible(hwnd))
+                    s->withdrawing_foreground = false;
+                } else if (w_os_hidden_confirmed(hwnd) && IsWindowVisible(hwnd))
                     s->externally_shown = true;
                 if (w->minimized || w->withdrawn || w->cloaked) {
                     w_effects_hide(i);

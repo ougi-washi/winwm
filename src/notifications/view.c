@@ -1063,7 +1063,7 @@ static LRESULT CALLBACK w_panel_proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         case read_id:w_set_details(!panel.expanded);return 0;
         case clear_id:w_clear();SetFocus(panel.search);return 0;
         case dismiss_id:w_dismiss_selected();return 0;
-        case close_id:w_notice_close();return 0;
+        case close_id:w_notice_close(true);return 0;
         case access_id:if (request_access) request_access(panel.access);return 0;
         }
         break;
@@ -1092,7 +1092,7 @@ static LRESULT CALLBACK w_panel_proc(HWND w,UINT msg,WPARAM wp,LPARAM lp) {
         if (LOWORD(wp)==WA_INACTIVE && w_notice_visible() && lp && !w_notice_contains((HWND)lp) &&
             (HWND)lp!=panel.anchor.bar) w_close_panel(false);
         break;
-    case WM_CLOSE:w_notice_close();return 0;
+    case WM_CLOSE:w_notice_close(true);return 0;
     case winwm_motion_updated:w_reveal_detail();return 0;
     case WM_SETTINGCHANGE:
         if (wp==SPI_SETCLIENTAREAANIMATION || wp==SPI_SETHIGHCONTRAST) w_reveal_detail();
@@ -1156,9 +1156,9 @@ static void w_close_panel(bool restore) {
     panel.previous=NULL;
 }
 
-bool w_notice_close(void) {
+bool w_notice_close(bool restore_focus) {
     if (!w_notice_visible()) return false;
-    w_close_panel(true);return true;
+    w_close_panel(restore_focus);return true;
 }
 
 void w_notice_outside(HWND hit) {
@@ -1177,7 +1177,7 @@ bool w_notice_message(MSG *msg) {
             (msg->wParam==VK_DELETE && msg->hwnd==panel.list))) return true;
         if (msg->wParam==VK_ESCAPE) {
             if (panel.expanded) w_set_details(false);
-            else w_notice_close();
+            else w_notice_close(true);
             return true;
         }
         if (msg->hwnd==panel.list && msg->wParam==VK_DELETE) {w_dismiss_selected();return true;}
@@ -1195,9 +1195,9 @@ bool w_notice_message(MSG *msg) {
 void w_notice_open(HMONITOR monitor,const w_popup_anchor *anchor) {
     if (!owner) return;
     if (anchor && !IsWindowVisible(anchor->bar)) return;
-    bool was_open=w_notice_visible(), was_painted=panel.hwnd && IsWindowVisible(panel.hwnd);
+    bool was_open=w_notice_visible();
     if (was_open && anchor && w_popup_same_source(anchor,&panel.anchor)) {
-        w_notice_close();return;
+        w_notice_close(true);return;
     }
     if (!panel.hwnd && !w_create_panel()) return;
     if (!was_open) panel.previous=GetForegroundWindow();
@@ -1211,8 +1211,7 @@ void w_notice_open(HMONITOR monitor,const w_popup_anchor *anchor) {
         panel.selected=0;panel.expanded=false;SetWindowTextW(panel.search,L"");
     }
     w_filter(!was_open);w_position_panel();
-    if (!was_painted) panel.fade.value=0;
-    w_fade(panel.hwnd,&panel.fade,255);
+    w_layer_present(panel.hwnd,&panel.fade);
     ShowWindow(panel.hwnd,SW_SHOW);
     SetForegroundWindow(panel.hwnd);
     SetFocus(panel.search);

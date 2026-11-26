@@ -3,36 +3,57 @@
 ////////////////
 //~ Focus
 
+enum { focus_retry_timer = 33, focus_retry_ms = 120 };
+
 // Workspace visibility and native foreground ownership settle independently.
-// Hold an explicit request only while waiting for its HWND or modal popup to show.
+// Carry the requested destination across native visibility and foreground changes.
 static struct w_pending_focus {
     w_window_id window;
     uint64_t pointer_presses;
+    bool automatic, empty, retried;
+    HWND foreground;
+    UINT_PTR timer;
 } pending;
 
 ////////////////
 //~ Focus Functions
 
 void w_desktop_focus_cancel(void) {
+    if (pending.timer) KillTimer(desk.root, pending.timer);
+    pending.timer = 0;
+    pending.retried = false;
+    pending.empty = false;
     pending.window.generation = 0;
 }
 
 bool w_desktop_focus_pending(void) {
-    return w_model_valid(&desk.model, pending.window) &&
-           pending.pointer_presses == w_input_pointer_press_count();
+    if (pending.pointer_presses != w_input_pointer_press_count()) return false;
+    if (pending.empty) return true;
+    if (!w_model_valid(&desk.model, pending.window)) return false;
+    HWND owner = desk.windows[pending.window.slot].hwnd;
+    // A stalled application's queued show may never complete. It must yield
+    // to the next foreground event or pointer movement on another application.
+    if (!IsWindow(owner) || (!w_os_ready_for_focus(owner) && IsHungAppWindow(owner))) {
+        w_desktop_focus_cancel();
+        return false;
+    }
+    return true;
 }
 
-static void w_request_focus(int slot) {
+static void w_request_focus(int slot, bool automatic) {
+    w_desktop_focus_cancel();
     w_model_focus(&desk.model, slot);
     pending.window = (w_window_id){slot, desk.model.windows[slot].generation};
     pending.pointer_presses = w_input_pointer_press_count();
+    pending.automatic = automatic;
+    pending.foreground = GetForegroundWindow();
 }
 
 void w_desktop_focus_successor(void) {
     w_desktop_model *m = &desk.model;
     int slot = w_model_recent(m, m->output, m->selected[m->output]);
     w_desktop_focus_cancel();
-    if (slot >= 0) w_request_focus(slot);
+    if (slot >= 0) w_request_focus(slot, true);
     else m->focus = -1;
     w_desktop_schedule();
 }
@@ -85,15 +106,51 @@ static HWND w_activation_target(HWND owner, HWND foreground) {
     return w_os_app_window(popup) == owner && w_can_activate(popup) ? popup : NULL;
 }
 
-static bool w_release_app(HWND foreground, HWND surface) {
-    return w_desktop_find(w_os_app_window(foreground)) < 0 || w_foreground(foreground, surface);
+static void w_guard_withdrawal(int output, int slot, uint64_t intent) {
+    if (slot < 0 || desk.model.windows[slot].output != output || !desk.windows[slot].wants_visible) return;
+    desk.windows[slot].withdrawing_foreground = true;
+    desk.windows[slot].withdrawal_intent = intent;
+}
+
+void w_desktop_record_selection(int output) {
+    w_output_state *o = &desk.outputs[output];
+    o->selection_tick = GetTickCount64();
+    o->selection_foreground = GetForegroundWindow();
+    o->selection_foreground_visible = IsWindowVisible(o->selection_foreground) != FALSE;
+    uint64_t intent = w_desktop_activation_intent();
+    w_guard_withdrawal(output,w_desktop_find(w_os_app_window(o->selection_foreground)),intent);
+    // Foreground changes cross UI threads. The destination of our last
+    // successful activation can still be in flight when another key arrives.
+    if (w_model_valid(&desk.model,o->last_activation))
+        w_guard_withdrawal(output,o->last_activation.slot,intent);
+    o->last_activation.generation = 0;
+}
+
+static void w_request_empty(void) {
+    w_desktop_focus_cancel();
+    desk.model.focus = -1;
+    pending.empty = true;
+    pending.automatic = false;
+    pending.pointer_presses = w_input_pointer_press_count();
+    pending.foreground = GetForegroundWindow();
+    w_desktop_focus_apply();
+    w_desktop_schedule();
 }
 
 void w_desktop_focus_empty(void) {
-    w_desktop_focus_cancel();
-    if (!w_palette_shown() && !w_notice_visible() && !w_bar_menu_active() && !w_desktop_popup_process())
-        w_release_app(GetForegroundWindow(), w_desktop_surface());
-    desk.model.focus = -1;
+    w_desktop_record_selection(desk.model.output);
+    w_request_empty();
+}
+
+void w_desktop_reclaim_focus(void) {
+    w_desktop_model *m = &desk.model;
+    int slot = w_model_recent(m,m->output,m->selected[m->output]);
+    if (slot < 0) {
+        w_request_empty();
+        return;
+    }
+    w_request_focus(slot,false);
+    w_desktop_focus_apply();
     w_desktop_schedule();
 }
 
@@ -126,20 +183,70 @@ static bool w_thread_owns_pointer(DWORD thread_id) {
 }
 
 bool w_desktop_focus_new(w_window_id id) {
-    if (!w_model_visible(&desk.model, id.slot) || w_palette_shown() || w_notice_visible() || w_bar_menu_active() || w_desktop_popup_process() ||
+    if ((w_desktop_focus_pending() && !pending.automatic) || !w_model_visible(&desk.model, id.slot) ||
+        w_palette_shown() || w_notice_visible() || w_bar_menu_active() || w_desktop_popup_process() ||
         w_thread_owns_pointer(0) || w_thread_owns_pointer(GetCurrentThreadId()))
         return false;
     HWND owner = desk.windows[id.slot].hwnd;
-    if (!w_activation_target(owner, GetForegroundWindow()))
+    HWND foreground = GetForegroundWindow();
+    if (w_os_shell_dialog(foreground) || !w_activation_target(owner, foreground))
         return false;
     // Make the new tab visible in the next layout pass. The same pass applies
     // foreground activation after asynchronous workspace and popup visibility.
-    w_request_focus(id.slot);
+    w_request_focus(id.slot, true);
     return true;
 }
 
 ////////////////
 //~ Foreground tracking
+
+// The broker can show a placeholder before XAML supplies the chooser's
+// native size. Place the real surface on the invoking output when it settles.
+void w_desktop_place_chooser(HWND window, DWORD event) {
+    static HWND placed, assisted;
+    static w_rect previous, requested;
+    if (event == EVENT_OBJECT_HIDE || event == EVENT_OBJECT_DESTROY) {
+        if (window == placed) placed = NULL;
+        if (window == assisted) assisted = NULL;
+        return;
+    }
+    if (event != EVENT_OBJECT_SHOW && event != EVENT_SYSTEM_FOREGROUND && event != EVENT_OBJECT_UNCLOAKED &&
+        event != EVENT_OBJECT_LOCATIONCHANGE) return;
+    // WinEvents are queued. By dispatch time this HWND may only be the
+    // previous foreground window or a background window being created.
+    if (window != GetForegroundWindow() || !w_os_shell_dialog(window) || !w_can_activate(window) ||
+        IsIconic(window) || w_os_cloaked(window)) return;
+    w_rect bounds = w_os_bounds(window);
+    if (bounds.w <= 1 || bounds.h <= 1) return;
+    int owner = w_desktop_find(w_os_app_window(GetWindow(window, GW_OWNER)));
+    int output = owner >= 0 ? desk.model.windows[owner].output : desk.model.output;
+    if ((unsigned)output >= output_limit || !desk.outputs[output].live) return;
+    w_rect work = desk.outputs[output].work;
+    if (work.w <= 0 || work.h <= 0) return;
+    if (window != assisted && bounds.h < MulDiv(160, desk.outputs[output].dpi, 96)) {
+        wchar_t cls[32];
+        if (GetClassNameW(window, cls, count_of(cls)) && !wcscmp(cls, L"Open With") && !GetShellWindow() &&
+            w_desktop_show_chooser_list(window)) assisted = window;
+    }
+    if (placed == window && requested.w == bounds.w && requested.h == bounds.h &&
+        bounds.x >= work.x && bounds.x <= work.x + max(0, work.w - bounds.w) &&
+        bounds.y >= work.y && bounds.y <= work.y + max(0, work.h - bounds.h)) {
+        previous = bounds;
+        return;
+    }
+    w_rect target = bounds;
+    target.x = work.x + max(0, (work.w - target.w) / 2);
+    target.y = work.y + max(0, (work.h - target.h) / 2);
+    if (!w_rect_equal(target, bounds)) {
+        if (event == EVENT_OBJECT_LOCATIONCHANGE && placed == window && w_rect_equal(previous, bounds) &&
+            w_rect_equal(requested, target)) return;
+        if (!SetWindowPos(window, NULL, target.x, target.y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE |
+                          SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_ASYNCWINDOWPOS)) return;
+    }
+    placed = window;
+    previous = bounds;
+    requested = target;
+}
 
 typedef struct w_float_order {
     HWND tile;
@@ -212,11 +319,10 @@ void w_desktop_focus_observe(HWND window) {
     HWND actual = w_os_app_window(GetForegroundWindow());
     if (actual != w_os_app_window(window))
         return;
-    if (w_model_valid(&desk.model, pending.window)) {
+    if (pending.empty || w_model_valid(&desk.model, pending.window)) {
         // Hiding a workspace can briefly activate another application while
         // its replacement is still becoming visible. A new click supersedes it.
-        if (pending.pointer_presses == w_input_pointer_press_count())
-            return;
+        if (w_desktop_focus_pending()) return;
         w_desktop_focus_cancel();
     }
     w_select_owner(actual);
@@ -227,6 +333,7 @@ void w_desktop_activate(int slot) {
     if ((unsigned)slot >= window_limit || !desk.model.windows[slot].live)
         return;
     w_model_window *w = &desk.model.windows[slot];
+    w_desktop_record_selection(w->output);
     desk.model.output = w->output;
     w_model_workspace(&desk.model, w->workspace);
     if (w->scratch)
@@ -236,8 +343,12 @@ void w_desktop_activate(int slot) {
             return;
         w->minimized = false;
     }
-    w_request_focus(slot);
-    w_desktop_apply();
+    w_request_focus(slot, false);
+    // A visible selection can take input immediately. A workspace or tab
+    // transition completes after the single queued visibility/layout pass.
+    if (desk.windows[slot].wants_visible && w_os_ready_for_focus(desk.windows[slot].hwnd))
+        w_desktop_focus_apply();
+    w_desktop_schedule();
 }
 
 bool w_desktop_close_target(HWND window, DWORD pid, w_window_id owner) {
@@ -273,13 +384,13 @@ static bool w_tool_panel(HWND window, DWORD pid) {
 }
 
 bool w_desktop_close_foreground(void) {
-    if (w_notice_close()) return true;
+    if (w_notice_close(true)) return true;
     HWND window = GetForegroundWindow();
     DWORD pid = 0;
     GetWindowThreadProcessId(window,&pid);
     if (w_tool_panel(window, pid))
         return GetForegroundWindow() == window && PostMessageW(window, WM_CLOSE, 0, 0);
-    if (w_bar_menu_close(NULL, true) || w_palette_close())
+    if (w_bar_menu_close(NULL, true) || w_palette_close(true))
         return true;
     if (w_desktop_popup_process()) {
         w_desktop_popup_cancel();
@@ -296,20 +407,66 @@ static BOOL CALLBACK w_await_owned_popup(HWND window, LPARAM owner) {
              w_os_shell_hidden(window));
 }
 
-void w_desktop_focus_apply(void) {
-    if (!w_model_valid(&desk.model, pending.window))
+static void CALLBACK w_focus_retry(HWND hwnd, UINT msg, UINT_PTR id, DWORD time) {
+    (void)msg;
+    (void)time;
+    if (pending.timer != id) return;
+    KillTimer(hwnd, id);
+    pending.timer = 0;
+    w_desktop_focus_apply();
+}
+
+static void w_apply_foreground(HWND foreground, HWND target) {
+    if (pending.timer) return;
+    bool activated = w_foreground(foreground, target);
+    if (activated && !pending.empty && w_model_valid(&desk.model,pending.window))
+        desk.outputs[desk.model.windows[pending.window.slot].output].last_activation = pending.window;
+    if (!activated && foreground == GetForegroundWindow() && !pending.automatic && !pending.retried &&
+        desk.root && (pending.timer = SetTimer(desk.root, focus_retry_timer, focus_retry_ms, w_focus_retry))) {
+        // Windows can temporarily deny activation as it hides the outgoing app.
+        // Give the explicit command one more attempt, without polling the layout.
+        pending.retried = true;
+        pending.foreground = foreground;
         return;
+    }
+    bool reconcile = !activated && !pending.empty;
+    w_desktop_focus_cancel();
+    if (reconcile) w_select_owner(w_os_app_window(GetForegroundWindow()));
+}
+
+void w_desktop_focus_apply(void) {
+    if (!pending.empty && !w_model_valid(&desk.model, pending.window))
+        return;
+    HWND foreground = GetForegroundWindow();
+    if (pending.empty) {
+        if (desk.model.focus >= 0 || w_palette_shown() || w_notice_visible() || w_bar_menu_active() ||
+            w_desktop_popup_process() || pending.pointer_presses != w_input_pointer_press_count() ||
+            (IsWindowVisible(foreground) && w_desktop_find(w_os_app_window(foreground)) < 0) ||
+            (pending.retried && foreground != pending.foreground && IsWindowVisible(foreground) &&
+             !w_os_desktop_surface(foreground)))
+            w_desktop_focus_cancel();
+        else
+            w_apply_foreground(foreground, w_desktop_surface());
+        return;
+    }
     int slot = pending.window.slot;
+    HWND owner = desk.windows[slot].hwnd;
+    // Pending automatic placement must yield when the user or application
+    // has already selected a different foreground surface, including via
+    // the keyboard. A temporary desktop activation can occur during layout.
+    bool handoff = (pending.automatic || pending.retried) && foreground != pending.foreground && !w_os_desktop_surface(foreground) &&
+                   w_os_app_window(foreground) != owner;
     if (!w_model_visible(&desk.model, slot) || w_palette_shown() || w_notice_visible() || w_bar_menu_active() ||
-        pending.pointer_presses != w_input_pointer_press_count()) {
+        pending.pointer_presses != w_input_pointer_press_count() ||
+        handoff || (pending.automatic && w_os_shell_dialog(foreground))) {
         w_desktop_focus_cancel();
         w_select_owner(w_os_app_window(GetForegroundWindow()));
         return;
     }
-    HWND owner = desk.windows[slot].hwnd;
-    if (w_desktop_popup_process() || !w_os_ready_for_focus(owner))
+    if (w_desktop_popup_process() || !w_os_ready_for_focus(owner)) {
+        if (!IsWindow(owner) || IsHungAppWindow(owner)) w_desktop_focus_cancel();
         return;
-    HWND foreground = GetForegroundWindow();
+    }
     HWND target = w_activation_target(owner, foreground);
     if (!target) {
         // Only a shell-hidden owned dialog has a show operation to await. An
@@ -320,8 +477,7 @@ void w_desktop_focus_apply(void) {
         w_select_owner(w_os_app_window(GetForegroundWindow()));
         return;
     }
-    w_desktop_focus_cancel();
-    w_foreground(foreground, target);
+    w_apply_foreground(foreground, target);
 }
 
 ////////////////
@@ -365,7 +521,7 @@ void w_desktop_hover(POINT point) {
     if (denied.slot == slot && w_model_valid(&desk.model, denied) && denied_by == foreground)
         return;
     denied.generation = 0;
-    if (w_active_app_tool(foreground, active, desk.windows[slot].pid))
+    if (w_os_shell_dialog(foreground) || w_active_app_tool(foreground, active, desk.windows[slot].pid))
         return;
     // Foreign menus, modal move/size loops and drags own the pointer until
     // their thread releases it. GetCapture() only sees our own input queue.

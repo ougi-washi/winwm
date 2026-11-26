@@ -1,6 +1,7 @@
 #include "desktop_ctl/entry.h"
 #include "install/install.h"
 #include "ipc/ipc.h"
+#include "win_platform/win_platform.h"
 #include <stdio.h>
 #include <wchar.h>
 

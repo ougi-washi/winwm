@@ -50,6 +50,6 @@ const w_popup_anchor *w_palette_anchor(void);
 void w_palette_reanchor(const w_popup_anchor *anchor);
 void w_palette_outside(HWND hit);
 bool w_palette_shown(void);
-bool w_palette_close(void);
+bool w_palette_close(bool restore_focus);
 bool w_palette_visible(const wchar_t *title);
 bool w_palette_message(MSG *msg);

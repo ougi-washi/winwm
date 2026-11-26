@@ -675,10 +675,10 @@ void w_palette_outside(HWND hit) {
     w_dismiss(false);
 }
 
-bool w_palette_close(void) {
+bool w_palette_close(bool restore_focus) {
     if (!w_palette_shown())
         return false;
-    w_dismiss(true);
+    w_dismiss(restore_focus);
     return true;
 }
 
@@ -1123,9 +1123,8 @@ void w_palette_position(const w_palette_site *site) {
     if (next_ex!=ex) SetWindowLongPtrW(panel,GWL_EXSTYLE,next_ex);
     if (attached!=was_attached) w_theme_material(panel);
     if (opening || attached != was_attached) {
-        if (hidden) fade.value=0;
         motion_enabled=!placement.follow_theme_motion || w_theme_motion_enabled();
-        w_layer_fade_to(panel,&fade,255,w_palette_timing(true),opening && motion_enabled);
+        w_layer_present(panel,&fade);
     }
     SetWindowPos(panel,HWND_TOPMOST,bounds.left,bounds.top,bounds.right-bounds.left,bounds.bottom-bounds.top,
                  SWP_SHOWWINDOW|SWP_NOACTIVATE|(next_style != style || next_ex != ex ? SWP_FRAMECHANGED : 0));

@@ -14,6 +14,11 @@ const char *w_command_name(enum command_kind k) {
     return k > cmd_invalid && k < cmd_count ? names[k] : names[0];
 }
 
+bool w_command_navigates(enum command_kind kind) {
+    return kind==cmd_workspace_select || kind==cmd_workspace_back || kind==cmd_workspace_follow ||
+           kind==cmd_output_next || kind==cmd_output_send;
+}
+
 bool w_command_delta(const char *args, int *dx, int *dy) {
     char *end;
     long x = strtol(args, &end, 10);

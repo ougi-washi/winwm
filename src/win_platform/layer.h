@@ -10,5 +10,6 @@ typedef struct w_layer_fade {
     w_transition timing;
 } w_layer_fade;
 
+void w_layer_present(HWND hwnd, w_layer_fade *fade);
 bool w_layer_fade_to(HWND hwnd, w_layer_fade *fade, BYTE target, w_transition timing, bool enabled);
 bool w_layer_fade_tick(HWND hwnd, w_layer_fade *fade, bool enabled);

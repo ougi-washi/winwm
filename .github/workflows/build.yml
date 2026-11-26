@@ -12,8 +12,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Check file and module includes for cycles
-        run: python3 tools/check_includes.py src
+      - name: Check dependency direction and compile the portable core on Linux
+        run: |
+          python3 tools/check_includes.py src
+          cc -std=c11 -Wall -Wextra -Werror -Isrc -fsyntax-only src/{base,command,config,model,layout}/*.c
   winwm:
     runs-on: windows-latest
     steps:
@@ -25,6 +27,9 @@ jobs:
           path-type: inherit
       - shell: msys2 {0}
         run: cmd.exe //c build.bat
+      - name: Check the production module graph against compiled symbol references
+        shell: msys2 {0}
+        run: python tools/check_includes.py src build/obj
       - name: Verify single executable and standalone runtime
         shell: msys2 {0}
         run: |
@@ -33,6 +38,10 @@ jobs:
           imports=$(objdump -p bin/winwm.exe)
           if grep -Ei 'DLL Name: (libwinpthread|libgcc|libstdc\+\+)' <<< "$imports"; then
             echo "winwm.exe requires an unshipped compiler runtime"
+            exit 1
+          fi
+          if grep -Ei 'DLL Name: (wscapi|wuapi|uiautomationcore)\.dll' <<< "$imports"; then
+            echo "An optional panel provider became a desktop startup dependency"
             exit 1
           fi
       - name: Check text rasterization, native panel geometry, and interaction
@@ -44,11 +53,34 @@ jobs:
           ./build/test_panel_geometry.exe bin/winwm.exe
           gcc -std=c11 -Wall -Wextra -Werror -municode -Isrc tools/test_material.c build/obj/win_platform/layer.o build/obj/config/config.o build/obj/command/command.o -lcomctl32 -ldwmapi -lgdi32 -o build/test_material.exe
           ./build/test_material.exe
+          cmd.exe //c build.bat build/test-bar-workspaces.exe
+          ./build/test-bar-workspaces.exe
       - name: Check focus across application windows, popups, and edit controls
         shell: msys2 {0}
         run: |
           gcc -std=c11 -O2 -flto -Wall -Wextra -Werror -DUNICODE -D_UNICODE -Isrc tools/test_focus.c src/model/model.c src/os_win32/os_win32.c -ldwmapi -o build/test_focus.exe
           ./build/test_focus.exe
+      - name: Check input routing and responsiveness with a stalled window or picker
+        shell: msys2 {0}
+        run: |
+          gcc -std=c11 -O2 -Wall -Wextra -Werror -DUNICODE -D_UNICODE -Isrc tools/test_input.c -o build/test_input.exe
+          ./build/test_input.exe
+          gcc -std=c11 -O2 -Wall -Wextra -Werror -DUNICODE -D_UNICODE -Isrc tools/test_open_with.c -lcomctl32 -lole32 -loleaut32 -luuid -lgdi32 -o build/test_open_with.exe
+          ./build/test_open_with.exe
+          gcc -std=c11 -O2 -flto -Wall -Wextra -Werror -DUNICODE -D_UNICODE -Isrc tools/test_security_actions.c -lshell32 -lole32 -luuid -o build/test_security_actions.exe
+          ./build/test_security_actions.exe
+          gcc -std=c11 -O2 -flto -Wall -Wextra -Werror -DUNICODE -D_UNICODE -Isrc tools/test_window_opacity.c src/os_win32/os_win32.c -ldwmapi -o build/test_window_opacity.exe
+          ./build/test_window_opacity.exe
+          gcc -std=c11 -O2 -Wall -Wextra -Werror -DUNICODE -D_UNICODE -Isrc tools/test_work_area.c -o build/test_work_area.exe
+          ./build/test_work_area.exe
+      - name: Check normal startup, shell refusal, delayed takeover, and exit
+        shell: msys2 {0}
+        run: |
+          gcc -std=c11 -O2 -Wall -Wextra -Werror -municode -Isrc tools/test_explorer.c -ladvapi32 -o build/test_explorer.exe
+          ./build/test_explorer.exe
+          cmd.exe //c build.bat build/winwm-handoff-test.exe
+          gcc -std=c11 -Wall -Wextra -Werror -municode tools/test_startup.c -o build/test_startup.exe
+          ./build/test_startup.exe bin/winwm.exe build/winwm-handoff-test.exe
       - name: Validate first startup with the shipped configuration
         shell: pwsh
         run: |

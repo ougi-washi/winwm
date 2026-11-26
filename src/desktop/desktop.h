@@ -24,11 +24,10 @@ enum {
     msg_network,
     msg_audio,
     msg_hover,
-    msg_desktop_menu,
     msg_catalog,
-    msg_pointer_select, msg_drag_preview, msg_drag_limits, msg_run_result, msg_shell_started, msg_pointer_down,
+    msg_pointer_select, msg_drag_preview, msg_drag_limits, msg_run_result, msg_pointer_down,
     msg_titles, msg_environment, msg_notifications, msg_notification_published, msg_notification_banner, msg_notification_open,
-    msg_tray_changed, msg_tray_refresh
+    msg_tray_changed, msg_tray_refresh, msg_pointer_gesture
 };
 
 typedef struct w_output_state {
@@ -37,6 +36,10 @@ typedef struct w_output_state {
     bool live, bar_hidden;
     w_rect screen, available, work;
     int dpi;
+    ULONGLONG selection_tick;
+    HWND selection_foreground;
+    bool selection_foreground_visible;
+    w_window_id last_activation;
     w_bar_window bar;
     HWND tabs;
     w_tab_layout tab_layout;
@@ -50,6 +53,8 @@ typedef struct w_window_state {
     unsigned tab_title_revision;
     bool tab_title_dirty;
     ULONGLONG workspace_hide_tick;
+    uint64_t withdrawal_intent;
+    bool withdrawing_foreground;
     int displaced_from;
     w_rect issued, issued_native, rejected_bounds, float_before_request, drag_start;
     w_rect saved_float_work;
@@ -92,9 +97,9 @@ typedef struct w_desktop_state {
     w_output_state outputs[output_limit];
     w_window_state windows[window_limit];
     w_ipc_channel channels[ipc_slots];
-    bool preview, ipc_live, resize, inhibit, hide_bars, refresh_pending, ready, first_input, loading;
+    bool preview, publish_work, ipc_live, resize, inhibit, hide_bars, refresh_pending, ready, first_input, loading;
     bool registered[binding_limit];
-    uint64_t revision;
+    uint64_t revision, application_launches;
     HWINEVENTHOOK hooks[7];
     char status[512];
     wchar_t clips[24][4096];
@@ -110,9 +115,13 @@ extern w_desktop_state desk;
 //~ Desktop Interface
 
 void w_desktop_schedule(void);
+uint64_t w_desktop_activation_intent(void);
 void w_desktop_scan(bool focus_new);
 void w_desktop_event(HWND hwnd, DWORD event, DWORD event_tick);
+void w_desktop_place_chooser(HWND window, DWORD event);
+bool w_desktop_show_chooser_list(HWND window);
 void w_desktop_outputs(void);
+bool w_desktop_work_changed(void);
 void w_desktop_measure_output(int output);
 HWND w_desktop_tabs_update(int output, const int *slots, int count, int selected, w_rect bounds);
 int w_desktop_output_for_bounds(int current, w_rect r);
@@ -178,6 +187,8 @@ void w_desktop_capture(int output);
 bool w_desktop_capture_window(HWND target, DWORD pid);
 int w_desktop_find(HWND w);
 void w_desktop_activate(int slot);
+void w_desktop_record_selection(int output);
+void w_desktop_reclaim_focus(void);
 void w_desktop_hover(POINT p);
 void w_desktop_focus_cancel(void);
 bool w_desktop_focus_pending(void);

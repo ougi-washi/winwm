@@ -279,7 +279,24 @@ HANDLE w_os_launch_positioned(const wchar_t *exe, const wchar_t *arg, POINT orig
     return w_launch_at(exe, arg, NULL, &origin);
 }
 
+static bool standalone_panels;
+
+void w_os_prefer_standalone_panels(bool prefer) {
+    // Session startup sets this before any launch workers are created.
+    standalone_panels = prefer;
+}
+
 bool w_os_shell_execute(const wchar_t *file, const wchar_t *parameters, const wchar_t *directory, bool admin) {
+    // Explorer's HWND may still exist while it is shutting down. A regular
+    // session uses its own panels throughout the handoff.
+    const wchar_t *tool = !_wcsicmp(file, L"ms-settings:") ? L"--tool-windows_settings" :
+                          !_wcsicmp(file, L"ms-settings:windowsupdate") ? L"--tool-windows_update" :
+                          (!_wcsicmp(file, L"windowsdefender:") || !_wcsicmp(file, L"ms-settings:windowsdefender"))
+                              ? L"--tool-windows_security" : NULL;
+    if (tool && (!parameters || !*parameters) && (standalone_panels || !GetShellWindow())) {
+        wchar_t self[os_path_cap];
+        return w_os_self(self, count_of(self)) && w_os_run_executable(self, tool, directory, admin);
+    }
     w_environment_for_launch();
     HRESULT apartment = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     SHELLEXECUTEINFOW info = {.cbSize = sizeof(info), .fMask = SEE_MASK_NOASYNC | SEE_MASK_FLAG_NO_UI,
@@ -457,6 +474,42 @@ bool w_os_cloaked(HWND w) {
     return SUCCEEDED(DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked, sizeof(cloaked))) && cloaked;
 }
 
+bool w_os_open_with_broker(HWND window) {
+    DWORD pid = 0;
+    if (!GetWindowThreadProcessId(window, &pid) || pid == GetCurrentProcessId()) return false;
+    // All window discovery and hover handling runs on the desktop thread.
+    // Keeping the process handle open also prevents its PID from being reused.
+    static HANDLE process;
+    static DWORD last_pid;
+    static bool matches;
+    if (pid == last_pid) return matches;
+    if (process) CloseHandle(process);
+    process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    last_pid = process ? pid : 0;
+    wchar_t image[MAX_PATH], system[MAX_PATH];
+    DWORD length = count_of(image);
+    UINT n = GetSystemWindowsDirectoryW(system, count_of(system));
+    matches = process && n && n < count_of(system) && QueryFullProcessImageNameW(process, 0, image, &length) &&
+              length > n && !_wcsnicmp(image, system, n) &&
+              (!_wcsicmp(image + n, L"\\System32\\OpenWith.exe") || !_wcsicmp(image + n, L"\\SysWOW64\\OpenWith.exe"));
+    return matches;
+}
+
+// Check the surface class before querying a foreign process. Discovery and
+// focus run on the desktop's input thread. Other windows in the broker (such
+// as the file browser it opens) keep their own placement and focus policy.
+static bool w_shell_dialog_class(HWND window, const wchar_t *cls) {
+    if (!wcscmp(cls, L"Shell_Dialog")) return true;
+    return (!wcscmp(cls, L"Open With") || !wcscmp(cls, L"Windows.UI.Core.CoreWindow")) &&
+           w_os_open_with_broker(window);
+}
+
+bool w_os_shell_dialog(HWND window) {
+    wchar_t cls[80];
+    return window && GetClassNameW(window, cls, count_of(cls)) && w_shell_dialog_class(window, cls) &&
+           window == GetAncestor(window, GA_ROOT);
+}
+
 bool w_os_candidate(HWND w, DWORD *pid) {
     if (!w || !IsWindowVisible(w) || GetAncestor(w, GA_ROOT) != w ||
         !GetWindowThreadProcessId(w, pid) || *pid == GetCurrentProcessId() || GetPropW(w, L"winwm.ignore"))
@@ -469,11 +522,11 @@ bool w_os_candidate(HWND w, DWORD *pid) {
     const wchar_t *skip[] = {
         L"Progman",          L"WorkerW",          L"Shell_TrayWnd", L"Shell_SecondaryTrayWnd",
         L"#32768",           L"tooltips_class32", L"SysShadow",     L"Windows.UI.Core.CoreWindow",
-        L"WinwmHost"};
+        L"WinwmHost", L"Shell_Dim", L"Open With Dummy Window Class For Interim Dialog"};
     for (size_t i = 0; i < count_of(skip); i++)
         if (!_wcsicmp(cls, skip[i]))
             return false;
-    return !w_os_cloaked(w);
+    return !w_shell_dialog_class(w, cls) && !w_os_cloaked(w);
 }
 
 // Properties are owned by the HWND lifetime. A reused handle never inherits recovery data.
@@ -558,6 +611,7 @@ failed:
 enum { hide_pending = 1, hidden_confirmed, show_pending };
 
 static const wchar_t visibility_prop[] = L"winwm.hidden";
+static const wchar_t visibility_tick[] = L"winwm.visibility_tick";
 bool w_os_shell_hidden(HWND window) {
     return GetPropW(window, visibility_prop) != NULL;
 }
@@ -571,6 +625,26 @@ bool w_os_ready_for_focus(HWND window) {
     return (!state || state == show_pending) && IsWindowVisible(window) && !IsIconic(window);
 }
 
+static void w_visibility_landed(HWND window, int phase) {
+    if (phase == hide_pending)
+        SetPropW(window, visibility_prop, (HANDLE)(uintptr_t)hidden_confirmed);
+    else
+        RemovePropW(window, visibility_prop);
+    RemovePropW(window, visibility_tick);
+}
+
+void w_os_visibility_event(HWND window, DWORD event, DWORD event_tick) {
+    int phase = (int)(uintptr_t)GetPropW(window, visibility_prop);
+    if (!((phase == hide_pending && event == EVENT_OBJECT_HIDE) ||
+          (phase == show_pending && event == EVENT_OBJECT_SHOW))) return;
+    ULONGLONG issued = (uintptr_t)GetPropW(window, visibility_tick);
+    ULONGLONG now = GetTickCount64();
+    // A client may immediately reverse the native operation before our UI
+    // thread sees it. Its dated completion still releases our pending request.
+    if (issued && (DWORD)((DWORD)now - event_tick) <= now - issued)
+        w_visibility_landed(window, phase);
+}
+
 ////////////////
 //~ Visibility and appearance
 
@@ -580,12 +654,12 @@ bool w_os_set_visible(HWND w, bool wanted) {
     if (state == hide_pending) {
         if (visible)
             return false;
+        w_visibility_landed(w, state);
         state = hidden_confirmed;
-        SetPropW(w, visibility_prop, (HANDLE)(uintptr_t)state);
     } else if (state == show_pending) {
         if (!visible)
             return false;
-        RemovePropW(w, visibility_prop);
+        w_visibility_landed(w, state);
         state = 0;
     }
     if (wanted ? !state : !visible)
@@ -597,6 +671,7 @@ bool w_os_set_visible(HWND w, bool wanted) {
     int next = wanted ? show_pending : hide_pending;
     if (!SetPropW(w, visibility_prop, (HANDLE)(uintptr_t)next))
         return false;
+    SetPropW(w, visibility_tick, (HANDLE)(uintptr_t)GetTickCount64());
     UINT flags = SWP_ASYNCWINDOWPOS | SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE |
                  (wanted ? SWP_SHOWWINDOW : SWP_HIDEWINDOW);
     // SWP_NOACTIVATE can leave an invisible panel as the foreground window.
@@ -609,17 +684,21 @@ bool w_os_set_visible(HWND w, bool wanted) {
         SetPropW(w, visibility_prop, (HANDLE)(uintptr_t)state);
     else
         RemovePropW(w, visibility_prop);
+    RemovePropW(w, visibility_tick);
     return false;
 }
 
 static void w_release_visibility(HWND w) {
     if (GetPropW(w, visibility_prop) && SetWindowPos(w, NULL, 0, 0, 0, 0,
                      SWP_ASYNCWINDOWPOS | SWP_NOSIZE | SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE |
-                         SWP_SHOWWINDOW))
+                         SWP_SHOWWINDOW)) {
         RemovePropW(w, visibility_prop);
+        RemovePropW(w, visibility_tick);
+    }
 }
 
 static const wchar_t dim_prop[] = L"winwm.dim_added";
+static const wchar_t dim_job_prop[] = L"winwm.dim_job";
 #define dim_releasing ((HANDLE)2)
 static void w_remove_dim(HWND w) {
     if (GetPropW(w, dim_prop)) {
@@ -635,6 +714,12 @@ static SRWLOCK layer_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE layers_done = CONDITION_VARIABLE_INIT;
 static unsigned restoring_layers;
 
+static HANDLE w_layer_mutex(HWND w) {
+    wchar_t name[80];
+    swprintf(name, count_of(name), L"Local\\winwm.layer.%p", (void *)w);
+    return CreateMutexW(NULL, FALSE, name);
+}
+
 static void w_layer_finished(void) {
     AcquireSRWLockExclusive(&layer_lock);
     if (!--restoring_layers) WakeAllConditionVariable(&layers_done);
@@ -643,11 +728,9 @@ static void w_layer_finished(void) {
 
 static DWORD WINAPI w_release_layer(void *arg) {
     HWND w = arg;
-    wchar_t name[80];
-    swprintf(name, count_of(name), L"Local\\winwm.layer.%p", (void *)w);
-    HANDLE lock = CreateMutexW(NULL, FALSE, name);
+    HANDLE lock = w_layer_mutex(w);
     if (lock) {
-        DWORD wait = WaitForSingleObject(lock, 0);
+        DWORD wait = WaitForSingleObject(lock, INFINITE);
         if (wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED) {
             if (GetPropW(w, dim_prop) == dim_releasing) {
                 SetLayeredWindowAttributes(w, 0, 255, LWA_ALPHA);
@@ -663,12 +746,14 @@ static DWORD WINAPI w_release_layer(void *arg) {
 
 static BOOL CALLBACK w_queue_layer(HWND w, LPARAM unused) {
     (void)unused;
-    if (GetPropW(w, dim_prop) && SetPropW(w, dim_prop, dim_releasing)) {
-        AcquireSRWLockExclusive(&layer_lock);
+    AcquireSRWLockExclusive(&layer_lock);
+    bool restore = GetPropW(w, dim_prop) && SetPropW(w, dim_prop, dim_releasing);
+    if (restore) {
+        RemovePropW(w, dim_job_prop);
         ++restoring_layers;
-        ReleaseSRWLockExclusive(&layer_lock);
-        if (!QueueUserWorkItem(w_release_layer, w, WT_EXECUTELONGFUNCTION)) w_layer_finished();
     }
+    ReleaseSRWLockExclusive(&layer_lock);
+    if (restore && !QueueUserWorkItem(w_release_layer, w, WT_EXECUTELONGFUNCTION)) w_layer_finished();
     return TRUE;
 }
 
@@ -715,31 +800,98 @@ bool w_os_direct_surface(HWND w, DWORD pid) {
     return direct;
 }
 
-bool w_os_window_opacity(HWND w, BYTE alpha, bool retain_layer) {
-    if (GetPropW(w, dim_prop) == dim_releasing)
-        return false;
-    if (alpha == 255 && !retain_layer) {
-        w_remove_dim(w);
-        return true;
-    }
-    if (GetPropW(w, dim_prop)) {
-        // Changing the extended style on every focus transition rebuilds the window's
-        // redirection surface. Keep our layer and change only its opacity.
-        return SetLayeredWindowAttributes(w, 0, alpha, LWA_ALPHA) != 0;
-    }
-    if (alpha == 255)
-        return true;
+typedef struct w_layer_update {
+    struct w_layer_update *next;
+    HWND window;
+    HANDLE cookie;
+    BYTE alpha;
+    bool retain;
+} w_layer_update;
+
+static w_layer_update *layer_updates;
+static DWORD next_layer_cookie;
+
+static void w_apply_opacity(HWND w, BYTE alpha, bool retain) {
     LONG_PTR ex = GetWindowLongPtrW(w, GWL_EXSTYLE);
-    if ((ex & (WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP)) ||
-        (GetClassLongPtrW(w, GCL_STYLE) & (CS_OWNDC | CS_CLASSDC)))
-        return false;
-    if (SetPropW(w, dim_prop, (HANDLE)1)) {
-        SetWindowLongPtrW(w, GWL_EXSTYLE, ex | WS_EX_LAYERED);
-        if (SetLayeredWindowAttributes(w, 0, alpha, LWA_ALPHA))
-            return true;
-        w_remove_dim(w);
+    if (!(ex & WS_EX_LAYERED)) {
+        if (alpha == 255) return;
+        SetLastError(0);
+        if (!SetWindowLongPtrW(w, GWL_EXSTYLE, ex | WS_EX_LAYERED) && GetLastError()) return;
     }
-    return false;
+    if (!SetLayeredWindowAttributes(w, 0, alpha, LWA_ALPHA) || (alpha == 255 && !retain))
+        SetWindowLongPtrW(w, GWL_EXSTYLE, GetWindowLongPtrW(w, GWL_EXSTYLE) & ~WS_EX_LAYERED);
+}
+
+// At most one updater per HWND. The input thread publishes the newest value
+// even while a foreign WM_STYLECHANGING handler is blocked. Recovery can
+// cancel a queued update by removing its HWND-lifetime cookie.
+static DWORD WINAPI w_update_layer(void *arg) {
+    w_layer_update *job = arg;
+    HWND w = job->window;
+    HANDLE mutex = w_layer_mutex(w);
+    DWORD wait = mutex ? WaitForSingleObject(mutex, INFINITE) : WAIT_FAILED;
+    bool acquired = wait == WAIT_OBJECT_0 || wait == WAIT_ABANDONED;
+    AcquireSRWLockExclusive(&layer_lock);
+    while (acquired && GetPropW(w, dim_job_prop) == job->cookie && GetPropW(w, dim_prop) == (HANDLE)1) {
+        BYTE alpha = job->alpha;
+        bool retain = job->retain;
+        ReleaseSRWLockExclusive(&layer_lock);
+        w_apply_opacity(w, alpha, retain);
+        AcquireSRWLockExclusive(&layer_lock);
+        if (alpha == job->alpha && retain == job->retain) break;
+    }
+    if (GetPropW(w, dim_job_prop) == job->cookie) {
+        RemovePropW(w, dim_job_prop);
+        if (GetPropW(w, dim_prop) == (HANDLE)1 && !(GetWindowLongPtrW(w, GWL_EXSTYLE) & WS_EX_LAYERED))
+            RemovePropW(w, dim_prop);
+    }
+    w_layer_update **link = &layer_updates;
+    while (*link != job) link = &(*link)->next;
+    *link = job->next;
+    ReleaseSRWLockExclusive(&layer_lock);
+    if (acquired) ReleaseMutex(mutex);
+    if (mutex) CloseHandle(mutex);
+    free(job);
+    return 0;
+}
+
+bool w_os_window_opacity(HWND w, BYTE alpha, bool retain_layer) {
+    bool ok = false;
+    AcquireSRWLockExclusive(&layer_lock);
+    HANDLE journal = GetPropW(w, dim_prop), cookie = GetPropW(w, dim_job_prop);
+    if (journal == dim_releasing) goto done;
+    if (cookie) {
+        for (w_layer_update *job = layer_updates; job; job = job->next) {
+            if (job->window != w || job->cookie != cookie) continue;
+            job->alpha = alpha;
+            job->retain = retain_layer;
+            ok = true;
+            goto done;
+        }
+    }
+    if (!journal) {
+        if (alpha == 255) { ok = true; goto done; }
+        if ((GetWindowLongPtrW(w, GWL_EXSTYLE) & (WS_EX_LAYERED | WS_EX_NOREDIRECTIONBITMAP)) ||
+            (GetClassLongPtrW(w, GCL_STYLE) & (CS_OWNDC | CS_CLASSDC))) goto done;
+    }
+    w_layer_update *job = malloc(sizeof(*job));
+    if (!job) goto done;
+    cookie = (HANDLE)(uintptr_t)(((uint64_t)GetCurrentProcessId() << 32) | ++next_layer_cookie);
+    *job = (w_layer_update){layer_updates, w, cookie, alpha, retain_layer};
+    if (SetPropW(w, dim_job_prop, cookie)) {
+        if ((journal || SetPropW(w, dim_prop, (HANDLE)1)) &&
+            QueueUserWorkItem(w_update_layer, job, WT_EXECUTELONGFUNCTION)) {
+            layer_updates = job;
+            ok = true;
+            goto done;
+        }
+        if (!journal) RemovePropW(w, dim_prop);
+        RemovePropW(w, dim_job_prop);
+    }
+    free(job);
+done:
+    ReleaseSRWLockExclusive(&layer_lock);
+    return ok;
 }
 
 static bool w_restore_placement(HWND w, bool native) {

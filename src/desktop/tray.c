@@ -389,6 +389,7 @@ static bool w_restore(uint64_t key, bool combined) {
         int output = w_monitor_output(t->monitor);
         if (output < 0) output = w_monitor_output(MonitorFromWindow(t->hwnd,MONITOR_DEFAULTTONEAREST));
         if (output >= 0) {
+            w_desktop_record_selection(output);
             desk.model.output = output;
             w_model_workspace(&desk.model,t->workspace);
             w_desktop_schedule();

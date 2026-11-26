@@ -4,8 +4,12 @@
 // Use a private desktop and its thread-local active window so USER32 delivers
 // real activation and focus messages without taking over the user's desktop.
 static unsigned transfers;
+static unsigned denied_transfers;
+static HWND hung_window;
+static BOOL hung(HWND window) { return (window && window == hung_window) || IsHungAppWindow(window); }
 static BOOL activate(HWND window) {
     ++transfers;
+    if (denied_transfers) { --denied_transfers; return FALSE; }
     SetActiveWindow(window);
     return GetActiveWindow() == window;
 }
@@ -17,6 +21,10 @@ static BOOL thread_info(DWORD thread, GUITHREADINFO *info) {
 #define GetForegroundWindow GetActiveWindow
 #define SetForegroundWindow activate
 #define GetGUIThreadInfo thread_info
+#define IsHungAppWindow hung
+static HWND broker_dialog;
+static bool shell_dialog(HWND window) { return (window && window == broker_dialog) || w_os_shell_dialog(window); }
+#define w_os_shell_dialog shell_dialog
 #include "../src/desktop/focus.c"
 
 w_desktop_state desk;
@@ -24,8 +32,13 @@ bool w_palette_shown(void) { return false; }
 bool w_notice_visible(void) { return false; }
 bool w_bar_menu_active(void) { return false; }
 HANDLE w_desktop_popup_process(void) { return NULL; }
-uint64_t w_input_pointer_press_count(void) { return 0; }
-void w_desktop_schedule(void) {}
+static uint64_t pointer_presses;
+uint64_t w_input_pointer_press_count(void) { return pointer_presses; }
+uint64_t w_desktop_activation_intent(void) { return pointer_presses; }
+static unsigned scheduled;
+void w_desktop_schedule(void) { ++scheduled; }
+static int chooser_lists;
+bool w_desktop_show_chooser_list(HWND window) { ++chooser_lists; return window == broker_dialog; }
 
 int w_desktop_find(HWND window) {
     for (int i = 0; i < window_limit; ++i)
@@ -59,6 +72,15 @@ static void hover(HWND window) {
     CHECK(ClientToScreen(window, &point));
     CHECK(GetAncestor(WindowFromPoint(point), GA_ROOT) == GetAncestor(window, GA_ROOT));
     w_desktop_hover(point);
+}
+
+static void pump_focus(void) {
+    ULONGLONG until = GetTickCount64() + 500;
+    while (w_desktop_focus_pending() && GetTickCount64() < until) {
+        MSG msg;
+        while (PeekMessageW(&msg, NULL, 0, 0, PM_REMOVE)) DispatchMessageW(&msg);
+        Sleep(5);
+    }
 }
 
 int main(void) {
@@ -147,6 +169,14 @@ int main(void) {
     w_desktop_focus_apply();
     CHECK(GetActiveWindow() == dialog && transfers == 0 && !w_desktop_focus_pending());
 
+    // A native keyboard activation can select a different app or dialog
+    // between discovery and the deferred foreground request.
+    SetActiveWindow(owner);
+    CHECK(w_desktop_focus_new(first));
+    SetActiveWindow(dialog);
+    w_desktop_focus_apply();
+    CHECK(GetActiveWindow() == dialog && !w_desktop_focus_pending());
+
     SetCapture(dialog);
     hover(owner);
     CHECK(GetActiveWindow() == dialog);
@@ -156,6 +186,145 @@ int main(void) {
     EnableWindow(document, FALSE);
     hover(dialog);
     CHECK(GetActiveWindow() == dialog && desk.model.focus == second.slot);
+
+    EnableWindow(document, TRUE);
+    SetActiveWindow(owner);
+    CHECK(w_desktop_focus_new(first));
+    // The in-process Windows picker uses this class independently of the
+    // caller's executable, language and main window.
+    wc.lpszClassName = L"Shell_Dialog";
+    CHECK(RegisterClassW(&wc));
+    HWND embedded = CreateWindowW(wc.lpszClassName, L"", WS_CHILD | WS_VISIBLE,
+                                  0, 0, 40, 40, owner, NULL, wc.hInstance, NULL);
+    CHECK(embedded && !w_os_shell_dialog(embedded));
+    DestroyWindow(embedded);
+    HWND chooser = CreateWindowW(wc.lpszClassName, L"Chooser", WS_POPUP,
+                            0, 0, 1, 1, NULL, NULL, wc.hInstance, NULL);
+    CHECK(chooser != NULL);
+    desk.outputs[0].live = true;
+    desk.outputs[0].work = (w_rect){32, 24, 640, 360};
+    desk.outputs[0].dpi = 96;
+    // Old show events can be dispatched after the user already switched apps.
+    SetWindowPos(chooser, NULL, -110, -70, 160, 100, SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    w_rect background = w_os_bounds(chooser);
+    w_desktop_place_chooser(chooser, EVENT_OBJECT_SHOW);
+    CHECK(w_rect_equal(w_os_bounds(chooser), background) && GetActiveWindow() == owner);
+    SetWindowPos(chooser, NULL, 0, 0, 1, 1, SWP_NOZORDER | SWP_NOACTIVATE);
+    ShowWindow(chooser, SW_SHOW);
+    SetActiveWindow(chooser);
+    dismiss_on_deactivation = chooser;
+    w_desktop_place_chooser(chooser, EVENT_OBJECT_SHOW);
+    SetWindowPos(chooser, NULL, -110, -70, 160, 100, SWP_NOZORDER | SWP_NOACTIVATE);
+    w_desktop_place_chooser(chooser, EVENT_OBJECT_LOCATIONCHANGE);
+    CHECK(w_rect_equal(w_os_bounds(chooser), ((w_rect){272, 154, 160, 100})));
+    transfers = 0;
+    w_desktop_focus_apply();
+    CHECK(!w_desktop_focus_pending() && !w_desktop_focus_new(second));
+    hover(document);
+    CHECK(IsWindowVisible(chooser) && GetActiveWindow() == chooser && transfers == 0);
+    SetWindowPos(chooser, NULL, 104, 96, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+    w_desktop_place_chooser(chooser, EVENT_OBJECT_LOCATIONCHANGE);
+    w_desktop_place_chooser(chooser, EVENT_SYSTEM_FOREGROUND);
+    CHECK(w_rect_equal(w_os_bounds(chooser), ((w_rect){104, 96, 160, 100})));
+    CHECK(chooser_lists == 0);
+    // Closing the chooser immediately restores normal focus-follows-mouse.
+    DestroyWindow(chooser);
+    dismiss_on_deactivation = NULL;
+    hover(document);
+    CHECK(GetActiveWindow() == document);
+    // A shell-less broker can leave its app list at zero height, with only
+    // its confirmation strip visible. Keep the strip at its native size.
+    wc.lpszClassName = L"Open With";
+    CHECK(RegisterClassW(&wc));
+    broker_dialog = CreateWindowExW(WS_EX_TOOLWINDOW, wc.lpszClassName, L"", WS_POPUP,
+                                    -224, -30, 448, 61, NULL, NULL, wc.hInstance, NULL);
+    CHECK(broker_dialog != NULL);
+    ShowWindow(broker_dialog, SW_SHOW);
+    w_desktop_place_chooser(broker_dialog, EVENT_SYSTEM_FOREGROUND);
+    w_desktop_place_chooser(broker_dialog, EVENT_OBJECT_LOCATIONCHANGE);
+    CHECK(chooser_lists == 1 && w_rect_equal(w_os_bounds(broker_dialog), ((w_rect){128,173,448,61})));
+    DestroyWindow(broker_dialog);
+
+    wc.lpszClassName = L"WinwmEvents";
+    CHECK(RegisterClassW(&wc));
+    desk.root = CreateWindowW(wc.lpszClassName, L"Private desktop", WS_POPUP, 700, 400, 2, 2,
+                              NULL, NULL, wc.hInstance, NULL);
+    CHECK(desk.root);
+    ShowWindow(desk.root, SW_SHOWNOACTIVATE);
+    SetActiveWindow(owner);
+    w_model_workspace(&desk.model, 1);
+    transfers = 0;
+    denied_transfers = 1;
+    w_desktop_focus_empty();
+    CHECK(w_desktop_focus_pending() && GetActiveWindow() == owner);
+    pump_focus();
+    CHECK(transfers == 2 && !w_desktop_focus_pending() && GetActiveWindow() == desk.root && desk.model.focus == -1);
+
+    w_model_workspace(&desk.model, 0);
+    denied_transfers = 1;
+    w_request_focus(first.slot, false);
+    w_desktop_focus_apply();
+    pump_focus();
+    CHECK(!w_desktop_focus_pending() && GetActiveWindow() == owner && desk.model.focus == first.slot);
+
+    denied_transfers = 1;
+    w_request_focus(second.slot, false);
+    w_desktop_focus_apply();
+    CHECK(w_desktop_focus_pending());
+    ++pointer_presses;
+    w_desktop_focus_apply();
+    CHECK(!w_desktop_focus_pending() && GetActiveWindow() == owner);
+
+    transfers = 0;
+    denied_transfers = 4;
+    w_request_focus(second.slot, false);
+    w_desktop_focus_apply();
+    pump_focus();
+    CHECK(transfers == 2 && !w_desktop_focus_pending());
+    denied_transfers = 0;
+    SetActiveWindow(desk.root);
+    w_model_workspace(&desk.model, 1);
+    desk.windows[first.slot].wants_visible = false;
+    scheduled = transfers = 0;
+    w_desktop_activate(first.slot);
+    CHECK(scheduled == 1 && transfers == 0 && w_desktop_focus_pending());
+    CHECK(!w_desktop_focus_new(second));
+    desk.windows[first.slot].wants_visible = true;
+    w_desktop_focus_apply();
+    CHECK(GetActiveWindow() == owner && transfers == 1 && !w_desktop_focus_pending());
+    w_desktop_activate(second.slot);
+    CHECK(w_os_app_window(GetActiveWindow()) == document && !w_desktop_focus_pending());
+    ShowWindow(owner, SW_HIDE);
+    hung_window = owner;
+    w_request_focus(first.slot, false);
+    w_desktop_focus_apply();
+    CHECK(!w_desktop_focus_pending());
+    ShowWindow(owner, SW_SHOWNOACTIVATE);
+    hung_window = NULL;
+    w_desktop_focus_apply();
+    CHECK(w_os_app_window(GetActiveWindow()) == document);
+
+    // A native app can immediately re-show its window before the manager
+    // observes the hide. Only the notification for the outstanding request
+    // acknowledges it; stale notifications leave that request pending.
+    DWORD before_hide = GetTickCount() - 1000;
+    CHECK(w_os_set_visible(owner, false) && !IsWindowVisible(owner));
+    ShowWindow(owner, SW_SHOWNOACTIVATE);
+    w_os_visibility_event(owner, EVENT_OBJECT_HIDE, before_hide);
+    CHECK(!w_os_hidden_confirmed(owner));
+    w_os_visibility_event(owner, EVENT_OBJECT_HIDE, GetTickCount());
+    CHECK(w_os_hidden_confirmed(owner));
+    CHECK(w_os_set_visible(owner, false) && !IsWindowVisible(owner));
+    w_os_visibility_event(owner, EVENT_OBJECT_HIDE, GetTickCount());
+    CHECK(w_os_set_visible(owner, true) && IsWindowVisible(owner));
+    // The reverse ordering happens when an application dismisses itself
+    // immediately after its workspace is shown.
+    ShowWindow(owner, SW_HIDE);
+    w_os_visibility_event(owner, EVENT_OBJECT_SHOW, before_hide);
+    CHECK(w_os_shell_hidden(owner));
+    w_os_visibility_event(owner, EVENT_OBJECT_SHOW, GetTickCount());
+    CHECK(!w_os_shell_hidden(owner));
+    DestroyWindow(desk.root);
     DestroyWindow(owner);
     return failures ? 1 : 0;
 }

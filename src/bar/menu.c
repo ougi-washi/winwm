@@ -677,7 +677,7 @@ static void w_show(w_bar_window *bar, int hit, const w_menu_row *rows, int count
     SendMessageW(menu->list, LB_SETCURSEL, selected, 0);
     open_menu = menu;
     InvalidateRect(bar->hwnd,&bar->hits[hit].box,FALSE);
-    w_layer_fade_to(popup,&menu->fade,255,w_theme_layer_timing(true),menu->motion_enabled);
+    w_layer_present(popup,&menu->fade);
     ShowWindow(popup, SW_SHOW);
     SetForegroundWindow(popup);
     if (open_menu == menu && IsWindow(popup))

@@ -95,9 +95,6 @@ static DWORD WINAPI w_launch_thread(void *ptr) {
         if (why) {
             if (j->kind == launch_window_capture)
                 w_str_copy(why,512,launched ? "Window capture copied to clipboard." : "Could not capture the selected window.");
-            else if (j->kind == launch_command && !GetShellWindow() &&
-                     (!_strnicmp(j->exe, "ms-settings:", 12) || !_strnicmp(j->exe, "windowsdefender:", 16)))
-                w_str_copy(why, 512, "Windows could not open this panel. Exit winwm and run winwm.exe --preview to use it with Explorer.");
             else snprintf(why, 512, "Could not open %.380s.", j->exe);
             if (!PostMessageW(desk.root, msg_status, 0, (LPARAM)why))
                 free(why);
@@ -119,6 +116,8 @@ static bool w_queue_launch(const char *exe, const char *arg, enum launch_kind ki
         free(j);
         return false;
     }
+    if (kind != launch_window_capture && kind != launch_panel)
+        ++desk.application_launches;
     return true;
 }
 
@@ -133,6 +132,14 @@ bool w_desktop_capture_window(HWND target, DWORD pid) {
     char mode[96];
     snprintf(mode,sizeof(mode),"--tool-capture_window-%llx-%lu",(unsigned long long)(uintptr_t)target,pid);
     return w_queue_launch(mode,NULL,launch_window_capture,NULL,false);
+}
+
+bool w_desktop_show_chooser_list(HWND window) {
+    DWORD pid = 0;
+    if (!GetWindowThreadProcessId(window, &pid)) return false;
+    char mode[96];
+    snprintf(mode, sizeof(mode), "--tool-open_with-%llx-%lu", (unsigned long long)(uintptr_t)window, pid);
+    return w_queue_launch(mode, NULL, launch_panel, NULL, false);
 }
 
 static DWORD WINAPI w_start_configured_programs(void *ptr) {
@@ -313,13 +320,18 @@ bool w_desktop_run_anchored(const w_command *c, int output, bool admin, const w_
     }
     bool popup = anchor && !admin && w_panel_command(c->kind) &&
                  c->kind != cmd_capture_region && c->kind != cmd_record && c->kind != cmd_pick_color;
+    bool navigates = w_command_navigates(c->kind);
     if (c->kind != cmd_close && c->kind != cmd_notifications && c->kind != cmd_notify)
-        w_notice_close();
-    if (!popup && (anchor || c->kind == cmd_workspace_select || c->kind == cmd_workspace_back ||
-                   c->kind == cmd_output_next || c->kind == cmd_menu || c->kind == cmd_notifications))
+        w_notice_close(!navigates);
+    if (navigates) {
+        // The destination workspace owns the next foreground selection.
+        w_palette_close(false);
+        w_bar_menu_close(NULL, false);
+    }
+    if (!popup && (anchor || navigates || c->kind == cmd_menu || c->kind == cmd_notifications))
         w_desktop_popup_cancel();
     if (popup) {
-        w_palette_close();
+        w_palette_close(true);
         w_desktop_focus_cancel();
         ok = w_desktop_popup_toggle(anchor, c->kind);
     } else if (w_panel_command(c->kind)) {
@@ -349,7 +361,10 @@ bool w_desktop_run_anchored(const w_command *c, int output, bool admin, const w_
                 configured = desk.config.apps[j].path;
                 break;
             }
-        ok = configured ? w_launch(configured,"",admin) : w_catalog_launch(c->arg,admin) || w_launch(c->arg,"",admin);
+        if (!configured && w_catalog_launch(c->arg,admin))
+            ++desk.application_launches;
+        else
+            ok = w_launch(configured ? configured : c->arg,"",admin);
         break;
     }
     case cmd_capture_window: {
@@ -369,7 +384,7 @@ bool w_desktop_run_anchored(const w_command *c, int output, bool admin, const w_
     case cmd_notifications:
         w_desktop_focus_cancel();
         w_bar_menu_close(NULL,true);
-        w_palette_close();
+        w_palette_close(true);
         if (desk.resize) { desk.resize = false; w_input_mode(false); }
         w_desktop_notifications_open(output,anchor);
         break;

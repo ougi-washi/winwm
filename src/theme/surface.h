@@ -24,6 +24,7 @@ void w_theme_material(HWND window);
 void w_theme_dock_material(HWND window);
 void w_theme_native_controls(HWND window);
 void w_theme_publish(HWND manager);
+bool w_theme_read_published(void);
 void w_theme_follow(HWND tool);
 void w_theme_follow_overlay(HWND tool);
 w_transition w_theme_layer_timing(bool entering);

@@ -214,6 +214,13 @@ void w_desktop_drag_client_resized(int slot) {
 }
 
 bool w_desktop_drag(enum input_drag_event event, POINT point) {
+    if (event == input_drag_commit) {
+        if (grab.kind == drag_float)
+            PostMessageW(desk.root, msg_drag_limits, grab.source.slot, grab.source.generation);
+        if (grab.source.slot >= 0)
+            PostMessageW(desk.root, msg_pointer_select, grab.source.slot, grab.source.generation);
+        return true;
+    }
     if (event == input_drag_cancel) {
         w_desktop_cancel_drag();
         return false;
@@ -264,10 +271,8 @@ bool w_desktop_drag(enum input_drag_event event, POINT point) {
         grab.kind = event == input_drag_reposition ? drag_reposition : drag_float;
         grab.left = point.x < grab.initial.x + grab.initial.w/2;
         grab.top = point.y < grab.initial.y + grab.initial.h/2;
-        if (grab.kind == drag_float) {
+        if (grab.kind == drag_float)
             w_default_limits(GetDpiForWindow(hit));
-            PostMessageW(desk.root, msg_drag_limits, slot, grab.source.generation);
-        }
     } else {
         int edge = desk.borders_hidden ? 0 : desk.config.border_size;
         int tolerance = MulDiv(max(4, edge) + desk.config.gap/2, grab.dpi, 96);
@@ -276,7 +281,5 @@ bool w_desktop_drag(enum input_drag_event event, POINT point) {
             return false;
         grab.kind = drag_splits;
     }
-    if (slot >= 0)
-        PostMessageW(desk.root, msg_pointer_select, slot, grab.source.generation);
     return true;
 }

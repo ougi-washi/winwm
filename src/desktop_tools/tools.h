@@ -18,6 +18,8 @@ enum {
 
 int w_capture_run(const wchar_t *mode);
 int w_settings_run(const wchar_t *page);
+int w_windows_panel_run(const wchar_t *mode);
+int w_open_with_list(const wchar_t *target);
 int w_clock_run(void);
 int w_color_run(void);
 int w_packages_run(const wchar_t *mode);

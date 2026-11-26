@@ -5,6 +5,7 @@
 #include "native_notifications/listener.h"
 #include "shell_host/entry.h"
 #include "os_win32/environment.h"
+#include "os_win32/work_area.h"
 #include "desktop/desktop.h"
 #include "desktop/tray.h"
 #include "tray/host.h"
@@ -18,10 +19,13 @@
 
 w_desktop_state desk;
 static bool event_overflow, logging_off, loaded_programs;
-static bool shell_ready, config_ready, startup_config_loaded;
+static bool check_shell, config_ready, startup_config_loaded;
+static DWORD shell_handoff_error;
+static DWORD binding_generation;
+static uint64_t input_dispatched, input_stale;
 static int pending_events;
 static UINT shell_notification, taskbar_created;
-enum { discovery_timer = 29 };
+enum { discovery_timer = 29, shell_watch_timer = 31, shell_watch_ms = 3000 };
 
 ////////////////
 //~ Desktop Functions
@@ -87,6 +91,10 @@ void w_desktop_schedule(void) {
         desk.refresh_pending = PostMessageW(desk.root, msg_refresh, 0, 0) != 0;
 }
 
+uint64_t w_desktop_activation_intent(void) {
+    return w_input_press_count() + desk.application_launches;
+}
+
 void w_desktop_update_appearance(void) {
     w_effects_preferences();
     w_theme_configure(&desk.config);
@@ -96,8 +104,8 @@ void w_desktop_update_appearance(void) {
 
 void w_desktop_bind(void) {
     w_desktop_update_appearance();
-    w_input_bind(desk.root, msg_command, msg_hover, desk.preview ? 0 : msg_desktop_menu, msg_pointer_down,
-               &desk.config, desk.registered, w_desktop_drag);
+    binding_generation = w_input_bind(desk.root, msg_command, msg_hover, msg_pointer_down, msg_pointer_gesture,
+                                     &desk.config, desk.registered, w_desktop_drag);
 }
 
 static void CALLBACK w_observe(HWINEVENTHOOK hook, DWORD event, HWND w, LONG obj, LONG child, DWORD thread,
@@ -173,9 +181,8 @@ static void w_discover_initial(void) {
 }
 
 static void w_finish_startup(void) {
-    if (desk.ready || !shell_ready || !config_ready) return;
-    // Recovery must own shell restoration before we manage windows or launch
-    // any commands from the user's config. Input and config I/O can overlap it.
+    if (desk.ready || !config_ready) return;
+    // Recovery is attached before the desktop starts accepting input.
     w_desktop_status_configure();
     if (!desk.hide_bars) w_providers_configure(desk.root, msg_devices, &desk.config);
     if (startup_config_loaded) {
@@ -218,7 +225,7 @@ static bool w_startup_ui_ready(void) {
     for (int i = 0; i < desk.config.binding_count; i++)
         if (!desk.registered[i]) return false;
     for (int i = 0; i < output_limit; i++)
-        if (desk.outputs[i].live && !desk.outputs[i].bar.hwnd) return false;
+        if (!desk.hide_bars && desk.outputs[i].live && !desk.outputs[i].bar.hwnd) return false;
     return desk.outputs[desk.model.output].live;
 }
 
@@ -252,14 +259,25 @@ void w_desktop_request(const char *s, char *reply, size_t cap) {
         if (!w_providers_value(s + 15, &v, action, sizeof(action)) || !w_os_utf8(v.text, reply, (int)cap))
             snprintf(reply, cap, "error: unknown provider");
     } else if (!strcmp(s, "doctor")) {
+        int available_bindings = 0;
+        for (int i = 0; i < desk.config.binding_count; ++i)
+            if (desk.registered[i]) ++available_bindings;
         int n = snprintf(
             reply, cap,
-            "desktop protocol 1\nwindow events: %s\nfile browser: %s\ntask manager: %s\nlast message: %s\n"
+            "desktop protocol 1\nsession mode: %s\nwindow events: %s\ninput bindings: %d/%d\n"
+            "file browser: %s\ntask manager: %s\nlast message: %s\n"
             "animations: %s (%s)\nborder width: %d DIP\nnotification capture: %s\nnotification history: %d\n",
-            desk.ready ? "initialized" : "starting", desk.config.file_browser, desk.config.task_manager,
+            desk.preview ? "preview" : "normal", desk.ready ? "initialized" : "starting",
+            available_bindings, desk.config.binding_count, desk.config.file_browser, desk.config.task_manager,
             desk.status, desk.motion_allowed ? "on" : "off",
             desk.config.animations == motion_system ? "follow Windows" : "winwm preference",
             desk.borders_hidden ? 0 : desk.config.border_size, w_desktop_notification_status(), w_notice_count());
+        if (n >= 0 && (size_t)n < cap) {
+            char input[256];
+            w_input_diagnostics(input, sizeof(input));
+            n += snprintf(reply + n, cap - n, "%s\ninput commands: %llu dispatched, %llu stale\n",
+                          input, (unsigned long long)input_dispatched, (unsigned long long)input_stale);
+        }
         DWORD shell_status = w_os_startup_shell();
         HWND host = FindWindowW(L"WinwmHost", NULL);
         HANDLE exit_code = GetPropW(host, L"winwm.child_exit");
@@ -273,9 +291,17 @@ void w_desktop_request(const char *s, char *reply, size_t cap) {
         if (n >= 0 && (size_t)n + 100 < cap)
             n += snprintf(reply + n, cap - n, "Windows shell desktop: %s\n",GetShellWindow() ? "present" : "absent");
         if (n >= 0 && (size_t)n + 100 < cap)
+            n += snprintf(reply + n, cap - n, "Explorer taskbar: %s\n", w_os_explorer_tray_present() ? "present" : "absent");
+        if (n >= 0 && (size_t)n + 100 < cap)
             n += snprintf(reply + n, cap - n, "application tray: %s\nregistered tray icons: %zu\n",
-                          w_tray_is_active() ? "winwm" : desk.preview ? "Explorer preview" : "external or unavailable",
+                          w_tray_is_active() ? "winwm" : desk.preview ? "Windows" : "external or unavailable",
                           w_tray_count());
+        if (shell_handoff_error && n >= 0 && (size_t)n + 100 < cap)
+            n += snprintf(reply + n, cap - n, "Explorer shutdown: retry pending (Win32 %lu)\n",
+                          shell_handoff_error);
+        else if (!desk.preview && (!startup_config_loaded || !w_startup_ui_ready()) &&
+                 n >= 0 && (size_t)n + 100 < cap)
+            n += snprintf(reply + n, cap - n, "shell handoff: waiting for configuration, input and bars\n");
         if (exit_code && n >= 0 && (size_t)n + 120 < cap)
             n += snprintf(reply + n, cap - n, "previous desktop exit: %lu\n",
                           (DWORD)((uintptr_t)exit_code - 1));
@@ -299,11 +325,12 @@ void w_desktop_request(const char *s, char *reply, size_t cap) {
 
 static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (taskbar_created && msg == taskbar_created) {
-        // A replacement tray also broadcasts TaskbarCreated so apps republish their icons.
-        if (!desk.preview && !w_os_explorer_tray_present()) return 0;
-        PostMessageW(hwnd, msg_shell_started, 0, 0);
-        w_position_desktop();
-        if (desk.root) w_desktop_outputs();
+        if (desk.preview) {
+            if (desk.root) w_desktop_outputs();
+        } else {
+            // Our own tray broadcasts this too. Check ownership once, after dispatch.
+            check_shell = true;
+        }
         return 0;
     }
     if (shell_notification && msg == shell_notification) {
@@ -336,14 +363,16 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         if ((wp & 0xfff0) == SC_CLOSE)
             return 0;
         return DefWindowProcW(hwnd, msg, wp, lp);
-    case WM_INPUT:
-        w_input_mouse_motion();
-        return DefWindowProcW(hwnd, msg, wp, lp);
     case WM_INPUTLANGCHANGE:
         w_invalidate_language();
         return DefWindowProcW(hwnd, msg, wp, lp);
-    case msg_desktop_menu: {
-        POINT point = {(LONG)(LONG_PTR)wp, (LONG)lp};
+    case WM_CONTEXTMENU: {
+        if (desk.preview || (HWND)wp != hwnd) return DefWindowProcW(hwnd, msg, wp, lp);
+        if (lp == -1) {
+            w_desktop_action(desk.model.output, "menu");
+            return 0;
+        }
+        POINT point = {(short)LOWORD(lp), (short)HIWORD(lp)};
         HMONITOR monitor = MonitorFromPoint(point, MONITOR_DEFAULTTONULL);
         for (int i = 0; i < output_limit; i++)
             if (desk.outputs[i].live && desk.outputs[i].monitor == monitor) {
@@ -358,6 +387,9 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         w_desktop_hover(p);
         return 0;
     }
+    case msg_pointer_gesture:
+        w_input_pointer_message(wp, lp);
+        return 0;
     case msg_pointer_down: {
         HWND hit = WindowFromPoint((POINT){(LONG)(LONG_PTR)wp, (LONG)lp});
         w_notice_outside(hit);
@@ -388,9 +420,12 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         w_desktop_drag_limits((w_window_id){(int)wp, (uint32_t)lp});
         return 0;
     case msg_command:
-        if ((DWORD)(uintptr_t)GetPropW(hwnd, L"winwm.binding_generation") == (DWORD)lp &&
-            wp < (WPARAM)desk.config.binding_count)
+        if (binding_generation == (DWORD)lp && wp < (WPARAM)desk.config.binding_count) {
+            ++input_dispatched;
             w_desktop_run(&desk.config.bindings[wp].action);
+        } else {
+            ++input_stale;
+        }
         return 0;
     case msg_init:
         w_initialize();
@@ -445,7 +480,8 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
                     w_desktop_start_programs(!loaded_programs);
                     loaded_programs = true;
                 }
-            } else startup_config_loaded = true;
+            }
+            startup_config_loaded = true;
             w_repaint_bars();
         } else
             w_desktop_notify(L"Configuration error", r ? r->error : "Configuration allocation failed");
@@ -539,7 +575,11 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
             w_environment_refresh();
             return 0;
         }
-        if (desk.root && (wp == SPI_SETWORKAREA || wp == SPI_SETLOGICALDPIOVERRIDE))
+        if (wp == SPI_SETWORKAREA) {
+            if (desk.root && (desk.preview || (desk.publish_work && w_desktop_work_changed()))) w_desktop_outputs();
+            return 0;
+        }
+        if (desk.root && wp == SPI_SETLOGICALDPIOVERRIDE)
             w_desktop_outputs();
         w_notification_refresh();
         InvalidateRect(hwnd, NULL, FALSE);
@@ -558,6 +598,14 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
         if (wp) w_catalog_invalidate();
         return 0;
     case WM_TIMER:
+        if (wp == input_health_timer) {
+            w_input_check(desk.registered);
+            return 0;
+        }
+        if (wp == shell_watch_timer) {
+            check_shell = true;
+            return 0;
+        }
         if (wp == animation_timer) {
             w_effects_tick();
             return 0;
@@ -611,18 +659,33 @@ static LRESULT CALLBACK w_desktop_proc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp
     }
 }
 
-typedef struct w_shell_handoff {
-    HANDLE recovery;
-    HWND host;
-} w_shell_handoff;
+static DWORD WINAPI w_await_shell_exit(void *host) {
+    HANDLE worker = w_recovery_take_desktop((HWND)host);
+    if (!worker) return GetLastError();
+    DWORD status;
+    if (WaitForSingleObject(worker, INFINITE) != WAIT_OBJECT_0 || !GetExitCodeThread(worker, &status))
+        status = GetLastError();
+    CloseHandle(worker);
+    return status;
+}
 
-static DWORD WINAPI w_take_shell(void *arg) {
-    const w_shell_handoff *handoff = arg;
-    return w_recovery_take_desktop(handoff->recovery, handoff->host);
+static HANDLE w_begin_handoff(HWND host, HANDLE *original) {
+    DWORD pid = 0;
+    HWND shell = GetShellWindow();
+    if (shell) GetWindowThreadProcessId(shell, &pid);
+    *original = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : NULL;
+    HANDLE worker = CreateThread(NULL, 0, w_await_shell_exit, host, 0, NULL);
+    shell_handoff_error = worker ? ERROR_SUCCESS : GetLastError();
+    if (!worker && *original) {
+        CloseHandle(*original);
+        *original = NULL;
+    }
+    return worker;
 }
 
 int w_session_run(HINSTANCE instance, bool preview) {
     desk.preview = preview;
+    w_os_prefer_standalone_panels(!preview);
     DWORD host = w_os_instance_status(os_host_instance);
     if (host != ERROR_SUCCESS)
         return (int)host;
@@ -680,27 +743,37 @@ int w_session_run(HINSTANCE instance, bool preview) {
         w_os_instance_release(&lock);
         return 3;
     }
-    w_shell_handoff handoff = {recovery,host_window};
+    HANDLE original_shell = NULL;
     HANDLE shell_thread = NULL;
-    bool waiting_for_shell = false, tray_seen = false;
-    shell_ready = preview;
-    if (!preview) {
-        shell_thread = CreateThread(NULL,0,w_take_shell,&handoff,0,NULL);
-        if (!shell_thread) {
-            error = GetLastError();
-            DestroyWindow(desk.root);
-            CloseHandle(recovery);
-            w_os_instance_release(&lock);
-            return (int)error;
-        }
-    }
+    bool first_handoff = !preview;
+    bool work_area_attempted = false;
+    ULONGLONG retry_after = 0;
+    check_shell = !preview;
+    if (!preview) SetTimer(desk.root, shell_watch_timer, shell_watch_ms, NULL);
     w_environment_start(desk.root,msg_environment);
     w_desktop_bind();
     w_os_mark(L"bindings_registered");
     PostMessageW(desk.root, msg_init, 0, 0);
     int result = 0;
     for (;;) {
-        HANDLE handles[2*ipc_slots+4];
+        if (check_shell && !shell_thread && !logging_off && desk.ready && startup_config_loaded &&
+            w_startup_ui_ready() && GetTickCount64() >= retry_after) {
+            check_shell = false;
+            if (first_handoff || w_os_explorer_shell_present()) {
+                first_handoff = false;
+                shell_thread = w_begin_handoff(host_window, &original_shell);
+                if (!shell_thread) retry_after = GetTickCount64() + shell_watch_ms;
+            } else {
+                shell_handoff_error = ERROR_SUCCESS;
+                if (!work_area_attempted) {
+                    work_area_attempted = true;
+                    desk.publish_work = w_work_areas_open(GetCurrentProcessId(),false);
+                    if (desk.publish_work) w_desktop_outputs();
+                }
+                if (!w_tray_is_active()) w_tray_start(desk.root,msg_tray_changed,w_desktop_tray_locate);
+            }
+        }
+        HANDLE handles[2*ipc_slots+5];
         DWORD count = desk.ipc_live ? 2*ipc_slots : 0;
         for (DWORD i = 0; i < count / 2; i++) {
             handles[2*i] = desk.channels[i].peer_event;
@@ -712,6 +785,9 @@ int w_session_run(HINSTANCE instance, bool preview) {
         if (popup) handles[total++] = popup;
         DWORD clipboard_index = total;
         if (desk.clipboard_reader) handles[total++] = desk.clipboard_reader;
+        HANDLE input_thread = w_input_thread();
+        DWORD input_index = total;
+        if (input_thread) handles[total++] = input_thread;
         if (shell_thread) handles[total++] = shell_thread;
         DWORD wait = MsgWaitForMultipleObjectsEx(total, handles, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         if (wait == WAIT_OBJECT_0+count) {
@@ -721,20 +797,20 @@ int w_session_run(HINSTANCE instance, bool preview) {
         if (popup && wait == WAIT_OBJECT_0+count+1) w_desktop_popup_finished();
         if (desk.clipboard_reader && wait == WAIT_OBJECT_0+clipboard_index)
             w_desktop_clipboard_done();
+        if (input_thread && wait == WAIT_OBJECT_0+input_index)
+            w_input_check(desk.registered);
         if (shell_thread && wait == WAIT_OBJECT_0+total-1) {
             if (!GetExitCodeThread(shell_thread,&error)) error = GetLastError();
             CloseHandle(shell_thread);
             shell_thread = NULL;
-            waiting_for_shell = error == ERROR_NOT_FOUND;
-            if (error && !waiting_for_shell) {
-                result = (int)error;
-                break;
-            }
-            shell_ready = true;
-            w_tray_start(desk.root,msg_tray_changed,w_desktop_tray_locate);
-            w_finish_startup();
-            if (waiting_for_shell && tray_seen) PostMessageW(desk.root,msg_shell_started,0,0);
-            tray_seen = false;
+            if (original_shell) CloseHandle(original_shell);
+            original_shell = NULL;
+            shell_handoff_error = error == ERROR_NOT_FOUND ? ERROR_SUCCESS : error;
+            if (shell_handoff_error) retry_after = GetTickCount64() + shell_watch_ms;
+            if (!error && w_tray_is_active() && taskbar_created)
+                PostMessageW(HWND_BROADCAST, taskbar_created, 0, 0);
+            // A new Explorer can appear before the old worker signals completion.
+            check_shell = true;
         }
         if (wait == WAIT_FAILED) {
             result = 4;
@@ -748,25 +824,6 @@ int w_session_run(HINSTANCE instance, bool preview) {
         }
         MSG message;
         for (int i = 0; i < 64 && PeekMessageW(&message, NULL, 0, 0, PM_REMOVE); i++) {
-            if (message.hwnd == desk.root && message.message == msg_shell_started) {
-                // At sign-in Explorer may create its first taskbar after winwm starts.
-                if (shell_thread) tray_seen = true;
-                else if (waiting_for_shell && !logging_off) {
-                    w_tray_stop();
-                    w_desktop_tray_update();
-                    shell_thread = CreateThread(NULL,0,w_take_shell,&handoff,0,NULL);
-                    if (!shell_thread) {
-                        result = (int)GetLastError();
-                        goto done;
-                    }
-                } else if (!preview && !logging_off && w_tray_is_active() && w_os_explorer_tray_present()) {
-                    // Explorer was explicitly restored after startup. Give its tray the registrations.
-                    w_tray_stop();
-                    w_desktop_tray_update();
-                    SendNotifyMessageW(HWND_BROADCAST,taskbar_created,0,0);
-                }
-                continue;
-            }
             if (message.message == WM_QUIT) {
                 result = (int)message.wParam;
                 goto done;
@@ -778,15 +835,15 @@ int w_session_run(HINSTANCE instance, bool preview) {
         }
     }
 done:
+    desk.publish_work = false;
+    w_work_areas_close();
+    if (!preview) KillTimer(desk.root, shell_watch_timer);
     w_desktop_notifications_stop();
     w_tray_stop();
     w_catalog_end();
     if (desk.clipboard_enabled) RemoveClipboardFormatListener(desk.root);
     if (desk.clipboard_reader) CloseHandle(desk.clipboard_reader);
-    if (shell_thread) {
-        WaitForSingleObject(shell_thread,INFINITE);
-        CloseHandle(shell_thread);
-    }
+    if (shell_thread) CloseHandle(shell_thread);
     w_desktop_popup_cancel();
     if (w_desktop_popup_process()) w_desktop_popup_finished();
     if ((DWORD)(uintptr_t)GetPropW(host_window,L"winwm.session_pid") == GetCurrentProcessId())
@@ -809,8 +866,12 @@ done:
     if (desk.ipc_live)
         w_ipc_close(desk.channels);
     w_os_restore_all();
-    if (!preview && !logging_off && WaitForSingleObject(recovery, 0) == WAIT_OBJECT_0)
+    if (!preview && !logging_off && WaitForSingleObject(recovery, 0) == WAIT_OBJECT_0) {
+        // The host may have died between asking Explorer to quit and its exit.
+        if (original_shell) WaitForSingleObject(original_shell, 10000);
         w_os_ensure_shell();
+    }
+    if (original_shell) CloseHandle(original_shell);
     CloseHandle(recovery);
     w_os_instance_release(&lock);
     w_environment_stop();

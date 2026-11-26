@@ -53,6 +53,37 @@ static int alpha_of(HWND window) {
     return GetLayeredWindowAttributes(window,NULL,&alpha,&flags) && (flags&LWA_ALPHA) ? alpha : -1;
 }
 
+static HWND observed_panel,observed_child;
+static unsigned panel_paints,child_paints;
+static bool painting_first_frame,backdrop_exposed;
+
+static LRESULT CALLBACK test_proc(HWND window,UINT message,WPARAM wp,LPARAM lp) {
+    if (message==WM_PAINT) {
+        if (window==observed_panel) ++panel_paints;
+        if (window==observed_child) ++child_paints;
+        if (painting_first_frame && IsWindowVisible(FindWindowW(L"WinwmMaterialShadow",NULL))) backdrop_exposed=true;
+        PAINTSTRUCT paint;
+        HDC dc=BeginPaint(window,&paint);
+        FillRect(dc,&paint.rcPaint,(HBRUSH)GetStockObject(GRAY_BRUSH));
+        EndPaint(window,&paint);
+        return 0;
+    }
+    return DefWindowProcW(window,message,wp,lp);
+}
+
+static bool black_erase(HWND window) {
+    HDC dc=CreateCompatibleDC(NULL);
+    HBITMAP bitmap=CreateBitmap(8,8,1,1,NULL);
+    if (!dc || !bitmap) { DeleteDC(dc); DeleteObject(bitmap); return false; }
+    HGDIOBJ old=SelectObject(dc,bitmap);
+    PatBlt(dc,0,0,8,8,WHITENESS);
+    bool ok=SendMessageW(window,WM_ERASEBKGND,(WPARAM)dc,0) && GetPixel(dc,4,4)==RGB(0,0,0);
+    SelectObject(dc,old);
+    DeleteObject(bitmap);
+    DeleteDC(dc);
+    return ok;
+}
+
 static bool run(HWND panel,HWND dock) {
     w_panel_material cfg={.opacity=204,.blur=true,.shadow=true};
     w_material_apply(panel,&cfg,RGB(14,19,22),16,material_panel);
@@ -65,12 +96,15 @@ static bool run(HWND panel,HWND dock) {
     CHECK(attempts==0 && !FindWindowW(L"WinwmMaterialShadow",NULL));
     ShowWindow(dock,SW_SHOWNOACTIVATE);
     CHECK(attempts==1 && alpha_of(dock)==204 && !FindWindowW(L"WinwmMaterial",NULL));
+    painting_first_frame=true;
     ShowWindow(panel,SW_SHOWNOACTIVATE);
+    painting_first_frame=false;
+    CHECK(panel_paints && child_paints && !backdrop_exposed);
     HWND shadow=FindWindowW(L"WinwmMaterialShadow",NULL);
     CHECK(attempts==2 && shadow && IsWindowVisible(shadow) && !IsWindowEnabled(shadow));
     CHECK(SendMessageW(shadow,WM_NCHITTEST,0,0)==HTTRANSPARENT && GetWindow(panel,GW_HWNDNEXT)==shadow);
     DWORD flags=0;
-    CHECK(GetLayeredWindowAttributes(shadow,NULL,NULL,&flags) && (flags&LWA_COLORKEY));
+    CHECK(GetLayeredWindowAttributes(shadow,NULL,NULL,&flags) && (flags&LWA_COLORKEY) && black_erase(shadow));
 
     SetWindowPos(panel,NULL,31,47,180,90,SWP_NOZORDER|SWP_NOACTIVATE);
     RECT panel_rect,back_rect;
@@ -80,8 +114,11 @@ static bool run(HWND panel,HWND dock) {
     CHECK(attempts==2 && FindWindowW(L"WinwmMaterialShadow",NULL)==shadow);
     ShowWindow(panel,SW_HIDE);
     CHECK(!IsWindowVisible(shadow));
+    panel_paints=child_paints=0;
+    painting_first_frame=true;
     ShowWindow(panel,SW_SHOWNOACTIVATE);
-    CHECK(IsWindowVisible(shadow) && attempts==2);
+    painting_first_frame=false;
+    CHECK(IsWindowVisible(shadow) && attempts==2 && panel_paints && child_paints && !backdrop_exposed);
 
     supported=true;
     SendMessageW(dock,WM_DISPLAYCHANGE,32,MAKELPARAM(1280,720));
@@ -94,12 +131,16 @@ static bool run(HWND panel,HWND dock) {
     w_material_apply(panel,&cfg,RGB(240,238,241),16,material_panel);
     CHECK(!dark && FindWindowW(L"WinwmMaterialShadow",NULL)==acrylic);
     CHECK(w_material_alpha(panel,128) && alpha_of(panel)==102);
-    CHECK(alpha_of(acrylic)==MulDiv(255*128,255-204,255*255-128*204));
-    CHECK(w_material_alpha(panel,255) && attempts==5 && alpha_of(panel)==204);
-    CHECK(!(GetWindowLongPtrW(acrylic,GWL_EXSTYLE)&WS_EX_LAYERED));
+    CHECK(!IsWindowVisible(acrylic) && !(GetWindowLongPtrW(acrylic,GWL_EXSTYLE)&WS_EX_LAYERED));
+    CHECK(w_material_alpha(panel,255) && attempts==4 && alpha_of(panel)==204);
+    CHECK(IsWindowVisible(acrylic) && !(GetWindowLongPtrW(acrylic,GWL_EXSTYLE)&WS_EX_LAYERED));
     CHECK(w_material_alpha(panel,128));
     supported=false;
-    CHECK(w_material_alpha(panel,255) && attempts==6 && GetLayeredWindowAttributes(acrylic,NULL,NULL,&flags) && (flags&LWA_COLORKEY));
+    SendMessageW(panel,WM_DWMCOMPOSITIONCHANGED,0,0);
+    CHECK(attempts==4 && !FindWindowW(L"WinwmMaterialShadow",NULL));
+    CHECK(w_material_alpha(panel,255) && attempts==5);
+    shadow=FindWindowW(L"WinwmMaterialShadow",NULL);
+    CHECK(shadow && GetLayeredWindowAttributes(shadow,NULL,NULL,&flags) && (flags&LWA_COLORKEY));
 
     transparency=false;
     SendMessageW(panel,WM_SETTINGCHANGE,0,(LPARAM)L"EnableTransparency");
@@ -121,7 +162,9 @@ static bool run(HWND panel,HWND dock) {
     CHECK(w_layer_fade_tick(panel,&fade,true) && fade.value<64 && fade.value>0);
     BYTE current=fade.value;
     CHECK(w_layer_fade_to(panel,&fade,255,linear,true) && fade.from==current && fade.timing.ms==MulDiv(1000,255-current,255));
-    CHECK(!w_layer_fade_to(panel,&fade,255,linear,false) && !fade.start && fade.value==255 && !KillTimer(panel,layer_fade_timer));
+    panel_paints=child_paints=0;
+    w_layer_present(panel,&fade);
+    CHECK(!fade.start && fade.value==255 && alpha_of(panel)==255 && panel_paints && child_paints && !KillTimer(panel,layer_fade_timer));
     fade.value=1;
     linear.ms=50;
     CHECK(!w_layer_fade_to(panel,&fade,0,linear,true) && !fade.start && alpha_of(panel)==0);
@@ -134,17 +177,19 @@ int wmain(void) {
     HDESK original=GetThreadDesktop(GetCurrentThreadId());
     HDESK desktop=CreateDesktopW(name,NULL,NULL,0,GENERIC_ALL,NULL);
     if (!desktop || !SetThreadDesktop(desktop)) { fprintf(stderr,"Private desktop setup failed (%lu)\n",GetLastError()); return 1; }
-    WNDCLASSW wc={.hInstance=GetModuleHandleW(NULL),.lpszClassName=L"WinwmTestPanelMaterial",.lpfnWndProc=DefWindowProcW};
+    WNDCLASSW wc={.hInstance=GetModuleHandleW(NULL),.lpszClassName=L"WinwmTestPanelMaterial",.lpfnWndProc=test_proc};
     if (!RegisterClassW(&wc)) return 1;
     HWND panel=CreateWindowExW(0,wc.lpszClassName,L"",WS_POPUP,3,5,100,80,NULL,NULL,wc.hInstance,NULL);
     HWND dock=CreateWindowExW(0,wc.lpszClassName,L"",WS_POPUP,0,0,300,32,NULL,NULL,wc.hInstance,NULL);
-    bool ok=panel && dock && run(panel,dock);
+    observed_panel=panel;
+    observed_child=CreateWindowW(wc.lpszClassName,L"",WS_CHILD|WS_VISIBLE,12,12,30,30,panel,NULL,wc.hInstance,NULL);
+    bool ok=panel && dock && observed_child && run(panel,dock);
     if (panel) DestroyWindow(panel);
     if (dock) DestroyWindow(dock);
     if (FindWindowW(L"WinwmMaterialShadow",NULL) || FindWindowW(L"WinwmMaterial",NULL)) ok=false;
     UnregisterClassW(wc.lpszClassName,wc.hInstance);
     SetThreadDesktop(original);
     CloseDesktop(desktop);
-    if (ok) puts("Panel and dock shape, compositor recovery, acrylic fade, accessibility and interruption: PASS");
+    if (ok) puts("Panel and child first paint, stable backdrop, shape, compositor recovery, accessibility and interrupted fades: PASS");
     return ok ? 0 : 1;
 }

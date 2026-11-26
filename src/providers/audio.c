@@ -1,6 +1,5 @@
 #define COBJMACROS
 #include "providers/audio.h"
-#include <initguid.h>
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #include <functiondiscoverykeys_devpkey.h>

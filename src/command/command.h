@@ -30,6 +30,7 @@ typedef struct w_command {
 //~ Command Interface
 
 const char *w_command_name(enum command_kind kind);
+bool w_command_navigates(enum command_kind kind);
 bool w_command_parse(const char *text, w_command *out);
 bool w_command_delta(const char *args, int *dx, int *dy);
 int w_command_direction(const char *name);

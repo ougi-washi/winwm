@@ -32,21 +32,24 @@ static int w_run_tool(const wchar_t *mode) {
     if (!wcscmp(mode,L"bar_settings")) return w_toolbar_run();
     if (!wcscmp(mode,L"capture_window") || !wcsncmp(mode,L"capture_window-",15))
         return w_capture_run(mode);
-    w_desktop_config *cfg = calloc(1, sizeof(*cfg));
-    if (cfg) {
-        w_config_defaults(cfg);
-        char diagnostic[256];
-        if (!w_os_cache_read(cfg) && !w_os_config_load(cfg,diagnostic,sizeof(diagnostic)))
+    bool project=!wcscmp(mode,L"project");
+    if (project || !w_theme_read_published()) {
+        w_desktop_config *cfg = malloc(sizeof(*cfg));
+        if (cfg) {
             w_config_defaults(cfg);
-        w_theme_configure(cfg);
-        if (!wcscmp(mode, L"project")) {
-            w_environment_start(NULL,0);
-            int result = w_project_run(cfg);
+            char diagnostic[256];
+            if (!w_os_cache_read(cfg) && !w_os_config_load(cfg,diagnostic,sizeof(diagnostic)))
+                w_config_defaults(cfg);
+            w_theme_configure(cfg);
+            if (project) {
+                w_environment_start(NULL,0);
+                int result = w_project_run(cfg);
+                free(cfg);
+                return result;
+            }
             free(cfg);
-            return result;
-        }
-        free(cfg);
-    } else if (!wcscmp(mode, L"project")) return 1;
+        } else if (project) return 1;
+    }
     if ((!wcscmp(mode,L"sleep") || !wcscmp(mode,L"restart") || !wcscmp(mode,L"wallpaper")) &&
         !w_tool_native_dialog()) return 0;
     if (!wcscmp(mode, L"languages")) return w_language_setup(input_languages);
@@ -62,6 +65,9 @@ static int w_run_tool(const wchar_t *mode) {
     }
     if (!wcscmp(mode, L"activity"))
         return w_activity_run();
+    if (!wcsncmp(mode, L"open_with-", 10)) return w_open_with_list(mode + 10);
+    if (!wcscmp(mode, L"windows_settings") || !wcscmp(mode, L"windows_update") || !wcscmp(mode, L"windows_security"))
+        return w_windows_panel_run(mode);
     if (!wcscmp(mode,L"update_winwm")) return w_releases_run();
     if (!wcscmp(mode,L"install_winwm") || !wcscmp(mode,L"uninstall_winwm")) {
         if (!w_tool_native_dialog()) return ERROR_CANCELLED;

@@ -17,7 +17,7 @@ typedef struct {
 } w_prompt;
 
 void w_theme_load_profile(void) {
-    if (w_theme_configured()) return;
+    if (w_theme_configured() || w_theme_read_published()) return;
     w_desktop_config *profile = malloc(sizeof(*profile));
     if (!profile) return;
     w_config_defaults(profile);

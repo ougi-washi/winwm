@@ -19,7 +19,7 @@ void w_notice_add(const w_notice_item *item, bool toast);
 void w_notice_cancel_balloon(uint64_t token);
 void w_notice_batch(bool begin);
 void w_notice_open(HMONITOR monitor, const w_popup_anchor *anchor);
-bool w_notice_close(void);
+bool w_notice_close(bool restore_focus);
 bool w_notice_visible(void);
 bool w_notice_contains(HWND hit);
 bool w_notice_message(MSG *msg);

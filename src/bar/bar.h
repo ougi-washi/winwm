@@ -93,12 +93,13 @@ typedef struct w_bar_window {
         UINT context_button;
         RECT strip;
     } tray;
+    const int *selected_workspace;
 } w_bar_window;
 
 ////////////////
 //~ Bar Interface
 
-bool w_bar_create(w_bar_window *b, int output, const w_desktop_config *config, bar_action invoke);
+bool w_bar_create(w_bar_window *b, int output, const int *selected_workspace, const w_desktop_config *config, bar_action invoke);
 HFONT w_bar_create_label_font(UINT dpi);
 w_rect w_bar_position(w_bar_window *b, w_rect screen, w_rect available, int dpi, bool hidden);
 void w_bar_invalidate(w_bar_window *b, const char *module);

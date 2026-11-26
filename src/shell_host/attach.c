@@ -1,28 +1,23 @@
 #include "shell_host/entry.h"
 #include <stdio.h>
 
-DWORD w_recovery_take_desktop(HANDLE host, HWND window) {
-    // Keep the original shell identifiable if the monitor dies during handoff.
-    DWORD pid = 0;
-    HWND shell = GetShellWindow();
-    if (shell) GetWindowThreadProcessId(shell, &pid);
-    HANDLE original = pid ? OpenProcess(SYNCHRONIZE, FALSE, pid) : NULL;
+HANDLE w_recovery_take_desktop(HWND window) {
+    // The monitor duplicates its worker handle into this process. Both message
+    // loops remain available while Restart Manager negotiates with Explorer.
     DWORD_PTR reply = 0;
-    SetLastError(ERROR_SUCCESS);
     LRESULT delivered = SendMessageTimeoutW(window, recovery_take_desktop, GetCurrentProcessId(), 0,
-                                            SMTO_ERRORONEXIT, 30000, &reply);
-    DWORD error = delivered ? ERROR_SUCCESS : GetLastError();
-    if (delivered && reply && WaitForSingleObject(host, 0) == WAIT_TIMEOUT) {
-        error = (DWORD)(reply - 1);
-    } else {
-        // Window destruction can precede the monitor process becoming signaled.
-        // Recover an unacknowledged exit before releasing our session lock.
-        if (original) WaitForSingleObject(original, 10000);
-        w_os_ensure_shell();
-        if (!error) error = ERROR_PROCESS_ABORTED;
+                                            SMTO_ERRORONEXIT | SMTO_ABORTIFHUNG, 5000, &reply);
+    if (delivered && reply) {
+        // Explorer can close only after the manager holds the completion handle.
+        if (PostMessageW(window, recovery_confirm_handoff, GetCurrentProcessId(), (LPARAM)reply))
+            return (HANDLE)reply;
+        DWORD error = GetLastError();
+        CloseHandle((HANDLE)reply);
+        SetLastError(error);
+        return NULL;
     }
-    if (original) CloseHandle(original);
-    return error;
+    if (delivered || !GetLastError()) SetLastError(ERROR_PROCESS_ABORTED);
+    return NULL;
 }
 
 HANDLE w_recovery_attach(bool preview, HWND *window) {

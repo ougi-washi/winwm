@@ -47,7 +47,10 @@ static void w_desktop_run_line(const wchar_t *line, UINT request, bool admin) {
         job->request = request;
         job->admin = admin;
         memcpy(job->line, line, bytes);
-        if (QueueUserWorkItem(w_run_line_worker, job, WT_EXECUTEDEFAULT)) return;
+        if (QueueUserWorkItem(w_run_line_worker, job, WT_EXECUTEDEFAULT)) {
+            ++desk.application_launches;
+            return;
+        }
         free(job);
     }
     w_palette_line_result(request, ERROR_NOT_ENOUGH_MEMORY);
@@ -99,6 +102,8 @@ static void w_pick(int n, bool admin) {
     if (current_palette == cmd_menu && n >= window_limit) {
         if (!w_catalog_launch_item(snapshot, n - window_limit, admin))
             w_desktop_notice("Could not start the selected application.");
+        else
+            ++desk.application_launches;
         return;
     }
     if ((unsigned)n >= (unsigned)row_count)
@@ -466,7 +471,7 @@ void w_desktop_palette(enum command_kind kind, int output) {
 void w_desktop_bar_palette(enum command_kind kind, int output, const w_popup_anchor *anchor) {
     const w_popup_anchor *open = w_palette_anchor();
     if (w_palette_shown() && open && current_palette == kind && w_popup_same_source(open,anchor)) {
-        w_palette_close();
+        w_palette_close(true);
         return;
     }
     w_open_palette(kind, output, anchor);
@@ -476,7 +481,7 @@ static void w_refresh_palette(enum command_kind kind) {
     const w_popup_anchor *anchor = w_palette_anchor();
     int output = palette_output;
     if (anchor && (!IsWindowVisible(anchor->bar) || anchor->bar != desk.outputs[output].bar.hwnd)) {
-        w_palette_close();
+        w_palette_close(true);
         return;
     }
     if (!desk.outputs[output].live) output = desk.model.output;

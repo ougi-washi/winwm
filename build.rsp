@@ -68,6 +68,8 @@ src/desktop_tools/packages.c
 src/desktop_tools/releases.c
 src/desktop_tools/power.c
 src/desktop_tools/settings.c
+src/desktop_tools/windows_panels.c
+src/desktop_tools/open_with.c
 src/desktop_tools/toolbar.c
 src/desktop_tools/sound.c
 src/input/input.c
@@ -76,10 +78,12 @@ src/layout/layout.c
 src/layout/gesture.c
 src/model/model.c
 src/os_win32/explorer.c
+src/os_win32/guids.c
 src/os_win32/shell_policy.c
 src/os_win32/environment.c
 src/os_win32/modifier_map.c
 src/os_win32/os_win32.c
+src/os_win32/work_area.c
 src/palette/palette.c
 src/providers/audio.c
 src/providers/providers.c

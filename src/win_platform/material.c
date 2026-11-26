@@ -9,9 +9,9 @@ typedef struct {
     enum w_material_role role;
     w_panel_material config;
     COLORREF tint;
-    BYTE opacity, fade, backing_alpha;
+    BYTE opacity, fade;
     int rounding, shape_radius, shape_width, shape_height, panel_alpha, corner_preference;
-    bool blur, blur_unavailable, shadow, contrast, framed, layered_owned, panel_layered, busy, shaped;
+    bool blur, blur_unavailable, shadow, contrast, framed, layered_owned, panel_layered, busy, shaped, presented;
 } w_material;
 
 static const wchar_t *const surface_classes[]={L"WinwmMaterial",L"WinwmMaterialShadow"};
@@ -51,7 +51,6 @@ static LRESULT CALLBACK w_surface_proc(HWND w,UINT message,WPARAM wp,LPARAM lp) 
     }
     case WM_NCHITTEST: return HTTRANSPARENT;
     case WM_MOUSEACTIVATE: return MA_NOACTIVATE;
-    case WM_ERASEBKGND: return TRUE;
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC dc=BeginPaint(w,&ps);
@@ -101,22 +100,13 @@ static bool w_shape_panel(w_material *m) {
     return true;
 }
 
-static BYTE w_back_alpha(const w_material *m) {
-    if (!m->blur || m->fade==255) return m->fade;
-    // Foreground coverage is opacity * fade. Scale the remaining native
-    // backdrop coverage so their composition fades linearly over the desktop.
-    return (BYTE)MulDiv(255*m->fade,255-m->opacity,255*255-m->fade*m->opacity);
-}
-
 static bool w_acrylic(w_material *m) {
     int transient=3; // DWMSBT_TRANSIENTWINDOW
     MARGINS glass={-1,-1,-1,-1};
+    BOOL dark=GetRValue(m->tint)*299+GetGValue(m->tint)*587+GetBValue(m->tint)*114<128000;
+    DwmSetWindowAttribute(m->backing,20,&dark,sizeof(dark));
     if (SUCCEEDED(DwmSetWindowAttribute(m->backing,38,&transient,sizeof(transient))) &&
-        SUCCEEDED(DwmExtendFrameIntoClientArea(m->backing,&glass))) {
-        BOOL dark=GetRValue(m->tint)*299+GetGValue(m->tint)*587+GetBValue(m->tint)*114<128000;
-        DwmSetWindowAttribute(m->backing,20,&dark,sizeof(dark));
-        return true;
-    }
+        SUCCEEDED(DwmExtendFrameIntoClientArea(m->backing,&glass))) return true;
     int none=1;
     DwmSetWindowAttribute(m->backing,38,&none,sizeof(none));
     m->blur_unavailable=true;
@@ -130,30 +120,11 @@ static bool w_set_layered(HWND window,LONG_PTR style,bool enabled) {
     return SetWindowLongPtrW(window,GWL_EXSTYLE,next)!=0 || GetLastError()==0;
 }
 
-static bool w_surface_alpha(w_material *m) {
-    BYTE alpha=w_back_alpha(m);
-    LONG_PTR ex=GetWindowLongPtrW(m->backing,GWL_EXSTYLE);
-    // Keep the resting acrylic surface on DWM's ordinary, non-layered
-    // redirection path. Uniform window alpha is only needed during a fade.
-    if (m->blur && alpha==255 && (ex&WS_EX_LAYERED)) {
-        if (!w_set_layered(m->backing,ex,false)) return false;
-        ex&=~(LONG_PTR)WS_EX_LAYERED;
-        if (!w_acrylic(m) && !m->shadow) return false;
-        InvalidateRect(m->backing,NULL,FALSE);
-    }
-    if (!m->blur || alpha<255) {
-        if (!(ex&WS_EX_LAYERED) && !w_set_layered(m->backing,ex,true)) return false;
-        if (!SetLayeredWindowAttributes(m->backing,0,alpha,LWA_ALPHA|(m->blur ? 0 : LWA_COLORKEY))) return false;
-    }
-    m->backing_alpha=alpha;
-    return true;
-}
-
 static bool w_new_surface(w_material *m) {
     HINSTANCE module=GetModuleHandleW(NULL);
     const wchar_t *name=surface_classes[m->shadow];
     WNDCLASSW wc={.hInstance=module,.lpszClassName=name,.lpfnWndProc=w_surface_proc,
-                  .style=m->shadow ? CS_DROPSHADOW : 0};
+                  .style=m->shadow ? CS_DROPSHADOW : 0,.hbrBackground=(HBRUSH)GetStockObject(BLACK_BRUSH)};
     if (!RegisterClassW(&wc) && GetLastError()!=ERROR_CLASS_ALREADY_EXISTS) return false;
     DWORD ex=WS_EX_TOOLWINDOW|WS_EX_NOACTIVATE|WS_EX_TRANSPARENT;
     if (!m->blur) ex|=WS_EX_LAYERED;
@@ -162,11 +133,17 @@ static bool w_new_surface(w_material *m) {
     // would be forced above its owner.
     m->backing=CreateWindowExW(ex,name,L"",WS_POPUP|WS_DISABLED,0,0,0,0,GetWindow(m->panel,GW_OWNER),NULL,module,m);
     if (!m->backing) return false;
+    BOOL disable_transitions=TRUE;
+    DwmSetWindowAttribute(m->backing,DWMWA_TRANSITIONS_FORCEDISABLED,&disable_transitions,sizeof(disable_transitions));
     if (m->blur && !w_acrylic(m) && !m->shadow) {
         w_drop_surface(m);
         return false;
     }
-    if (!w_surface_alpha(m)) { w_drop_surface(m); return false; }
+    if (!m->blur && ((!(ex&WS_EX_LAYERED) && !w_set_layered(m->backing,ex,true)) ||
+                     !SetLayeredWindowAttributes(m->backing,0,255,LWA_COLORKEY))) {
+        w_drop_surface(m);
+        return false;
+    }
     return true;
 }
 
@@ -186,7 +163,10 @@ static void w_sync(w_material *m) {
     if (m->busy) return;
     m->busy=true;
     bool reshape=w_shape_panel(m);
-    if ((!m->blur && !m->shadow) || !m->opacity || !m->fade || !IsWindowVisible(m->panel) || IsIconic(m->panel)) {
+    // A DWM backdrop needs ordinary window redirection. During an animated
+    // transition only the foreground's alpha changes; the backdrop stays hidden.
+    if ((!m->blur && !m->shadow) || !m->presented || !m->opacity || m->fade!=255 ||
+        !IsWindowVisible(m->panel) || IsIconic(m->panel)) {
         if (m->backing && IsWindowVisible(m->backing)) ShowWindow(m->backing,SW_HIDE);
     } else {
         RECT target,old;
@@ -204,8 +184,10 @@ static void w_sync(w_material *m) {
             if (GetWindow(m->panel,GW_HWNDNEXT)==m->backing) flags|=SWP_NOZORDER;
             if (!IsWindowVisible(m->backing)) flags|=SWP_SHOWWINDOW;
             if (fresh || reshape || !(flags&SWP_NOSIZE)) w_shape(m);
-            if ((flags&(SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_SHOWWINDOW))!=(SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER))
+            if ((flags&(SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER|SWP_SHOWWINDOW))!=(SWP_NOMOVE|SWP_NOSIZE|SWP_NOZORDER)) {
                 SetWindowPos(m->backing,m->panel,target.left,target.top,target.right-target.left,target.bottom-target.top,flags);
+                if (flags&SWP_SHOWWINDOW) UpdateWindow(m->backing);
+            }
         }
     }
     m->busy=false;
@@ -215,7 +197,7 @@ static bool w_panel_alpha(w_material *m,BYTE alpha) {
     LONG_PTR ex=GetWindowLongPtrW(m->panel,GWL_EXSTYLE);
     bool layered=(ex&WS_EX_LAYERED)!=0;
     if (m->panel_alpha==alpha && m->panel_layered==layered) return true;
-    bool ok=true;
+    bool ok=true,redraw=false;
     if (!layered) {
         m->layered_owned=false;
         if (alpha<255) {
@@ -228,11 +210,13 @@ static bool w_panel_alpha(w_material *m,BYTE alpha) {
     if (m->layered_owned && (!ok || alpha==255)) {
         if (w_set_layered(m->panel,ex,false)) {
             layered=m->layered_owned=false;
-            RedrawWindow(m->panel,NULL,NULL,RDW_INVALIDATE|RDW_ERASE|RDW_FRAME|RDW_ALLCHILDREN);
+            redraw=true;
         } else ok=false;
     }
     m->panel_alpha=ok ? alpha : -1;
     m->panel_layered=layered;
+    if (redraw)
+        RedrawWindow(m->panel,NULL,NULL,RDW_INVALIDATE|RDW_ERASE|RDW_FRAME|RDW_ALLCHILDREN|(m->presented ? RDW_UPDATENOW : 0));
     return ok;
 }
 
@@ -242,9 +226,9 @@ bool w_material_alpha(HWND window,BYTE fade) {
     BYTE previous=m->fade;
     m->fade=fade;
     BYTE alpha=m->contrast ? (fade ? 255 : 0) : (BYTE)MulDiv(m->opacity,fade,255);
+    if (previous==255 && fade<255) w_sync(m);
     bool ok=w_panel_alpha(m,alpha);
-    if (m->backing && w_back_alpha(m)!=m->backing_alpha && !w_surface_alpha(m)) w_drop_surface(m);
-    if ((!previous)!=(!fade)) w_sync(m);
+    if (previous<255 && fade==255 && w_attached(window)==m) w_sync(m);
     return ok;
 }
 
@@ -276,8 +260,9 @@ static void w_refresh(w_material *m,COLORREF tint) {
         DwmSetWindowAttribute(m->backing,20,&dark,sizeof(dark));
     }
     m->tint=tint;
-    w_material_alpha(m->panel,m->fade);
-    w_sync(m);
+    HWND panel=m->panel;
+    w_material_alpha(panel,m->fade);
+    if (w_attached(panel)==m) w_sync(m);
 }
 
 static LRESULT CALLBACK w_panel_proc(HWND w,UINT message,WPARAM wp,LPARAM lp,UINT_PTR id,DWORD_PTR ref) {
@@ -289,8 +274,25 @@ static LRESULT CALLBACK w_panel_proc(HWND w,UINT message,WPARAM wp,LPARAM lp,UIN
         free(m);
         return DefSubclassProc(w,message,wp,lp);
     }
-    if (message==WM_WINDOWPOSCHANGING && (((WINDOWPOS *)lp)->flags&SWP_HIDEWINDOW) && m->backing)
-        ShowWindow(m->backing,SW_HIDE);
+    if (message==WM_WINDOWPOSCHANGING && (((WINDOWPOS *)lp)->flags&SWP_HIDEWINDOW)) {
+        m->presented=false;
+        if (m->backing) ShowWindow(m->backing,SW_HIDE);
+    }
+    if (message==WM_WINDOWPOSCHANGED) {
+        // Default processing delivers WM_SIZE and moves child controls. Paint
+        // the finished layout before revealing its separate backdrop HWND.
+        UINT flags=((WINDOWPOS *)lp)->flags;
+        LRESULT result=DefSubclassProc(w,message,wp,lp);
+        if (w_attached(w)!=m) return result;
+        if ((flags&SWP_SHOWWINDOW) && !m->presented && IsWindowVisible(w)) {
+            w_sync(m);
+            RedrawWindow(w,NULL,NULL,RDW_INVALIDATE|RDW_ERASE|RDW_FRAME|RDW_ALLCHILDREN|RDW_UPDATENOW);
+            if (w_attached(w)!=m) return result;
+            m->presented=IsWindowVisible(w)!=FALSE;
+        }
+        w_sync(m);
+        return result;
+    }
     if (message==WM_DISPLAYCHANGE || message==WM_DWMCOMPOSITIONCHANGED) m->blur_unavailable=false;
     if (message==WM_DWMCOMPOSITIONCHANGED) {
         // The old compositor's backdrop, glass margins and corner preferences
@@ -301,7 +303,7 @@ static LRESULT CALLBACK w_panel_proc(HWND w,UINT message,WPARAM wp,LPARAM lp,UIN
     if (message==WM_SYSCOLORCHANGE || message==WM_DWMCOMPOSITIONCHANGED || message==WM_DISPLAYCHANGE || message==WM_THEMECHANGED ||
         (message==WM_SETTINGCHANGE && (wp==SPI_SETDROPSHADOW || w_appearance_setting(wp,lp))))
         w_refresh(m,m->tint);
-    if (message==WM_WINDOWPOSCHANGED || message==WM_DPICHANGED) w_sync(m);
+    if (message==WM_DPICHANGED) w_sync(m);
     return DefSubclassProc(w,message,wp,lp);
 }
 
@@ -317,6 +319,7 @@ void w_material_apply(HWND window,const w_panel_material *material,COLORREF tint
         m=calloc(1,sizeof(*m));
         if (!m) return;
         m->panel=window; m->fade=255; m->shape_radius=-2; m->panel_alpha=-1;
+        m->presented=IsWindowVisible(window)!=FALSE;
         if (!SetPropW(window,material_property,m)) { free(m); return; }
         if (!SetWindowSubclass(window,w_panel_proc,material_id,(DWORD_PTR)m)) {
             RemovePropW(window,material_property); free(m); return;

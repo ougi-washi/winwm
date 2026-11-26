@@ -1,5 +1,6 @@
 #pragma once
-#include "win_platform/win_platform.h"
+#include "base/base.h"
+#include <windows.h>
 enum { ipc_slots = 6, ipc_capacity = 16384 };
 
 ////////////////

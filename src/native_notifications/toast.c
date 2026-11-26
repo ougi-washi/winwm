@@ -4,7 +4,6 @@
 #include "native_notifications/toast.h"
 #include <roapi.h>
 #include <winstring.h>
-#include <initguid.h>
 #include <windows.data.xml.dom.h>
 #include <windows.ui.notifications.h>
 #include <wchar.h>

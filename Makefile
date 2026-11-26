@@ -34,6 +34,13 @@ build/config_res.o: assets/config.rc assets/app.manifest assets/winwm.lua third_
 build/winwm.exe: build.rsp compile.rsp Makefile lua.rsp $(filter %.o,$(main_inputs)) | build
 	"$(CC)" @compile.rsp $(main_inputs) -o $@
 
+bar_test_inputs := $(filter-out build/obj/app/main.o,$(main_inputs))
+build/test-bar-workspaces.exe: tools/test_bar_workspaces.c build.rsp compile.rsp Makefile lua.rsp $(filter %.o,$(bar_test_inputs)) | build
+	"$(CC)" @compile.rsp -Wall -Wextra -Werror $< $(bar_test_inputs) -Wl,--subsystem,console -o $@
+
+build/winwm-handoff-test.exe: tools/test_shell_handoff_fixture.c build.rsp compile.rsp Makefile lua.rsp $(filter %.o,$(main_inputs)) | build
+	"$(CC)" @compile.rsp $< $(main_inputs) -Wl,--wrap=w_os_exit_shell,--wrap=w_os_ensure_shell,--wrap=__imp_SetWindowsHookExW,--wrap=__imp_GetForegroundWindow,--wrap=w_desktop_event,--wrap=w_os_explorer_shell_present,--wrap=w_os_instance_claim,--wrap=w_os_instance_status,--wrap=w_ipc_name -o $@
+
 bin/winwm.exe: build/winwm.exe | bin
 	@copy /b /y "$(subst /,\,$<)" "$(subst /,\,$@).tmp" >nul
 	@move /y "$(subst /,\,$@).tmp" "$(subst /,\,$@)" >nul 2>nul || powershell -NoProfile -NonInteractive -Command "[IO.File]::Replace('$@.tmp','$@','build/winwm.previous')"

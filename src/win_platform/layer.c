@@ -2,6 +2,12 @@
 #include "win_platform/material.h"
 #include <stdlib.h>
 
+void w_layer_present(HWND hwnd, w_layer_fade *fade) {
+    if (fade->start) KillTimer(hwnd,layer_fade_timer);
+    *fade=(w_layer_fade){.value=255,.target=255,.from=255};
+    w_material_alpha(hwnd,255);
+}
+
 bool w_layer_fade_tick(HWND hwnd, w_layer_fade *fade, bool enabled) {
     uint64_t elapsed = GetTickCount64()-fade->start;
     bool running = enabled && fade->start && elapsed < (unsigned)fade->timing.ms;

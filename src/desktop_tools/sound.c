@@ -1,7 +1,6 @@
 #define COBJMACROS
 #include "desktop_tools/sound.h"
 #include "desktop_tools/rows.h"
-#include <initguid.h>
 #include <mmdeviceapi.h>
 #include <endpointvolume.h>
 #include <audiopolicy.h>

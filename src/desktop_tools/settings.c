@@ -9,7 +9,6 @@
 #include "theme/dialog.h"
 #include "desktop_tools/rows.h"
 #include "desktop_tools/display.h"
-#include <initguid.h>
 #include "desktop_tools/sound.h"
 #include "win_platform/percent_slider.h"
 #include "desktop_tools/network.h"
@@ -1072,7 +1071,9 @@ int w_settings_run(const wchar_t *name) {
                            WS_CHILD | WS_VISIBLE | WS_TABSTOP | WS_VSCROLL | LBS_NOTIFY | LBS_HASSTRINGS |
                            LBS_OWNERDRAWFIXED | LBS_NOINTEGRALHEIGHT, 12, 10, 520, 238,
                            window, NULL, inst, NULL);
-    status = CreateWindowW(L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_EDITCONTROL|SS_NOPREFIX,12,258,520,34,window,NULL,inst,NULL);
+    const wchar_t *initial_status=page!=page_audio ? L"" :
+        sound_view==sound_apps ? L"Reading audio sessions…" : L"Reading audio devices…";
+    status = CreateWindowW(L"STATIC",initial_status,WS_CHILD|WS_VISIBLE|SS_EDITCONTROL|SS_NOPREFIX,12,258,520,34,window,NULL,inst,NULL);
     w_tool_track_feedback(status,&settings_feedback);
     const wchar_t *labels[] = {L"Mute / unmute", L"Connect", L"Device properties", L"Preview", L"Activate", L"Details"};
     apply = CreateWindowW(L"BUTTON", labels[page],
@@ -1118,10 +1119,10 @@ int w_settings_run(const wchar_t *name) {
     if (page == page_display) w_display_create(window, list, status, apply);
     if (page == page_power) w_power_create(window, list, status, apply);
     w_size_controls(true);
-    if (page==page_audio) w_audio_open_view(sound_view);
     if (w_tool_show(window)) {
         UpdateWindow(window);
         if (page == page_audio) {
+            w_audio_open_view(sound_view);
             SetTimer(window, 2, 1000, NULL);
         } else if (page == page_wifi || page == page_network)
             w_open_network_page(page);

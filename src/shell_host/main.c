@@ -6,6 +6,7 @@
 #include "install/install.h"
 #include "native_notifications/toast.h"
 #include "os_win32/environment.h"
+#include "os_win32/work_area.h"
 #include "win_platform/win_platform.h"
 #include <shellapi.h>
 #include <shellscalingapi.h>
@@ -15,7 +16,8 @@
 ////////////////
 //~ Shell Host
 
-static HANDLE session;
+static HANDLE session, shell_worker, shell_gate, pending_handoff, shell_stop;
+static LONG shell_approved;
 static HWND panel;
 static wchar_t session_exe[os_path_cap], restart_exe[os_path_cap];
 
@@ -23,7 +25,6 @@ static wchar_t session_exe[os_path_cap], restart_exe[os_path_cap];
 //~ Shell Host Functions
 
 static bool ending, rescue_requested, quit_requested, preview, logging_off;
-static bool owns_desktop, waiting_for_shell;
 enum { first_recovery_id = 101, exit_windows_id = 109 };
 
 static const wchar_t *const labels[] = {
@@ -213,6 +214,41 @@ static void w_handle_action(int id) {
 ////////////////
 //~ Host messages
 
+static DWORD WINAPI w_take_desktop(void *gate) {
+    if (WaitForSingleObject(gate, INFINITE) != WAIT_OBJECT_0 ||
+        !InterlockedCompareExchange(&shell_approved, 0, 0)) return ERROR_CANCELLED;
+    return w_os_exit_shell(shell_stop);
+}
+
+static void w_cancel_unconfirmed_handoff(void) {
+    if (pending_handoff) {
+        pending_handoff = NULL;
+        SetEvent(shell_gate);
+    }
+}
+
+static void w_stop_handoff(void) {
+    if (shell_stop) SetEvent(shell_stop);
+    w_cancel_unconfirmed_handoff();
+}
+
+static DWORD w_restore_shell(void) {
+    if (shell_worker) {
+        w_stop_handoff();
+        if (!logging_off) {
+            WaitForSingleObject(shell_worker, INFINITE);
+            CloseHandle(shell_gate);
+        }
+        shell_gate = NULL;
+        CloseHandle(shell_worker);
+        shell_worker = NULL;
+    } else if (preview || GetShellWindow()) {
+        return ERROR_SUCCESS;
+    }
+    return logging_off || (session && WaitForSingleObject(session, 0) == WAIT_TIMEOUT) ?
+           ERROR_SUCCESS : w_os_ensure_shell();
+}
+
 static LRESULT CALLBACK w_host_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     LRESULT color_result;
     if (w_theme_message(w, msg, wp, lp, &color_result))
@@ -237,17 +273,48 @@ static LRESULT CALLBACK w_host_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case recovery_take_desktop: {
         if (preview || !session || quit_requested || rescue_requested || logging_off ||
-            (owns_desktop && !waiting_for_shell) || (DWORD)wp != GetProcessId(session) ||
-            WaitForSingleObject(session, 0) != WAIT_TIMEOUT)
-            return ERROR_CANCELLED + 1;
-        owns_desktop = true;
-        waiting_for_shell = false;
-        DWORD error = w_os_exit_shell();
-        waiting_for_shell = error == ERROR_NOT_FOUND;
-        return (LRESULT)error + 1;
+            (DWORD)wp != GetProcessId(session) || WaitForSingleObject(session, 0) != WAIT_TIMEOUT)
+            return 0;
+        if (shell_worker && WaitForSingleObject(shell_worker, 0) != WAIT_OBJECT_0) return 0;
+        if (!shell_stop) shell_stop = CreateEventW(NULL, TRUE, FALSE, NULL);
+        if (!shell_stop) return 0;
+        // Only shell replacement needs permission to share the worker handle.
+        // The interactive session still has recovery if Windows denies this.
+        HANDLE target = OpenProcess(PROCESS_DUP_HANDLE, FALSE, GetProcessId(session));
+        if (!target) return 0;
+        if (shell_worker) {
+            CloseHandle(shell_worker);
+            CloseHandle(shell_gate);
+        }
+        InterlockedExchange(&shell_approved, FALSE);
+        shell_gate = CreateEventW(NULL, TRUE, FALSE, NULL);
+        shell_worker = shell_gate ? CreateThread(NULL, 0, w_take_desktop, shell_gate, 0, NULL) : NULL;
+        pending_handoff = NULL;
+        if (shell_worker) {
+            if (!DuplicateHandle(GetCurrentProcess(), shell_worker, target, &pending_handoff,
+                                 SYNCHRONIZE | THREAD_QUERY_LIMITED_INFORMATION, FALSE, 0)) {
+                pending_handoff = NULL;
+                SetEvent(shell_gate);
+            }
+        } else if (shell_gate) {
+            CloseHandle(shell_gate);
+            shell_gate = NULL;
+        }
+        CloseHandle(target);
+        return (LRESULT)pending_handoff;
     }
+    case recovery_confirm_handoff:
+        if (session && !quit_requested && !rescue_requested && !logging_off &&
+            pending_handoff && pending_handoff == (HANDLE)lp && (DWORD)wp == GetProcessId(session) &&
+            WaitForSingleObject(session, 0) == WAIT_TIMEOUT) {
+            pending_handoff = NULL;
+            InterlockedExchange(&shell_approved, TRUE);
+            SetEvent(shell_gate);
+        }
+        return 0;
     case recovery_session_closing:
         if (session && (DWORD)wp == GetProcessId(session)) {
+            w_stop_handoff();
             if (lp == 42) rescue_requested = true;
             if (!rescue_requested) quit_requested = true;
             SetTimer(w,1,5000,NULL);
@@ -263,6 +330,7 @@ static LRESULT CALLBACK w_host_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CLOSE:
         if (msg == WM_CLOSE) quit_requested = true;
         if (session) {
+            w_stop_handoff();
             // Closing the session runs its normal cleanup. A hung
             // process is handled by the independent recovery action below.
             DWORD pid = GetProcessId(session);
@@ -289,6 +357,7 @@ static LRESULT CALLBACK w_host_proc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_ENDSESSION:
         if (wp) {
             logging_off = true;
+            w_stop_handoff();
             ending = true;
             PostQuitMessage(0);
         }
@@ -325,16 +394,18 @@ static int w_host_run(HINSTANCE inst, DWORD pid, uint64_t birth, HANDLE ready) {
     if (!panel || !SetPropW(panel,L"winwm.session_pid",(HANDLE)(uintptr_t)pid)) { error = GetLastError(); goto done; }
     if (!RegisterHotKey(panel, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_F12))
         SetPropW(panel, L"winwm.recovery_hotkey_error", (HANDLE)(uintptr_t)GetLastError());
+    if (!preview) w_work_areas_open(pid,true);
     if (!SetEvent(ready)) { error = GetLastError(); goto done; }
     w_theme_follow(panel);
     w_environment_start(NULL,0);
     while (!ending) {
-        DWORD n = session ? 1 : 0;
+        HANDLE observed = session ? session : shell_worker;
+        DWORD n = observed ? 1 : 0;
         DWORD wait =
-            MsgWaitForMultipleObjectsEx(n, session ? &session : NULL, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
+            MsgWaitForMultipleObjectsEx(n, n ? &observed : NULL, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         if (wait == WAIT_FAILED)
             break;
-        if (n && wait == WAIT_OBJECT_0) {
+        if (session && wait == WAIT_OBJECT_0) {
             DWORD code = 0;
             FILETIME born, exited, kernel, user;
             if (GetProcessTimes(session,&born,&exited,&kernel,&user))
@@ -344,12 +415,15 @@ static int w_host_run(HINSTANCE inst, DWORD pid, uint64_t birth, HANDLE ready) {
             CloseHandle(session);
             session = NULL;
             KillTimer(panel, 1);
+            w_work_areas_close();
             w_os_restore_all();
-            if (owns_desktop && !logging_off) {
-                error = w_os_ensure_shell();
-                owns_desktop = false;
-            }
-            if (!quit_requested && (rescue_requested || code == 42))
+            w_stop_handoff();
+            if (code == 42) rescue_requested = true;
+            if (shell_worker && WaitForSingleObject(shell_worker, 0) == WAIT_TIMEOUT) continue;
+        }
+        if (n && !session && wait == WAIT_OBJECT_0) {
+            error = w_restore_shell();
+            if (!quit_requested && rescue_requested)
                 w_rescue();
             else
                 break;
@@ -367,8 +441,9 @@ static int w_host_run(HINSTANCE inst, DWORD pid, uint64_t birth, HANDLE ready) {
             }
         }
     }
-    if (owns_desktop && !logging_off) error = w_os_ensure_shell();
+    if (shell_worker) error = w_restore_shell();
 done:
+    if (shell_stop && !logging_off) CloseHandle(shell_stop);
     if (session) CloseHandle(session);
     if (panel) DestroyWindow(panel);
     if (recovery_font) DeleteObject(recovery_font);

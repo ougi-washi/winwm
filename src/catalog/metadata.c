@@ -3,7 +3,6 @@
 #include <propkey.h>
 #include <shellapi.h>
 #include <shlwapi.h>
-#include <initguid.h>
 #include <xmllite.h>
 #include <stdio.h>
 #include <winver.h>

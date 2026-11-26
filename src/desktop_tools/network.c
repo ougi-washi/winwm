@@ -2,7 +2,6 @@
 #include <windows.h>
 #include <setupapi.h>
 #include <cfgmgr32.h>
-#include <initguid.h>
 #include <devguid.h>
 #include <shlwapi.h>
 #include <stdio.h>
