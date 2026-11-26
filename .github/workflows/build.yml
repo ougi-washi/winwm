@@ -109,4 +109,4 @@ jobs:
           zip -9 winwm-windows-x64.zip "${executables[@]}"
           gh release create "$GITHUB_REF_NAME" winwm-windows-x64.zip "${executables[@]}" \
             --repo "$GITHUB_REPOSITORY" --verify-tag --title "WinWM $GITHUB_REF_NAME" \
-            --notes 'Windows x64. Download `winwm.exe` to run WinWM. Use `winwm.exe --preview` to try it alongside Explorer. For startup at sign-in, extract the ZIP and run `winwm_install.exe /install`.'
+            --notes-file /dev/null
