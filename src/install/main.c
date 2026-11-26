@@ -1,6 +1,5 @@
-#define WIN32_LEAN_AND_MEAN
+#include "install/install.h"
 #include "theme/dialog.h"
-#include "os_win32/os_win32.h"
 #include <shlobj.h>
 #include <shellapi.h>
 #include <stdbool.h>
@@ -10,7 +9,6 @@
 
 #define length_of(a) (sizeof(a) / sizeof((a)[0]))
 enum { path_cap = 4096, slot_count = 3 };
-enum operation { op_install, op_uninstall, op_rollback };
 
 ////////////////
 //~ Install
@@ -23,7 +21,7 @@ static const wchar_t run_name[] = L"winwm";
 typedef wchar_t path_string[path_cap];
 
 typedef struct w_install_paths {
-    path_string root, source_shell, source_setup;
+    path_string root;
     path_string slot[slot_count], shell[slot_count], command[slot_count], setup[slot_count], recovery[slot_count];
 } w_install_paths;
 
@@ -46,16 +44,6 @@ static DWORD w_get_paths(w_install_paths *p) {
     CoTaskMemFree(local);
     if (error)
         return error;
-    DWORD n = GetModuleFileNameW(NULL, p->source_setup, path_cap);
-    if (!n || n >= path_cap)
-        return n ? ERROR_FILENAME_EXCED_RANGE : GetLastError();
-    path_string source_directory;
-    wcscpy(source_directory, p->source_setup);
-    wchar_t *separator = wcsrchr(source_directory, L'\\');
-    if (!separator)
-        return ERROR_BAD_PATHNAME;
-    *separator = 0;
-    error = w_join(p->source_shell, source_directory, L"winwm.exe");
     for (int i = 0; !error && i < slot_count; i++) {
         error = w_join(p->slot[i], p->root, slot_dirs[i]);
         if (!error)
@@ -121,60 +109,70 @@ static DWORD w_create_directory(const wchar_t *path) {
 //~ Release staging
 
 // Comparison also covers retries from a running installed copy with either slot active.
-static DWORD w_files_equal(const wchar_t *a, const wchar_t *b, bool *equal) {
-    *equal = false;
-    HANDLE first = CreateFileW(a, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (first == INVALID_HANDLE_VALUE)
-        return GetLastError();
-    HANDLE second = CreateFileW(b, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    DWORD error = ERROR_SUCCESS;
-    if (second == INVALID_HANDLE_VALUE) {
-        error = GetLastError();
-        if (w_absent(error))
-            error = ERROR_SUCCESS;
-    } else {
-        BYTE left[16384], right[16384];
-        for (;;) {
-            DWORD n, m;
-            if (!ReadFile(first, left, sizeof(left), &n, NULL) ||
-                !ReadFile(second, right, sizeof(right), &m, NULL)) {
-                error = GetLastError();
-                break;
-            }
-            if (n != m || memcmp(left, right, n) != 0)
-                break;
-            if (!n) {
-                *equal = true;
-                break;
-            }
-        }
-        CloseHandle(second);
+DWORD w_install_read(const wchar_t *path, w_install_image *image) {
+    HANDLE file = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
+    if (file == INVALID_HANDLE_VALUE) return GetLastError();
+    LARGE_INTEGER size;
+    DWORD error = GetFileSizeEx(file,&size) ? ERROR_SUCCESS : GetLastError();
+    if (!error && (size.QuadPart <= 0 || size.HighPart)) error = ERROR_FILE_INVALID;
+    if (!error) {
+        HANDLE mapping = CreateFileMappingW(file,NULL,PAGE_READONLY,0,0,NULL);
+        const void *bytes = mapping ? MapViewOfFile(mapping,FILE_MAP_READ,0,0,0) : NULL;
+        if (!bytes) error = GetLastError();
+        else *image = (w_install_image){bytes,size.LowPart};
+        if (mapping) CloseHandle(mapping);
     }
-    CloseHandle(first);
+    CloseHandle(file);
     return error;
 }
 
-static DWORD w_stage_file(const wchar_t *source, const wchar_t *destination) {
-    bool equal;
-    DWORD error = w_files_equal(source, destination, &equal);
-    if (error || equal)
-        return error;
+static DWORD w_files_equal(w_install_image image, const wchar_t *path, bool *equal) {
+    w_install_image existing;
+    DWORD error = w_install_read(path,&existing);
+    *equal = false;
+    if (w_absent(error) || error == ERROR_FILE_INVALID) return ERROR_SUCCESS;
+    if (!error) {
+        *equal = existing.size == image.size && !memcmp(existing.bytes,image.bytes,image.size);
+        UnmapViewOfFile(existing.bytes);
+    }
+    return error;
+}
+
+static DWORD w_write_new(const wchar_t *path, w_install_image image) {
+    HANDLE file = CreateFileW(path,GENERIC_WRITE,0,NULL,CREATE_NEW,FILE_ATTRIBUTE_NORMAL,NULL);
+    if (file == INVALID_HANDLE_VALUE) return GetLastError();
+    DWORD written;
+    DWORD error = WriteFile(file,image.bytes,image.size,&written,NULL) ? ERROR_SUCCESS : GetLastError();
+    if (!error && written != image.size) error = ERROR_WRITE_FAULT;
+    if (!error && !FlushFileBuffers(file)) error = GetLastError();
+    CloseHandle(file);
+    if (error) DeleteFileW(path);
+    return error;
+}
+
+static DWORD w_stage_file(w_install_image image, const wchar_t *destination) {
     path_string temp;
     if (swprintf(temp, path_cap, L"%ls.new", destination) < 0)
         return ERROR_FILENAME_EXCED_RANGE;
     if (!DeleteFileW(temp) && !w_absent(GetLastError()))
         return GetLastError();
-    if (!CopyFileW(source, temp, TRUE)) {
-        error = GetLastError();
-        if (error != ERROR_FILE_EXISTS && error != ERROR_ALREADY_EXISTS)
-            DeleteFileW(temp);
-        return error;
-    }
-    if (!MoveFileExW(temp, destination, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
-        error = GetLastError();
-        DeleteFileW(temp);
-    }
+    DWORD error = w_write_new(temp,image);
+    if (error) return error;
+    if (!MoveFileExW(temp,destination,MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH))
+        error=GetLastError();
+    if (error) DeleteFileW(temp);
     return error;
+}
+
+static w_install_image w_default_config(HMODULE module) {
+    HRSRC res = FindResourceW(module,L"WINWM_DEFAULT_CONFIG",RT_RCDATA);
+    if (!res) return (w_install_image){0};
+    return (w_install_image){LockResource(LoadResource(module,res)),SizeofResource(module,res)};
+}
+
+static bool w_config_matches(const wchar_t *path,w_install_image stock) {
+    bool equal;
+    return stock.bytes && stock.size && !w_files_equal(stock,path,&equal) && equal;
 }
 
 static DWORD w_validate(const wchar_t *exe, const wchar_t *directory) {
@@ -221,11 +219,24 @@ static DWORD w_release_history(int current, bool owned[slot_count], int *previou
 }
 
 static bool w_slot_empty(const w_install_paths *p, int slot) {
-    const wchar_t *files[] = {p->shell[slot],p->setup[slot],p->recovery[slot]};
-    for (size_t i = 0; i < length_of(files); ++i) {
-        if (GetFileAttributesW(files[i]) != INVALID_FILE_ATTRIBUTES || !w_absent(GetLastError())) return false;
-    }
-    return true;
+    DWORD attrs = GetFileAttributesW(p->slot[slot]);
+    if (attrs == INVALID_FILE_ATTRIBUTES) return w_absent(GetLastError());
+    if (!(attrs & FILE_ATTRIBUTE_DIRECTORY) || (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) return false;
+    path_string pattern;
+    if (w_join(pattern,p->slot[slot],L"*")) return false;
+    WIN32_FIND_DATAW item;
+    HANDLE search = FindFirstFileW(pattern,&item);
+    if (search == INVALID_HANDLE_VALUE) return GetLastError() == ERROR_FILE_NOT_FOUND;
+    bool empty = false;
+    do {
+        if (wcscmp(item.cFileName,L".") && wcscmp(item.cFileName,L"..")) break;
+        if (!FindNextFileW(search,&item)) {
+            empty = GetLastError() == ERROR_NO_MORE_FILES;
+            break;
+        }
+    } while (true);
+    FindClose(search);
+    return empty;
 }
 
 static DWORD w_activate(const w_install_paths *p, int current, int slot) {
@@ -242,7 +253,41 @@ static DWORD w_activate(const w_install_paths *p, int current, int slot) {
     return RegSetKeyValueW(HKEY_CURRENT_USER,run_key,run_name,REG_SZ,p->command[slot],
                            (DWORD)((wcslen(p->command[slot])+1)*sizeof(wchar_t)));
 }
-static DWORD w_select_release(const w_install_paths *p, int current, bool rollback) {
+
+// Older releases may reject settings in a newer shipped default. Switch only a
+// byte-identical stock config and keep the original next to it as a backup.
+static DWORD w_validate_release(const w_install_paths *p,int current,int slot) {
+    DWORD error = w_validate(p->shell[slot],p->slot[slot]);
+    if (!error) return w_activate(p,current,slot);
+    path_string config, next, backup;
+    if (error != ERROR_INVALID_DATA || !w_os_config_path(config,count_of(config))) return error;
+    DWORD flags = LOAD_LIBRARY_AS_DATAFILE_EXCLUSIVE|LOAD_LIBRARY_AS_IMAGE_RESOURCE;
+    HMODULE old = current >= 0 ? LoadLibraryExW(p->shell[current],NULL,flags) : NULL;
+    HMODULE target = LoadLibraryExW(p->shell[slot],NULL,flags);
+    w_install_image local = w_default_config(NULL), prior = w_default_config(old), defaults = w_default_config(target);
+    ULONGLONG stamp = GetTickCount64();
+    if (target && defaults.bytes && defaults.size && !w_config_matches(config,defaults) &&
+        (w_config_matches(config,local) || w_config_matches(config,prior)) &&
+        swprintf(next,path_cap,L"%ls.%lu-%llu.tmp",config,GetCurrentProcessId(),stamp)>0 &&
+        swprintf(backup,path_cap,L"%ls.before-release-%lu-%llu",config,GetCurrentProcessId(),stamp)>0) {
+        error = w_write_new(next,defaults);
+        if (!error && !ReplaceFileW(config,next,backup,0,NULL,NULL)) {
+            error = GetLastError();
+            DeleteFileW(next);
+        } else if (!error) {
+            // Recheck the actual displaced file in case an editor saved during staging.
+            error = w_config_matches(backup,local) || w_config_matches(backup,prior) ?
+                    w_validate(p->shell[slot],p->slot[slot]) : ERROR_REVISION_MISMATCH;
+            if (!error) error = w_activate(p,current,slot);
+            if (error && w_config_matches(config,defaults) && !ReplaceFileW(config,backup,NULL,0,NULL,NULL))
+                error = GetLastError();
+        }
+    }
+    if (target) FreeLibrary(target);
+    if (old) FreeLibrary(old);
+    return error;
+}
+static DWORD w_select_release(const w_install_paths *p, int current, w_install_image image, bool rollback) {
     if (current == foreign_slot) return ERROR_ALREADY_ASSIGNED;
     DWORD error = w_os_startup_shell();
     if (error) return error;
@@ -257,11 +302,16 @@ static DWORD w_select_release(const w_install_paths *p, int current, bool rollba
     } else {
         bool identical = false;
         if (current >= 0) {
-            error = w_files_equal(p->source_shell, p->shell[current], &identical);
+            error = w_files_equal(image, p->shell[current], &identical);
             if (error)
                 return error;
         }
         slot = current;
+        if (!identical && previous >= 0) {
+            error = w_files_equal(image,p->shell[previous],&identical);
+            if (error) return error;
+            if (identical) slot = previous;
+        }
         if (!identical) {
             slot = 0;
             while (slot < slot_count && (slot == current || slot == previous ||
@@ -276,14 +326,35 @@ static DWORD w_select_release(const w_install_paths *p, int current, bool rollba
             if (error) return error;
         }
         error = w_create_directory(p->slot[slot]);
-        if (!error)
-            error = w_stage_file(p->source_shell, p->shell[slot]);
-        if (!error)
-            error = w_stage_file(p->source_setup, p->setup[slot]);
+        if (!error && !identical)
+            error = w_stage_file(image, p->shell[slot]);
+        // An inactive slot may still contain the old split release's helpers.
+        if (!error && !identical) {
+            const wchar_t *legacy[] = {p->setup[slot],p->recovery[slot]};
+            for (size_t i=0; i<count_of(legacy); ++i)
+                if (!DeleteFileW(legacy[i]) && !w_absent(GetLastError())) return GetLastError();
+        }
     }
-    if (!error)
-        error = w_validate(p->shell[slot], p->slot[slot]);
-    return error ? error : w_activate(p,current,slot);
+    return error ? error : w_validate_release(p,current,slot);
+}
+
+static bool w_remove_installed_file(const wchar_t *path) {
+    if (DeleteFileW(path)) return true;
+    DWORD error = GetLastError();
+    if (w_absent(error)) return true;
+    if (error != ERROR_ACCESS_DENIED && error != ERROR_SHARING_VIOLATION) return false;
+    // Windows allows a mapped image to be renamed. Retire it to the user's
+    // temporary files so uninstall works from the installed executable itself.
+    DWORD attrs = GetFileAttributesW(path);
+    if (attrs == INVALID_FILE_ATTRIBUTES || (attrs & (FILE_ATTRIBUTE_DIRECTORY|FILE_ATTRIBUTE_REPARSE_POINT)))
+        return false;
+    wchar_t temp[MAX_PATH+1], retired[MAX_PATH+1];
+    DWORD n = GetTempPathW(count_of(temp),temp);
+    if (!n || n >= count_of(temp) || !GetTempFileNameW(temp,L"wwm",0,retired)) return false;
+    bool moved = MoveFileExW(path,retired,MOVEFILE_REPLACE_EXISTING) != FALSE;
+    if (moved) SetFileAttributesW(retired,FILE_ATTRIBUTE_TEMPORARY);
+    DeleteFileW(retired);
+    return moved;
 }
 
 static DWORD w_uninstall(const w_install_paths *p, int current, bool *files_busy) {
@@ -298,7 +369,7 @@ static DWORD w_uninstall(const w_install_paths *p, int current, bool *files_busy
         const wchar_t *files[] = {p->shell[i],p->setup[i],p->recovery[i]};
         bool busy = false;
         for (size_t j = 0; j < length_of(files); ++j) {
-            if (!DeleteFileW(files[j]) && !w_absent(GetLastError())) busy = true;
+            if (!w_remove_installed_file(files[j])) busy = true;
         }
         if (busy) {
             // Keep ownership after removing Run so a later uninstall can finish.
@@ -314,7 +385,18 @@ static DWORD w_uninstall(const w_install_paths *p, int current, bool *files_busy
     }
     return ERROR_SUCCESS;
 }
-static DWORD w_change_installation(enum operation op, bool *files_busy) {
+DWORD w_install_current(wchar_t path[os_path_cap]) {
+    w_install_paths p;
+    int slot;
+    path[0] = 0;
+    DWORD error = w_get_paths(&p);
+    if (!error) error = w_registered_slot(&p,run_key,run_name,&slot);
+    if (!error && slot == foreign_slot) return ERROR_ALREADY_ASSIGNED;
+    if (!error && slot >= 0) wcscpy(path,p.shell[slot]);
+    return error;
+}
+
+static DWORD w_change_installation(enum w_install_operation op, w_install_image image, bool *files_busy) {
     w_install_paths p;
     DWORD error = w_get_paths(&p);
     if (error)
@@ -333,7 +415,7 @@ static DWORD w_change_installation(enum operation op, bool *files_busy) {
     error = w_registered_slot(&p,run_key,run_name,&slot);
     if (!error)
         error = op == op_uninstall ? w_uninstall(&p,slot,files_busy)
-                                   : w_select_release(&p, slot, op == op_rollback);
+                                   : w_select_release(&p, slot, image, op == op_rollback);
     CloseHandle(lock);
     return error;
 }
@@ -341,7 +423,7 @@ static DWORD w_change_installation(enum operation op, bool *files_busy) {
 ////////////////
 //~ Installer interface
 
-static void w_report(bool interactive, enum operation op, bool files_busy, DWORD error) {
+static void w_report(bool interactive, enum w_install_operation op, bool files_busy, DWORD error) {
     wchar_t system_error[512] = L"";
     wchar_t message[1024];
     const wchar_t *detail;
@@ -364,7 +446,7 @@ static void w_report(bool interactive, enum operation op, bool files_busy, DWORD
         detail = L"Another installation controls the startup entry or Windows logon shell.";
         break;
     case ERROR_FILE_NOT_FOUND:
-        detail = L"Place winwm.exe beside winwm_install.exe and retry.";
+        detail = L"The selected executable could not be found.";
         break;
     case ERROR_INVALID_DATA:
         detail = L"The staged release failed startup validation. Run winwm.exe validate-startup for details.";
@@ -379,50 +461,44 @@ static void w_report(bool interactive, enum operation op, bool files_busy, DWORD
         swprintf(message, length_of(message), L"%ls\nWindows error %lu. %ls", detail, error, system_error);
     } else {
         swprintf(message, length_of(message), L"%ls%ls", detail,
-                 files_busy ? L" Files still in use can be removed by running /uninstall from the downloaded "
-                              L"copy after signing in."
+                 files_busy ? L" To remove files still in use, run winwm.exe uninstall from your downloaded copy after signing out and back in."
                             : L"");
     }
     if (interactive)
         w_dialog(NULL, message, L"winwm setup", MB_OK | (error ? MB_ICONERROR : MB_ICONINFORMATION));
-    else if (AttachConsole(ATTACH_PARENT_PROCESS)) {
-        FILE *stream = _wfopen(L"CONOUT$", L"w");
-        if (stream) {
-            fwprintf(stream, L"%ls\n", message);
-            fclose(stream);
-        }
-    }
+    else
+        fwprintf(error ? stderr : stdout,L"%ls\n",message);
 }
 
-int WINAPI wWinMain(HINSTANCE instance, HINSTANCE previous, PWSTR args, int show) {
-    (void)instance;
-    (void)previous;
-    (void)args;
-    (void)show;
-    int count = 0;
-    wchar_t **argv = CommandLineToArgvW(GetCommandLineW(), &count);
-    if (!argv)
-        return (int)GetLastError();
-    const wchar_t *arg = count == 2 ? argv[1] : L"";
-    bool interactive = count == 1 || !_wcsicmp(arg, L"/restore") || !_wcsicmp(arg, L"/previous");
-    bool remove = !_wcsicmp(arg, L"/uninstall") || !_wcsicmp(arg, L"/restore");
-    bool rollback = !_wcsicmp(arg, L"/rollback") || !_wcsicmp(arg, L"/previous");
-    bool valid = interactive || remove || rollback || !_wcsicmp(arg, L"/install");
-    enum operation op = remove ? op_uninstall : rollback ? op_rollback : op_install;
-    LocalFree(argv);
-    if (!valid)
-        return ERROR_INVALID_PARAMETER;
+DWORD w_install_release(w_install_image image) {
+    bool busy = false;
+    return w_change_installation(op_install,image,&busy);
+}
+
+static DWORD w_install_self(void) {
+    path_string self;
+    if (!w_os_self(self,count_of(self))) return GetLastError();
+    w_install_image image;
+    DWORD error = w_install_read(self,&image);
+    if (!error) {
+        error = w_install_release(image);
+        UnmapViewOfFile(image.bytes);
+    }
+    return error;
+}
+
+DWORD w_install_run(enum w_install_operation op, bool interactive) {
     if (interactive) {
         const wchar_t *question =
-            remove ? L"Remove winwm and its startup entry from this account?"
-            : rollback
+            op == op_uninstall ? L"Remove installed winwm releases and stop starting winwm at sign-in?"
+            : op == op_rollback
                 ? L"Use the previous installed winwm release at the next sign-in?"
                 : L"Install winwm and start it alongside Windows each time this account signs in?";
         if (w_dialog(NULL, question, L"winwm setup", MB_YESNO | MB_ICONQUESTION) != IDYES)
             return ERROR_CANCELLED;
     }
     bool files_busy = false;
-    DWORD error = w_change_installation(op, &files_busy);
+    DWORD error = op == op_install ? w_install_self() : w_change_installation(op,(w_install_image){0},&files_busy);
     w_report(interactive, op, files_busy, error);
     return (int)error;
 }

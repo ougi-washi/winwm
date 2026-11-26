@@ -3,6 +3,7 @@
 #include "theme/icon_button.h"
 #include "theme/theme.h"
 #include "shell_host/entry.h"
+#include "install/install.h"
 #include "native_notifications/toast.h"
 #include "os_win32/environment.h"
 #include "win_platform/win_platform.h"
@@ -197,21 +198,12 @@ static void w_handle_action(int id) {
         w_os_cache_discard();
         w_restart(session_exe);
     } else if (id == 105 || id == 107) {
-        wchar_t exe[os_path_cap];
-        const wchar_t *name = L"winwm_install.exe";
-        wchar_t *file = w_os_self(exe, count_of(exe)) ? wcsrchr(exe, L'\\') : NULL;
-        HANDLE setup = NULL;
-        if (file && (size_t)(file - exe) + 2 + wcslen(name) <= count_of(exe)) {
-            wcscpy(file + 1, name);
-            setup = w_os_launch(exe, id == 105 ? L"/previous" : L"/restore");
+        wchar_t current[os_path_cap];
+        if (id == 105) {
+            DWORD error = w_install_current(current);
+            if ((error == ERROR_ALREADY_ASSIGNED || (!error && !*current)) && w_start_managed_previous()) return;
         }
-        if (setup)
-            CloseHandle(setup);
-        else if (id != 105 || !w_start_managed_previous())
-            w_dialog(panel,
-                        id == 105 ? L"No previous winwm release is available."
-                                  : L"Run winwm_install.exe /uninstall from the release folder.",
-                        L"winwm recovery", MB_OK);
+        w_install_run(id == 105 ? op_rollback : op_uninstall,true);
     } else if (id == exit_windows_id) {
         PostQuitMessage(0);
     } else if (id == 106)

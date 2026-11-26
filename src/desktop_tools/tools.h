@@ -21,6 +21,7 @@ int w_settings_run(const wchar_t *page);
 int w_clock_run(void);
 int w_color_run(void);
 int w_packages_run(const wchar_t *mode);
+int w_releases_run(void);
 int w_activity_run(void);
 int w_project_run(const w_desktop_config *config);
 int w_toolbar_run(void);

@@ -71,6 +71,7 @@ static const wchar_t command_glyphs[cmd_count] = {
     [cmd_reload]=0xe72c, [cmd_provider_refresh]=0xe72c, [cmd_lock]=0xe72e, [cmd_restart]=0xe777,
     [cmd_sleep]=0xe708, [cmd_confirm_sign_out]=0xf3b1, [cmd_power_settings]=0xe7e8, [cmd_quit]=0xe8bb,
     [cmd_windows_security]=0xea18, [cmd_windows_settings]=0xe713,
+    [cmd_update_winwm]=0xe895, [cmd_install_winwm]=0xe896, [cmd_uninstall_winwm]=0xe74d,
 };
 
 static void w_add_row(const wchar_t *label, const char *action, w_window_id target) {
@@ -213,6 +214,9 @@ static const w_menu_item menu_items[] = {
     {palette_software, "Find and install software with Chocolatey", "chocolatey"},
     {palette_software, "Review and apply software updates", "updates"},
     {palette_software, "Windows Update settings", "windows_update"},
+    {palette_software, "Update winwm", "update_winwm"},
+    {palette_software, "Install winwm", "install_winwm"},
+    {palette_software, "Uninstall winwm", "uninstall_winwm"},
     {palette_settings, "Power plans and timeouts", "power_settings"},
     {palette_settings, "Change wallpaper", "wallpaper"},
     {palette_settings, "Show or hide toolbar", "bar_toggle"},
@@ -249,6 +253,7 @@ static const wchar_t *w_menu_keywords(enum command_kind kind) {
     case cmd_packages: return L"winget search install package packages software apps applications";
     case cmd_chocolatey: return L"choco chocolatey search install package packages software apps applications admin";
     case cmd_updates: return L"winget upgrade update packages apps applications";
+    case cmd_update_winwm: return L"winwm versions releases update upgrade revert downgrade rollback";
     case cmd_windows_update: return L"windows system updates check";
     case cmd_windows_security: return L"defender antivirus virus threat protection firewall";
     case cmd_project: return L"developer recent project folder terminal editor";

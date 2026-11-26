@@ -1,4 +1,5 @@
 #include "desktop_ctl/entry.h"
+#include "install/install.h"
 #include "ipc/ipc.h"
 #include <stdio.h>
 #include <wchar.h>
@@ -9,11 +10,17 @@
 int w_ctl_run(int argc, wchar_t **argv) {
     if (argc == 2 && (!wcscmp(argv[1],L"--help") || !wcscmp(argv[1],L"help"))) {
         puts("winwm.exe [--preview]\nwinwm.exe ACTION [ARG...]\n"
+             "winwm.exe install | uninstall | rollback\n"
              "winwm.exe query [provider NAME] | subscribe | doctor | validate | reload\n"
              "winwm.exe physical-modifier install|restore");
         for (int i=1; i<cmd_count; ++i)
             printf("%s%s",w_command_name((enum command_kind)i),i==cmd_count-1 ? "\n" : " ");
         return 0;
+    }
+    if (argc == 2) {
+        if (!_wcsicmp(argv[1],L"install")) return (int)w_install_run(op_install,false);
+        if (!_wcsicmp(argv[1],L"uninstall")) return (int)w_install_run(op_uninstall,false);
+        if (!_wcsicmp(argv[1],L"rollback")) return (int)w_install_run(op_rollback,false);
     }
     if (argc == 3 && !wcscmp(argv[1], L"physical-modifier") &&
         (!wcscmp(argv[2], L"install") || !wcscmp(argv[2], L"restore"))) {

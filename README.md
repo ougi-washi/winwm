@@ -13,9 +13,12 @@ Windows x64 · Tiling · Per-monitor workspaces · Tabs · Floating windows · A
 ## Install
 
 ```powershell
-.\bin\winwm_install.exe /install
-.\bin\winwm_install.exe /uninstall
+.\bin\winwm.exe install
+.\bin\winwm.exe uninstall
+.\bin\winwm.exe rollback
 ```
+
+**Win+D** → `install winwm` · `uninstall winwm` · `update winwm`
 
 ## Run
 

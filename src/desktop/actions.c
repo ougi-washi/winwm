@@ -236,6 +236,9 @@ static bool w_panel_command(enum command_kind kind) {
     case cmd_packages:
     case cmd_chocolatey:
     case cmd_updates:
+    case cmd_update_winwm:
+    case cmd_install_winwm:
+    case cmd_uninstall_winwm:
     case cmd_google_japanese_input:
     case cmd_input_methods:
     case cmd_bar_settings:

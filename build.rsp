@@ -13,6 +13,8 @@ src/theme/metrics.c
 src/theme/fonts.c
 src/theme/icon_button.c
 src/app/main.c
+src/install/main.c
+src/install/releases.c
 src/bar/bar.c
 src/bar/tray.c
 src/bar/accessibility.c
@@ -63,6 +65,7 @@ src/desktop_tools/popup.c
 src/desktop_tools/languages.c
 src/desktop_tools/network.c
 src/desktop_tools/packages.c
+src/desktop_tools/releases.c
 src/desktop_tools/power.c
 src/desktop_tools/settings.c
 src/desktop_tools/toolbar.c
@@ -87,6 +90,8 @@ src/win_platform/cpu.c
 src/win_platform/percent_slider.c
 src/win_platform/win_platform.c
 -luser32
+-lwinhttp
+-lbcrypt
 -luserenv
 -ladvapi32
 -ldwmapi

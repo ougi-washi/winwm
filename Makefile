@@ -11,14 +11,11 @@ WINDRES ?= windres
 lua_sources := $(file <lua.rsp)
 link_inputs = $(patsubst third_party/lua/%.c,build/obj/lua/%.o,$(patsubst src/%.c,build/obj/%.o,$(filter-out @compile.rsp,$(subst @lua.rsp,$(lua_sources),$(file <$(1))))))
 main_inputs := $(call link_inputs,build.rsp)
-install_inputs := $(call link_inputs,install.rsp)
-objects := $(sort $(filter build/obj/%.o,$(main_inputs) $(install_inputs)))
+objects := $(sort $(filter build/obj/%.o,$(main_inputs)))
 object_dirs := $(sort $(patsubst %/,%,$(dir $(objects))))
-programs := winwm.exe winwm_install.exe
-staged := $(addprefix build/,$(programs))
-
 .PHONY: all
-all: $(addprefix bin/,$(programs))
+all: bin/winwm.exe
+	@for %%f in (bin\winwm_install.exe bin\winwm_recovery.exe build\winwm_install.exe build\winwm_recovery.exe) do @if exist "%%f" (del /q "%%f" & if exist "%%f" exit /b 1)
 
 build bin build/obj $(object_dirs):
 	@if not exist "$(subst /,\,$@)" mkdir "$(subst /,\,$@)"
@@ -31,21 +28,14 @@ build/obj/%.o: src/%.c compile.rsp Makefile | $$(@D)
 build/obj/lua/%.o: third_party/lua/%.c compile.rsp Makefile | $$(@D)
 	"$(CC)" @compile.rsp -MMD -MP -c $< -o $@
 
-build/install_res.o: src/install/install.rc src/install/app.manifest third_party/lua/LICENSE Makefile | build
-	"$(WINDRES)" -I src/install -i $< -O coff -o $@
-
 build/config_res.o: assets/config.rc assets/app.manifest assets/winwm.lua third_party/lua/LICENSE Makefile | build
 	"$(WINDRES)" -I assets -i $< -O coff -o $@
 
-$(staged): compile.rsp Makefile | build
-build/winwm.exe: build.rsp lua.rsp $(filter %.o,$(main_inputs))
+build/winwm.exe: build.rsp compile.rsp Makefile lua.rsp $(filter %.o,$(main_inputs)) | build
 	"$(CC)" @compile.rsp $(main_inputs) -o $@
-build/winwm_install.exe: install.rsp lua.rsp $(filter %.o,$(install_inputs))
-	"$(CC)" @compile.rsp $(install_inputs) -o $@
 
-# Publish in order after all links succeed. A running manager can lock the first file.
-$(addprefix bin/,$(programs)): bin/%.exe: build/%.exe | bin $(staged)
-	@copy /b /y "$(subst /,\,$<)" "$(subst /,\,$@).tmp" >nul && move /y "$(subst /,\,$@).tmp" "$(subst /,\,$@)" >nul
-bin/winwm_install.exe: | bin/winwm.exe
+bin/winwm.exe: build/winwm.exe | bin
+	@copy /b /y "$(subst /,\,$<)" "$(subst /,\,$@).tmp" >nul
+	@move /y "$(subst /,\,$@).tmp" "$(subst /,\,$@)" >nul 2>nul || powershell -NoProfile -NonInteractive -Command "[IO.File]::Replace('$@.tmp','$@','build/winwm.previous')"
 
 -include $(objects:.o=.d)

@@ -25,16 +25,16 @@ jobs:
           path-type: inherit
       - shell: msys2 {0}
         run: cmd.exe //c build.bat
-      - name: Verify standalone runtime for both executables
+      - name: Verify single executable and standalone runtime
         shell: msys2 {0}
         run: |
-          for exe in bin/winwm.exe bin/winwm_install.exe; do
-            imports=$(objdump -p "$exe")
-            if grep -Ei 'DLL Name: (libwinpthread|libgcc|libstdc\+\+)' <<< "$imports"; then
-              echo "$exe requires an unshipped compiler runtime"
-              exit 1
-            fi
-          done
+          files=(bin/*.exe)
+          test "${files[*]}" = bin/winwm.exe
+          imports=$(objdump -p bin/winwm.exe)
+          if grep -Ei 'DLL Name: (libwinpthread|libgcc|libstdc\+\+)' <<< "$imports"; then
+            echo "winwm.exe requires an unshipped compiler runtime"
+            exit 1
+          fi
       - name: Check text rasterization, native panel geometry, and interaction
         shell: msys2 {0}
         run: |
@@ -58,6 +58,37 @@ jobs:
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $seed = Get-FileHash "$env:USERPROFILE/.config/winwm/winwm.lua"
           if ($seed.Hash -ne (Get-FileHash assets/winwm.lua).Hash) { throw 'First-run config differs from shipped config.' }
+      - name: Install, roll back, and uninstall the standalone executable
+        shell: pwsh
+        run: |
+          $env:USERPROFILE = "$env:RUNNER_TEMP/winwm-profile"
+          $exe = (Resolve-Path bin/winwm.exe).Path
+          $run = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
+          function Run-Setup($binary, $verb) {
+            $result = Start-Process $binary -ArgumentList $verb -PassThru -Wait -WindowStyle Hidden
+            if ($result.ExitCode) { throw "$verb failed ($($result.ExitCode))" }
+          }
+          Run-Setup $exe install
+          try {
+            $installed = (Get-ItemPropertyValue $run winwm).Trim('"')
+            if ((Get-FileHash $installed).Hash -ne (Get-FileHash $exe).Hash) { throw 'Installed executable differs.' }
+            if (@(Get-ChildItem (Split-Path $installed) -Filter '*.exe').Count -ne 1) { throw 'Expected one installed executable.' }
+            Run-Setup $installed install
+            if ((Get-ItemPropertyValue $run winwm).Trim('"') -ne $installed) { throw 'Reinstall changed the active slot.' }
+            $second = Join-Path $env:RUNNER_TEMP 'another build.exe'
+            Copy-Item $exe $second
+            $stream = [IO.File]::Open($second, 'Append')
+            try { $stream.WriteByte(0) } finally { $stream.Dispose() }
+            Run-Setup $second install
+            $updated = (Get-ItemPropertyValue $run winwm).Trim('"')
+            if ($updated -eq $installed -or (Get-FileHash $updated).Hash -ne (Get-FileHash $second).Hash) { throw 'Update did not stage the new build.' }
+            Run-Setup $updated rollback
+            if ((Get-ItemPropertyValue $run winwm).Trim('"') -ne $installed) { throw 'Rollback did not restore the previous slot.' }
+            Run-Setup $installed uninstall
+            if ((Get-ItemProperty $run -ErrorAction SilentlyContinue).winwm -or (Test-Path $installed)) { throw 'Self-uninstall left the release active or on disk.' }
+          } finally {
+            if ((Get-ItemProperty $run -ErrorAction SilentlyContinue).winwm) { Run-Setup $exe uninstall }
+          }
       - name: Check standalone startup and recovery
         shell: pwsh
         run: |
@@ -92,9 +123,7 @@ jobs:
         if: github.event_name == 'push' && github.ref_type == 'tag'
         with:
           name: winwm-windows-x64
-          path: |
-            bin/winwm.exe
-            bin/winwm_install.exe
+          path: bin/winwm.exe
           if-no-files-found: error
   release:
     if: github.event_name == 'push' && github.ref_type == 'tag'
@@ -110,8 +139,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          executables=(winwm.exe winwm_install.exe)
-          zip -9 winwm-windows-x64.zip "${executables[@]}"
-          gh release create "$GITHUB_REF_NAME" winwm-windows-x64.zip "${executables[@]}" \
+          gh release create "$GITHUB_REF_NAME" winwm.exe \
             --repo "$GITHUB_REPOSITORY" --verify-tag --title "WinWM $GITHUB_REF_NAME" \
-            --notes 'Windows x64. Download `winwm.exe` to run WinWM. Use `winwm.exe --preview` to try it alongside Explorer. For startup at sign-in, extract the ZIP and run `winwm_install.exe /install`.'
+            --notes-from-tag

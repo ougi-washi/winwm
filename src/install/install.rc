@@ -1,3 +1,0 @@
-#include <windows.h>
-CREATEPROCESS_MANIFEST_RESOURCE_ID RT_MANIFEST "app.manifest"
-WINWM_LUA_LICENSE RCDATA "../../third_party/lua/LICENSE"

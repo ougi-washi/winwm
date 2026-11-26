@@ -30,6 +30,7 @@ static const panel_case panels[] = {
     {L"activity", L"WinwmActivity", 5, 0},
     {L"languages", L"WinwmInputSetup", 3, 1},
     {L"packages", L"WinwmSoftware", 0, 1},
+    {L"update_winwm", L"WinwmReleases", 2, 1},
     {L"capture_region", L"NativeCapture", 0, 0},
 };
 static const wchar_t config[] = L".config\\winwm\\winwm.lua";

@@ -1,6 +1,7 @@
 #include "desktop_tools/entry.h"
 #include "desktop_tools/tools.h"
 #include "desktop_tools/adapter.h"
+#include "install/install.h"
 #include "theme/dialog.h"
 #include "theme/theme.h"
 #include "os_win32/environment.h"
@@ -61,6 +62,11 @@ static int w_run_tool(const wchar_t *mode) {
     }
     if (!wcscmp(mode, L"activity"))
         return w_activity_run();
+    if (!wcscmp(mode,L"update_winwm")) return w_releases_run();
+    if (!wcscmp(mode,L"install_winwm") || !wcscmp(mode,L"uninstall_winwm")) {
+        if (!w_tool_native_dialog()) return ERROR_CANCELLED;
+        return (int)w_install_run(!wcscmp(mode,L"install_winwm") ? op_install : op_uninstall,true);
+    }
     int result = 0;
     if (!wcscmp(mode, L"capture_region") || !wcscmp(mode, L"record"))
         result = w_capture_run(mode);
